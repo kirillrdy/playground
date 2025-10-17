@@ -1,0 +1,23 @@
+- [X] multithreading
+- [X] what eats new line after C^
+- [X] templating
+- [X] fix eval
+- [X] tailwind css
+- [X] start postgres in dev server
+- [X] call C from server
+- [X] tailwind from nix
+- [X] watch restart webserver
+- [X] running tests produces --seed files
+- [ ] http proxy
+- [ ] nested controllers
+- [ ] json read/write
+- [ ] wasm double reload in incremental mode?
+- [ ] login, authentication
+- [ ] inotify
+- [ ] CRUD
+- [ ] upload file to s3
+- [ ] call C from wasm
+- [ ] some image processing , eg libav
+- [ ] multipart file upload to httpz
+- [ ] http client
+- [ ] migrations

@@ -1,0 +1,7 @@
+nix-shell
+zig build run
+zig build --watch -fincremental
+
+also
+
+zig build db

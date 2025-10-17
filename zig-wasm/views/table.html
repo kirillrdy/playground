@@ -1,0 +1,38 @@
+<div class="flex p-2">
+  <h1 class="ml-4">{[title]s}</h1>
+  <span class="grow"></span>
+  <a class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded" href="/files/new">New</a>
+</div>
+
+<div class="relative overflow-x-auto">
+    <table class="w-full text-sm text-left rtl:text-right text-gray-500 dark:text-gray-400">
+        <thead class="text-xs text-gray-700 uppercase bg-gray-50 dark:bg-gray-700 dark:text-gray-400">
+            <tr>
+                .th
+                <th scope="col" class="px-6 py-3">
+                  {[value]s}
+                </th>
+            .th-close
+            </tr>
+        </thead>
+        <tbody>
+            .tr
+            <tr class="bg-white border-b border-gray-200">
+                .td
+                <td class="px-6 py-4">
+                  {[value]any}
+                </td>
+                .td-string
+                <td class="px-6 py-4">
+                  {[value]s}
+                </td>
+                .td-number
+                <td class="px-6 py-4">
+                  {[value]d}
+                </td>
+              .tr-close
+            </tr>
+            .tbody-close
+        </tbody>
+    </table>
+</div>
