@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Import Files</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen p-6">
+    <div class="max-w-md mx-auto bg-white shadow-md rounded-lg p-6">
+        <h1 class="text-2xl font-bold text-gray-800 mb-6">Import Files</h1>
+        <form action="/files/import" method="POST" enctype="multipart/form-data" class="space-y-4">
+            <div>
+                <label for="file" class="block text-sm font-medium text-gray-700">ZIP File</label>
+                <input type="file" id="file" name="file" accept=".zip" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+            </div>
+            <button type="submit" class="w-full bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Import</button>
+        </form>
+        <a href="/files" class="block mt-4 text-blue-500 hover:text-blue-700">Back to Files</a>
+    </div>
+</body>
+</html>
