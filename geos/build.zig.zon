@@ -4,7 +4,7 @@
     .dependencies = .{
         .geos_source = .{
             .url = "https://github.com/libgeos/geos/archive/refs/heads/main.tar.gz",
-            .hash = "N-V-__8AAGE8nAFlv_xkjYnfumkk9OZJJ7ah_mvt_gtO-BlN",
+            .hash = "N-V-__8AAHE-nAHf8zBUkYr8PQMkceKhA0_qkZZROT7B8rfK",
         },
     },
     .paths = .{""},

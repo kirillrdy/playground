@@ -559,7 +559,7 @@ pub fn build(b: *std.Build) !void {
         "src/index/intervalrtree/SortedPackedIntervalRTree.cpp",
     };
 
-    inline for (geos_cpp_files) |file_path| {
+    for (geos_cpp_files) |file_path| {
         geos_lib.addCSourceFile(.{
             .file = geos_source.path(file_path),
             .flags = cpp_flags,
