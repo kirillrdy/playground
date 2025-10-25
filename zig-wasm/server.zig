@@ -69,6 +69,7 @@ pub fn main() !void {
     router.get(Paths.wasm_js_file, wasmJsFile, .{});
     router.get(Paths.wasm_file, wasmFile, .{});
     router.get(Paths.css_file, cssFile, .{});
+    router.get("/favicon.ico", faviconHandler, .{});
 
     print("processor model: {s}", .{builtin.cpu.model.name});
     print("listening on :{d}", .{port});
@@ -273,4 +274,9 @@ fn wasmFile(_: *Repo, _: *httpz.Request, res: *httpz.Response) !void {
 fn cssFile(_: *Repo, _: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .CSS;
     res.body = try sendFile(res.arena, file_names.css);
+}
+
+fn faviconHandler(_: *Repo, _: *httpz.Request, res: *httpz.Response) !void {
+    res.content_type = .SVG;
+    res.body = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"></svg>";
 }
