@@ -223,7 +223,7 @@ const Files = struct {
 
 const handlers = struct {
     fn home(response: anytype) !void {
-        try response.printHeader(.{ .wasm = Paths.wasm, .files = Paths.files.index });
+        try response.writeHeader();
     }
 
     fn wasm(response: anytype) !void {
