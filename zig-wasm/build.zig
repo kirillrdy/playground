@@ -70,11 +70,8 @@ pub fn build(b: *std.Build) !void {
     }
 
     b.step("db", "Run psql client").dependOn(&b.addRunArtifact(b.addExecutable(.{ .name = "db", .root_module = b.createModule(.{ .root_source_file = b.path("db.zig"), .target = target, .optimize = optimize }) })).step);
-
     b.step("run", "Run dev server").dependOn(&run_server.step);
-
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = modules.server,
     })).step);
 
