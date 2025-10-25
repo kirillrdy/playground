@@ -2,18 +2,18 @@ const std = @import("std");
 const wasm_app_name = @import("server.zig").wasm_app_name;
 const server_name = @import("server.zig").server_name;
 const css_file = @import("server.zig").file_names.css;
+const string = []const u8;
+
+fn createModule(b: *std.Build, src: string, target: anytype, optimize: anytype) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path(src), .target = target, .optimize = optimize });
+}
 
 pub fn build(b: *std.Build) !void {
     const start = try std.time.Instant.now();
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const server_module = b.createModule(.{
-        .root_source_file = b.path("server.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const modules = .{ .server = createModule(b, "server.zig", target, optimize) };
 
     const dependecies = [_][]const u8{ "httpz", "jetquery", "zts" };
     for (dependecies) |dependency_name| {
@@ -21,12 +21,12 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         });
-        server_module.addImport(dependency_name, dependency.module(dependency_name));
+        modules.server.addImport(dependency_name, dependency.module(dependency_name));
     }
 
     const server = b.addExecutable(.{
         .name = server_name,
-        .root_module = server_module,
+        .root_module = modules.server,
     });
     b.installArtifact(server);
 
@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) !void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
-        .root_module = server_module,
+        .root_module = modules.server,
     })).step);
 
     const finish = try std.time.Instant.now();
