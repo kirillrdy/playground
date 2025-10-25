@@ -110,7 +110,7 @@ fn responseType(name: string, options: responseOptions) type {
 
     return struct {
         comptime template: string = if (options.default_template) @embedFile(template_path) else "",
-        out: std.ArrayList(u8).Writer,
+        out: *std.io.Writer,
         repo: *Repo,
         fn print(self: @This(), comptime section: string, args: anytype) !void {
             try zts.print(self.template, section, args, self.out);
@@ -140,15 +140,16 @@ fn makeHandlerWithOptions(name: string, options: responseOptions) httpzHandler {
 
     const func = @field(@field(@This(), space), field);
     return struct {
-        fn handler(repo: *Repo, _: *httpz.Request, response: *httpz.Response) !void {
-            var buffer = std.ArrayList(u8){};
-            const out = buffer.writer(response.arena);
+        fn handler(repo: *Repo, _: *httpz.Request, httpzResponse: *httpz.Response) !void {
+            var writerAllocating = std.Io.Writer.Allocating.init(httpzResponse.arena);
+            const writer = &writerAllocating.writer;
             const layout = @embedFile("views/layout.html");
-            try zts.writeHeader(layout, out);
-            try zts.print(layout, "title", .{ .title = space, .css = Paths.css_file }, out);
-            try func(responseType(name, options){ .out = out, .repo = repo });
-            try zts.write(layout, "close-body", out);
-            response.body = buffer.items;
+            try zts.writeHeader(layout, writer);
+            try zts.print(layout, "title", .{ .title = space, .css = Paths.css_file }, writer);
+            const response = responseType(name, options){ .out = writer, .repo = repo };
+            try func(response);
+            try zts.write(layout, "close-body", writer);
+            httpzResponse.body = writerAllocating.written();
         }
     }.handler;
 }
@@ -160,7 +161,7 @@ test "tolower" {
 }
 const Repo = jetquery.Repo(.postgresql, Schema);
 
-fn table(writer: std.ArrayList(u8).Writer, title: string, records: anytype) !void {
+fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
     const resultRowType = @typeInfo(@TypeOf(records)).pointer.child;
     const template = @embedFile("views/table.html");
     try zts.printHeader(template, .{ .title = title }, writer);
