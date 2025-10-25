@@ -1,5 +1,5 @@
 let
-  nixpkgs = fetchTarball "https://github.com/NixOS/nixpkgs/archive/d07d03d0bbe235eb05a30ecbe95ce8ca994cb1aa.tar.gz";
+  nixpkgs = fetchTarball "https://github.com/NixOS/nixpkgs/archive/01f116e4df6a15f4ccdffb1bcd41096869fb385c.tar.gz";
   pkgs = import nixpkgs { };
 in
 pkgs.mkShell {
