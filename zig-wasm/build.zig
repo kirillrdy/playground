@@ -15,13 +15,8 @@ pub fn build(b: *std.Build) !void {
 
     const modules = .{ .server = createModule(b, "server.zig", target, optimize) };
 
-    const dependecies = [_][]const u8{ "httpz", "jetquery", "zts" };
-    for (dependecies) |dependency_name| {
-        const dependency = b.dependency(dependency_name, .{
-            .target = target,
-            .optimize = optimize,
-        });
-        modules.server.addImport(dependency_name, dependency.module(dependency_name));
+    inline for (&.{ "httpz", "jetquery", "zts" }) |dependency_name| {
+        modules.server.addImport(dependency_name, b.dependency(dependency_name, .{}).module(dependency_name));
     }
 
     const server = b.addExecutable(.{
@@ -37,7 +32,6 @@ pub fn build(b: *std.Build) !void {
     });
 
     const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = b.createModule(.{ .root_source_file = b.path("dev_server.zig"), .target = target, .optimize = optimize }) });
-    const db_client = b.addExecutable(.{ .name = "db", .root_module = b.createModule(.{ .root_source_file = b.path("db.zig"), .target = target, .optimize = optimize }) });
 
     const wasm_app = b.addExecutable(.{ .name = wasm_app_name, .root_module = wasm_module });
     wasm_app.entry = .disabled;
@@ -76,9 +70,9 @@ pub fn build(b: *std.Build) !void {
     }
 
     const db_step = b.step("db", "Run psql client");
-    db_step.dependOn(&b.addRunArtifact(db_client).step);
+    db_step.dependOn(&b.addRunArtifact(b.addExecutable(.{ .name = "db", .root_module = b.createModule(.{ .root_source_file = b.path("db.zig"), .target = target, .optimize = optimize }) })).step);
 
-    const run_step = b.step("run", "Run web server");
+    const run_step = b.step("run", "Run dev server");
     run_step.dependOn(&run_server.step);
 
     const test_step = b.step("test", "Run unit tests");
