@@ -13,29 +13,24 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const modules = .{ .server = createModule(b, "server.zig", target, optimize) };
+    const modules = .{
+        .server = createModule(b, "server.zig", target, optimize),
+        .dev_server = createModule(b, "dev_server.zig", target, optimize),
+        .db = createModule(b, "db.zig", target, optimize),
+        .wasm = b.createModule(.{ .root_source_file = b.path("wasm.zig"), .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }), .optimize = optimize }),
+    };
 
     inline for (&.{ "httpz", "jetquery", "zts" }) |dependency_name| {
         modules.server.addImport(dependency_name, b.dependency(dependency_name, .{}).module(dependency_name));
     }
 
-    const server = b.addExecutable(.{
-        .name = server_name,
-        .root_module = modules.server,
-    });
-    b.installArtifact(server);
-
-    const wasm_module = b.createModule(.{
-        .root_source_file = b.path("wasm.zig"),
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-        .optimize = optimize,
-    });
-
-    const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = b.createModule(.{ .root_source_file = b.path("dev_server.zig"), .target = target, .optimize = optimize }) });
-
-    const wasm_app = b.addExecutable(.{ .name = wasm_app_name, .root_module = wasm_module });
+    const server = b.addExecutable(.{ .name = server_name, .root_module = modules.server });
+    const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = modules.dev_server });
+    const wasm_app = b.addExecutable(.{ .name = wasm_app_name, .root_module = modules.wasm });
     wasm_app.entry = .disabled;
     wasm_app.rdynamic = true;
+
+    b.installArtifact(server);
     b.installArtifact(wasm_app);
     b.installArtifact(dev_server);
 
@@ -69,7 +64,7 @@ pub fn build(b: *std.Build) !void {
         run_server.addArgs(args);
     }
 
-    b.step("db", "Run psql client").dependOn(&b.addRunArtifact(b.addExecutable(.{ .name = "db", .root_module = b.createModule(.{ .root_source_file = b.path("db.zig"), .target = target, .optimize = optimize }) })).step);
+    b.step("db", "Run psql client").dependOn(&b.addRunArtifact(b.addExecutable(.{ .name = "db", .root_module = modules.db })).step);
     b.step("run", "Run dev server").dependOn(&run_server.step);
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = modules.server,
