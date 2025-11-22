@@ -3,8 +3,8 @@
     .version = "0.15.1",
     .dependencies = .{
         .geos_source = .{
-            .url = "https://github.com/libgeos/geos/archive/refs/heads/main.tar.gz",
-            .hash = "N-V-__8AAHE-nAHf8zBUkYr8PQMkceKhA0_qkZZROT7B8rfK",
+            .url = "https://github.com/libgeos/geos/archive/640d3758eeafc859e7484ca7ab7e6d76fc48719d.tar.gz",
+            .hash = "N-V-__8AAHE0nQErs2V9ynDQ6IAyj2RZzwHWGy2idYFh4vzA",
         },
     },
     .paths = .{""},
