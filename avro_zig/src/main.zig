@@ -7,8 +7,13 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_fw = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_fw.interface;
+
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <avro_file>\n", .{args[0]});
+        try stdout.print("Usage: {s} <avro_file>\n", .{args[0]});
+        try stdout.flush();
         return;
     }
 
@@ -22,14 +27,15 @@ pub fn main() !void {
     var magic: [4]u8 = undefined;
     _ = try reader.readNoEof(&magic);
     if (!std.mem.eql(u8, &magic, "Obj\x01")) {
-        std.debug.print("Not an Avro OCF file. Magic bytes mismatch.\n", .{});
+        try stdout.print("Not an Avro OCF file. Magic bytes mismatch.\n", .{});
+        try stdout.flush();
         return;
     }
 
-    std.debug.print("Found Avro Magic bytes.\n", .{});
+    try stdout.print("Found Avro Magic bytes.\n", .{});
 
     // 2. Read Metadata Map
-    std.debug.print("Reading Metadata...\n", .{});
+    try stdout.print("Reading Metadata...\n", .{});
 
     var codec_is_zstd = false;
     var schema_json_string: []u8 = undefined;
@@ -49,12 +55,12 @@ pub fn main() !void {
             const key = try readString(allocator, reader);
             const value = try readBytes(allocator, reader);
 
-            std.debug.print("Metadata Key: {s}\n", .{key});
+            try stdout.print("Metadata Key: {s}\n", .{key});
             if (std.mem.eql(u8, key, "avro.schema")) {
                 schema_json_string = try allocator.dupe(u8, value);
-                std.debug.print("Schema found.\n", .{});
+                try stdout.print("Schema found.\n", .{});
             } else if (std.mem.eql(u8, key, "avro.codec")) {
-                std.debug.print("Codec: {s}\n", .{value});
+                try stdout.print("Codec: {s}\n", .{value});
                 if (std.mem.eql(u8, value, "zstandard")) {
                     codec_is_zstd = true;
                 }
@@ -76,7 +82,7 @@ pub fn main() !void {
     _ = try reader.readNoEof(&sync_marker);
 
     // 4. Read Data Blocks
-    std.debug.print("Reading Data Blocks...\n", .{});
+    try stdout.print("Reading Data Blocks...\n", .{});
     while (true) {
         // Read block count
         var block_count = readLong(reader) catch |err| {
@@ -92,7 +98,7 @@ pub fn main() !void {
             block_size = try readLong(reader);
         }
 
-        std.debug.print("Block: {d} records, {d} bytes.\n", .{ block_count, block_size });
+        try stdout.print("Block: {d} records, {d} bytes.\n", .{ block_count, block_size });
 
         if (codec_is_zstd) {
             const compressed_buf = try allocator.alloc(u8, @intCast(block_size));
@@ -100,28 +106,34 @@ pub fn main() !void {
 
             try reader.readNoEof(compressed_buf);
 
-            var in_reader = std.io.Reader.fixed(compressed_buf);
-            var decom = std.compress.zstd.Decompress.init(&in_reader, &.{}, .{});
-            var out_writer = std.io.Writer.Allocating.init(allocator);
-            defer out_writer.deinit();
+            var in_reader_struct = std.io.Reader.fixed(compressed_buf);
+            const window_buffer = try allocator.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+            defer allocator.free(window_buffer);
+            var decom = std.compress.zstd.Decompress.init(&in_reader_struct, window_buffer, .{});
 
-            _ = decom.reader.streamRemaining(&out_writer.writer) catch |err| {
-                std.debug.print("  Decompression error: {any}\n", .{err});
-            };
+            var out_list = std.ArrayListUnmanaged(u8){};
+            defer out_list.deinit(allocator);
 
-            const decompressed_data = try out_writer.toOwnedSlice();
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = try decom.reader.readSliceShort(&buf);
+                if (n == 0) break;
+                try out_list.appendSlice(allocator, buf[0..n]);
+            }
+
+            const decompressed_data = try out_list.toOwnedSlice(allocator);
             defer allocator.free(decompressed_data);
 
-            std.debug.print("  Decompressed {d} bytes. Parsing records...\n", .{decompressed_data.len});
+            try stdout.print("  Decompressed {d} bytes. Parsing records...\n", .{decompressed_data.len});
 
-            var fbs = std.io.fixedBufferStream(decompressed_data);
+            var fbs = std.io.FixedBufferStream([]u8){ .buffer = decompressed_data, .pos = 0 };
             const block_reader = fbs.reader();
 
             var r: i64 = 0;
             while (r < block_count) : (r += 1) {
-                // std.debug.print("Record {d}:\n", .{r});
-                try readDatum(allocator, parsed_schema.value, block_reader, &registry, 0);
-                std.debug.print("\n", .{});
+                // stdout.print("Record {d}:\n", .{r});
+                try readDatum(allocator, parsed_schema.value, block_reader, &registry, 0, stdout);
+                try stdout.print("\n", .{});
             }
         } else {
             try reader.skipBytes(@intCast(block_size), .{});
@@ -132,10 +144,12 @@ pub fn main() !void {
         _ = try reader.readNoEof(&marker);
 
         if (!std.mem.eql(u8, &marker, &sync_marker)) {
-            std.debug.print("Sync marker mismatch at end of block!\n", .{});
+            try stdout.print("Sync marker mismatch at end of block!\n", .{});
+            try stdout.flush();
             return;
         }
     }
+    try stdout.flush();
 }
 
 const ReaderType = std.io.GenericReader(std.fs.File, std.fs.File.ReadError, std.fs.File.read);
@@ -245,34 +259,34 @@ const SchemaRegistry = struct {
     }
 };
 
-fn readDatum(allocator: std.mem.Allocator, schema: std.json.Value, reader: anytype, registry: *SchemaRegistry, indent: usize) anyerror!void {
+fn readDatum(allocator: std.mem.Allocator, schema: std.json.Value, reader: anytype, registry: *SchemaRegistry, indent: usize, writer: anytype) anyerror!void {
     switch (schema) {
         .string => |s| {
             if (std.mem.eql(u8, s, "null")) {
-                std.debug.print("null", .{});
+                try writer.print("null", .{});
             } else if (std.mem.eql(u8, s, "boolean")) {
                 const b = try reader.readByte();
-                std.debug.print("{}", .{b != 0});
+                try writer.print("{}", .{b != 0});
             } else if (std.mem.eql(u8, s, "int")) {
-                std.debug.print("{}", .{try readInt(reader)});
+                try writer.print("{}", .{try readInt(reader)});
             } else if (std.mem.eql(u8, s, "long")) {
-                std.debug.print("{}", .{try readLong(reader)});
+                try writer.print("{}", .{try readLong(reader)});
             } else if (std.mem.eql(u8, s, "float")) {
-                std.debug.print("{d:.3}", .{try readFloat(reader)});
+                try writer.print("{d:.3}", .{try readFloat(reader)});
             } else if (std.mem.eql(u8, s, "double")) {
-                std.debug.print("{d:.3}", .{try readDouble(reader)});
+                try writer.print("{d:.3}", .{try readDouble(reader)});
             } else if (std.mem.eql(u8, s, "bytes")) {
                 const b = try readBytes(allocator, reader);
-                std.debug.print("<bytes len={d}>", .{b.len});
+                try writer.print("<bytes len={d}>", .{b.len});
             } else if (std.mem.eql(u8, s, "string")) {
                 const str = try readString(allocator, reader);
-                std.debug.print("\"{s}\"", .{str});
+                try writer.print("\"{s}\"", .{str});
             } else {
                 // Named type reference?
                 if (registry.get(s)) |def| {
-                    try readDatum(allocator, def, reader, registry, indent);
+                    try readDatum(allocator, def, reader, registry, indent, writer);
                 } else {
-                    std.debug.print("Unknown type: {s}", .{s});
+                    try writer.print("Unknown type: {s}", .{s});
                 }
             }
         },
@@ -280,7 +294,7 @@ fn readDatum(allocator: std.mem.Allocator, schema: std.json.Value, reader: anyty
             // Union
             const index = try readLong(reader);
             if (index < 0 or index >= arr.items.len) return error.InvalidUnionIndex;
-            try readDatum(allocator, arr.items[@intCast(index)], reader, registry, indent);
+            try readDatum(allocator, arr.items[@intCast(index)], reader, registry, indent, writer);
         },
         .object => |obj| {
             const type_val = obj.get("type");
@@ -291,21 +305,21 @@ fn readDatum(allocator: std.mem.Allocator, schema: std.json.Value, reader: anyty
             const t = type_val.?.string;
 
             if (std.mem.eql(u8, t, "record")) {
-                std.debug.print("{{\n", .{});
+                try writer.print("{{\n", .{});
                 const fields = obj.get("fields").?.array;
                 for (fields.items) |field| {
                     const fname = field.object.get("name").?.string;
                     const ftype = field.object.get("type").?;
 
-                    for (0..indent + 2) |_| std.debug.print(" ", .{});
-                    std.debug.print("\"{s}\": ", .{fname});
-                    try readDatum(allocator, ftype, reader, registry, indent + 2);
-                    std.debug.print(",\n", .{});
+                    for (0..indent + 2) |_| try writer.print(" ", .{});
+                    try writer.print("\"{s}\": ", .{fname});
+                    try readDatum(allocator, ftype, reader, registry, indent + 2, writer);
+                    try writer.print(",\n", .{});
                 }
-                for (0..indent) |_| std.debug.print(" ", .{});
-                std.debug.print("}}", .{});
+                for (0..indent) |_| try writer.print(" ", .{});
+                try writer.print("}}", .{});
             } else if (std.mem.eql(u8, t, "array")) {
-                std.debug.print("[", .{});
+                try writer.print("[", .{});
                 const item_type = obj.get("items").?;
 
                 var block_count = try readLong(reader);
@@ -316,18 +330,18 @@ fn readDatum(allocator: std.mem.Allocator, schema: std.json.Value, reader: anyty
                     }
 
                     for (0..@intCast(block_count)) |_| {
-                        try readDatum(allocator, item_type, reader, registry, indent);
-                        std.debug.print(", ", .{});
+                        try readDatum(allocator, item_type, reader, registry, indent, writer);
+                        try writer.print(", ", .{});
                     }
                     block_count = try readLong(reader);
                 }
-                std.debug.print("]", .{});
+                try writer.print("]", .{});
             } else if (std.mem.eql(u8, t, "enum")) {
                 const index = try readInt(reader);
                 const symbols = obj.get("symbols").?.array;
-                std.debug.print("\"{s}\"", .{symbols.items[@intCast(index)].string});
+                try writer.print("\"{s}\"", .{symbols.items[@intCast(index)].string});
             } else if (std.mem.eql(u8, t, "map")) {
-                std.debug.print("{{ ", .{});
+                try writer.print("{{ ", .{});
                 const val_type = obj.get("values").?;
                 var block_count = try readLong(reader);
                 while (block_count != 0) {
@@ -337,31 +351,30 @@ fn readDatum(allocator: std.mem.Allocator, schema: std.json.Value, reader: anyty
                     }
                     for (0..@intCast(block_count)) |_| {
                         const key = try readString(allocator, reader);
-                        std.debug.print("\"{s}\": ", .{key});
-                        try readDatum(allocator, val_type, reader, registry, indent);
-                        std.debug.print(", ", .{});
+                        try writer.print("\"{s}\": ", .{key});
+                        try readDatum(allocator, val_type, reader, registry, indent, writer);
+                        try writer.print(", ", .{});
                     }
                     block_count = try readLong(reader);
                 }
-                std.debug.print("}}", .{});
+                try writer.print("}}", .{});
             } else {
                 // logical types often appear as object with "type": "long", "logicalType": ...
                 // Or simple types defined as objects
                 if (std.mem.eql(u8, t, "long")) {
-                    std.debug.print("{}", .{try readLong(reader)});
+                    try writer.print("{}", .{try readLong(reader)});
                 } else if (std.mem.eql(u8, t, "string")) {
                     const str = try readString(allocator, reader);
-                    std.debug.print("\"{s}\"", .{str});
+                    try writer.print("\"{s}\"", .{str});
                 } else if (std.mem.eql(u8, t, "int")) {
-                    std.debug.print("{}", .{try readInt(reader)});
+                    try writer.print("{}", .{try readInt(reader)});
                 } else {
-                    std.debug.print("Unknown obj type: {s}", .{t});
+                    try writer.print("Unknown obj type: {s}", .{t});
                 }
             }
         },
         else => {
-            std.debug.print("?", .{});
+            try writer.print("?", .{});
         },
     }
 }
-
