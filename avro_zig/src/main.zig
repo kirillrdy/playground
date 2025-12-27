@@ -1,16 +1,16 @@
 const std = @import("std");
 
-pub const Point = struct {
+const Point = struct {
     x: f64,
     y: f64,
 };
 
-pub const Bounds = struct {
+const Bounds = struct {
     min: Point,
     max: Point,
 };
 
-pub const Detection = struct {
+const Detection = struct {
     frame_id: i32,
     bounds: ?Bounds,
     geometry_type: i32,
@@ -18,12 +18,12 @@ pub const Detection = struct {
     confidence: f32,
 };
 
-pub const EntityDatumSource = struct {
+const EntityDatumSource = struct {
     confidence: f64,
     frameId: i32,
 };
 
-pub const EavtValue = union(enum) {
+const EavtValue = union(enum) {
     string: []u8,
     int: i32,
     long: i64,
@@ -32,7 +32,7 @@ pub const EavtValue = union(enum) {
     null: void,
 };
 
-pub const Eavt = struct {
+const Eavt = struct {
     entityId: []u8,
     entityAttributeId: []u8,
     entityAttributeEnumId: []u8,
@@ -41,14 +41,14 @@ pub const Eavt = struct {
     time: i64,
 };
 
-pub const Track = struct {
+const Track = struct {
     track_id: []u8,
     data_file_id: []u8,
     detections: []Detection,
     eavts: []Eavt,
 };
 
-pub const Entity = struct {
+const Entity = struct {
     id: []u8,
     object_class: []u8,
     tracks: []Track,
@@ -140,7 +140,7 @@ pub fn main() !void {
     }
     // Arena will free window_buffer
 
-    var entities: std.ArrayListUnmanaged(Entity) = .{};
+    var entities: std.ArrayList(Entity) = .{};
 
     var limit_buf: [4096]u8 = undefined;
 
