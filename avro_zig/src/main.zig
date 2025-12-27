@@ -56,6 +56,7 @@ const Entity = struct {
 };
 
 pub fn main() !void {
+    var timer = try std.time.Timer.start();
     var debug: std.heap.DebugAllocator(.{}) = .init;
     // We use an arena for all parsed data to make cleanup easy
     var arena = std.heap.ArenaAllocator.init(debug.allocator());
@@ -206,18 +207,21 @@ pub fn main() !void {
         try stdout.print("First Entity Track Count: {d}\n", .{entities.items[0].tracks.len});
     }
 
+    const elapsed = timer.read();
+    try stdout.print("Execution took: {d:.3}ms\n", .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms});
+
     try stdout.flush();
 }
 
 // --- Avro Typed Readers ---
 
-fn readEntity(allocator: std.mem.Allocator, reader: anytype) !Entity {
+fn readEntity(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Entity {
     const id = try readStringAlloc(allocator, reader);
     const object_class = try readStringAlloc(allocator, reader);
     const tracks = try readArrayAlloc(Track, allocator, reader, readTrack);
     const embeddings = try readArrayAlloc([]i32, allocator, reader, readIntArray);
 
-    return Entity{
+    return .{
         .id = id,
         .object_class = object_class,
         .tracks = tracks,
@@ -375,7 +379,7 @@ fn readDouble(reader: anytype) !f64 {
     return @bitCast(i);
 }
 
-fn readStringAlloc(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
+fn readStringAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     const len = try readLong(reader);
     if (len < 0) return error.InvalidLength;
     const buffer = try allocator.alloc(u8, @intCast(len));
