@@ -67,6 +67,8 @@ pub const Runtime = struct {
         use_cuda: bool = true,
         cuda_device_id: i32 = 0,
         require_cuda: bool = false,
+        inter_op_num_threads: ?i32 = null,
+        intra_op_num_threads: ?i32 = null,
     };
 
     pub fn init(allocator: Allocator, model_path: []const u8) !@This() {
@@ -94,6 +96,7 @@ pub const Runtime = struct {
 
         try runtime.check(runtime.api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "zig-wasm", &runtime.env));
         try runtime.check(runtime.api.CreateSessionOptions.?(&runtime.session_options));
+        try runtime.configureSessionThreads(options);
         try runtime.configureExecutionProvider(options);
 
         const model_path_z = try allocator.dupeZ(u8, model_path);
@@ -206,6 +209,24 @@ pub const Runtime = struct {
         }
 
         std.log.warn("onnxruntime: CUDA execution provider unavailable, falling back to CPU: {s}", .{error_message});
+    }
+
+    fn configureSessionThreads(self: *@This(), options: InitOptions) !void {
+        if (options.inter_op_num_threads) |num_threads| {
+            if (self.api.SetInterOpNumThreads) |set_inter_op| {
+                try self.check(set_inter_op(self.session_options, num_threads));
+            } else {
+                std.log.warn("onnxruntime: SetInterOpNumThreads API unavailable, skipping inter-op config", .{});
+            }
+        }
+
+        if (options.intra_op_num_threads) |num_threads| {
+            if (self.api.SetIntraOpNumThreads) |set_intra_op| {
+                try self.check(set_intra_op(self.session_options, num_threads));
+            } else {
+                std.log.warn("onnxruntime: SetIntraOpNumThreads API unavailable, skipping intra-op config", .{});
+            }
+        }
     }
 
     pub fn decodeYoloOutput(

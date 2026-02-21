@@ -155,7 +155,7 @@ const HwDecodeContext = struct {
 };
 
 pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -199,6 +199,8 @@ pub fn main() !void {
             .use_cuda = true,
             .cuda_device_id = 0,
             .require_cuda = true,
+            .inter_op_num_threads = 1,
+            .intra_op_num_threads = 1,
         });
     }
     defer if (runtime) |*r| r.deinit();
