@@ -17,25 +17,25 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
     const api: *const c.OrtApi = @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable);
 
-    var env: ?*c.OrtEnv = null;
-    try ortCheck(api, api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "video-yolo-zig", &env));
-    defer if (env) |v| api.ReleaseEnv.?(v);
+    var env_raw: ?*c.OrtEnv = null;
+    try ortCheck(api, api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "video-yolo-zig", &env_raw));
+    const env = env_raw orelse return error.OnnxRuntimeError;
+    defer api.ReleaseEnv.?(env);
 
-    var session_options: ?*c.OrtSessionOptions = null;
-    try ortCheck(api, api.CreateSessionOptions.?(&session_options));
-    defer if (session_options) |v| api.ReleaseSessionOptions.?(v);
+    var session_options_raw: ?*c.OrtSessionOptions = null;
+    try ortCheck(api, api.CreateSessionOptions.?(&session_options_raw));
+    const session_options = session_options_raw orelse return error.OnnxRuntimeError;
+    defer api.ReleaseSessionOptions.?(session_options);
     try ortCheck(api, api.SetInterOpNumThreads.?(session_options, 1));
     try ortCheck(api, api.SetIntraOpNumThreads.?(session_options, 1));
 
-    var cuda_options: ?*c.OrtCUDAProviderOptionsV2 = null;
-    defer if (cuda_options != null and api.ReleaseCUDAProviderOptions != null) api.ReleaseCUDAProviderOptions.?(cuda_options);
     const create_cuda = api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-    const update_cuda = api.UpdateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
     const append_cuda = api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
-    try ortCheck(api, create_cuda(&cuda_options));
-    const keys = [_][*c]const u8{"device_id"};
-    const values = [_][*c]const u8{"0"};
-    try ortCheck(api, update_cuda(cuda_options, &keys, &values, keys.len));
+    const release_cuda = api.ReleaseCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+    var cuda_options_raw: ?*c.OrtCUDAProviderOptionsV2 = null;
+    try ortCheck(api, create_cuda(&cuda_options_raw));
+    const cuda_options = cuda_options_raw orelse return error.OnnxRuntimeError;
+    defer release_cuda(cuda_options);
     try ortCheck(api, append_cuda(session_options, cuda_options));
 
     const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
