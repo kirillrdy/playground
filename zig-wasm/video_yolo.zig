@@ -5,6 +5,7 @@ const c = @cImport({
     @cInclude("libavformat/avformat.h");
     @cInclude("libavcodec/avcodec.h");
     @cInclude("libavutil/avutil.h");
+    @cInclude("libavutil/hwcontext.h");
     @cInclude("libavutil/imgutils.h");
     @cInclude("libswscale/swscale.h");
 });
@@ -147,6 +148,12 @@ const InferWorkerCtx = struct {
     height: usize,
 };
 
+const HwDecodeContext = struct {
+    enabled: bool = false,
+    hw_pix_fmt: c.enum_AVPixelFormat = c.AV_PIX_FMT_NONE,
+    hw_device_ctx: ?*c.AVBufferRef = null,
+};
+
 pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_state.deinit();
@@ -229,6 +236,10 @@ fn processVideo(allocator: std.mem.Allocator, runtime: ?*onnxruntime.Runtime, vi
     defer c.avcodec_free_context(&codec_ctx);
 
     _ = try checkAv(c.avcodec_parameters_to_context(codec_ctx, codecpar));
+    var hw_decode: HwDecodeContext = .{};
+    try setupCudaHwDecode(codec_ctx.?, decoder.?, &hw_decode);
+    defer c.av_buffer_unref(&hw_decode.hw_device_ctx);
+
     const cpu_count = std.Thread.getCpuCount() catch 0;
     if (cpu_count > 0) codec_ctx.?.*.thread_count = @intCast(@min(cpu_count, 16));
     codec_ctx.?.*.thread_type = c.FF_THREAD_FRAME | c.FF_THREAD_SLICE;
@@ -238,12 +249,14 @@ fn processVideo(allocator: std.mem.Allocator, runtime: ?*onnxruntime.Runtime, vi
     if (frame == null) return error.OutOfMemory;
     defer c.av_frame_free(&frame);
 
+    var sw_frame = c.av_frame_alloc();
+    if (sw_frame == null) return error.OutOfMemory;
+    defer c.av_frame_free(&sw_frame);
+
     var packet = c.av_packet_alloc();
     if (packet == null) return error.OutOfMemory;
     defer c.av_packet_free(&packet);
 
-    const src_width_i32: c_int = codec_ctx.?.*.width;
-    const src_height_i32: c_int = codec_ctx.?.*.height;
     const infer_width: usize = 640;
     const infer_height: usize = 640;
     const infer_width_i32: c_int = @intCast(infer_width);
@@ -264,20 +277,8 @@ fn processVideo(allocator: std.mem.Allocator, runtime: ?*onnxruntime.Runtime, vi
         1,
     ));
 
-    const sws_ctx = c.sws_getContext(
-        src_width_i32,
-        src_height_i32,
-        codec_ctx.?.*.pix_fmt,
-        infer_width_i32,
-        infer_height_i32,
-        c.AV_PIX_FMT_RGB24,
-        c.SWS_FAST_BILINEAR,
-        null,
-        null,
-        null,
-    );
-    if (sws_ctx == null) return error.FfmpegScaleInitFailed;
-    defer c.sws_freeContext(sws_ctx);
+    var sws_ctx: ?*c.SwsContext = null;
+    defer if (sws_ctx) |ctx| c.sws_freeContext(ctx);
 
     const wall_start_ns = std.time.nanoTimestamp();
     var decode_stats: DecodeStats = .{};
@@ -305,12 +306,12 @@ fn processVideo(allocator: std.mem.Allocator, runtime: ?*onnxruntime.Runtime, vi
         if (read_ret < 0) break;
         recordReadPacketSample(&decode_stats, read_end_ns - read_start_ns);
         if (packet.?.*.stream_index == stream_idx) {
-            try decodePacket(skip_infer, codec_ctx.?, frame.?, packet.?, sws_ctx, &dst_data, &dst_linesize, rgb, &queue, &decode_stats);
+            try decodePacket(skip_infer, codec_ctx.?, frame.?, sw_frame.?, packet.?, &sws_ctx, &dst_data, &dst_linesize, rgb, infer_width_i32, infer_height_i32, &queue, &decode_stats, &hw_decode);
         }
         c.av_packet_unref(packet);
     }
 
-    try decodePacket(skip_infer, codec_ctx.?, frame.?, null, sws_ctx, &dst_data, &dst_linesize, rgb, &queue, &decode_stats);
+    try decodePacket(skip_infer, codec_ctx.?, frame.?, sw_frame.?, null, &sws_ctx, &dst_data, &dst_linesize, rgb, infer_width_i32, infer_height_i32, &queue, &decode_stats, &hw_decode);
     if (!skip_infer) {
         queue.close();
         if (infer_thread) |thread| thread.join();
@@ -324,13 +325,17 @@ fn decodePacket(
     skip_infer: bool,
     codec_ctx: *c.AVCodecContext,
     frame: *c.AVFrame,
+    sw_frame: *c.AVFrame,
     packet: ?*c.AVPacket,
-    sws_ctx: *c.SwsContext,
+    sws_ctx: *?*c.SwsContext,
     dst_data: *[4][*c]u8,
     dst_linesize: *[4]c_int,
     rgb: []u8,
+    infer_width_i32: c_int,
+    infer_height_i32: c_int,
     queue: *FrameQueue,
     decode_stats: *DecodeStats,
+    hw_decode: *const HwDecodeContext,
 ) !void {
     const send_start_ns = std.time.nanoTimestamp();
     const send_ret = c.avcodec_send_packet(codec_ctx, packet);
@@ -345,17 +350,48 @@ fn decodePacket(
         if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) return;
         _ = try checkAv(ret);
 
+        var source_frame = frame;
+        if (hw_decode.enabled and frame.format == hw_decode.hw_pix_fmt) {
+            c.av_frame_unref(sw_frame);
+            _ = try checkAv(c.av_hwframe_transfer_data(sw_frame, frame, 0));
+            source_frame = sw_frame;
+        }
+
+        const source_height: c_int = if (source_frame.height > 0) source_frame.height else codec_ctx.height;
+        if (source_height <= 0) {
+            c.av_frame_unref(frame);
+            continue;
+        }
+        const source_width: c_int = if (source_frame.width > 0) source_frame.width else codec_ctx.width;
+        const source_format = source_frame.format;
+        sws_ctx.* = c.sws_getCachedContext(
+            sws_ctx.*,
+            source_width,
+            source_height,
+            source_format,
+            infer_width_i32,
+            infer_height_i32,
+            c.AV_PIX_FMT_RGB24,
+            c.SWS_FAST_BILINEAR,
+            null,
+            null,
+            null,
+        );
+        if (sws_ctx.* == null) return error.FfmpegScaleInitFailed;
+
         const scale_start_ns = std.time.nanoTimestamp();
-        _ = c.sws_scale(
-            sws_ctx,
-            @ptrCast(&frame.data),
-            @ptrCast(&frame.linesize),
+        const scaled_lines = c.sws_scale(
+            sws_ctx.*,
+            @ptrCast(&source_frame.data),
+            @ptrCast(&source_frame.linesize),
             0,
-            @intCast(codec_ctx.height),
+            source_height,
             dst_data,
             dst_linesize,
         );
         const scale_end_ns = std.time.nanoTimestamp();
+        c.av_frame_unref(frame);
+        if (scaled_lines <= 0) continue;
 
         const decode_ns = decode_end_ns - decode_start_ns;
         const scale_ns = scale_end_ns - scale_start_ns;
@@ -396,6 +432,56 @@ fn inferWorkerMain(ctx: *InferWorkerCtx) void {
         );
         ctx.queue.releaseWriteSlot(idx);
     }
+}
+
+fn setupCudaHwDecode(codec_ctx: *c.AVCodecContext, decoder: [*c]const c.AVCodec, hw_decode: *HwDecodeContext) !void {
+    var config_index: c_int = 0;
+    while (true) : (config_index += 1) {
+        const config = c.avcodec_get_hw_config(decoder, config_index);
+        if (config == null) break;
+        if (config.?.*.device_type == c.AV_HWDEVICE_TYPE_CUDA and
+            (config.?.*.methods & c.AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0)
+        {
+            hw_decode.hw_pix_fmt = config.?.*.pix_fmt;
+            break;
+        }
+    }
+
+    if (hw_decode.hw_pix_fmt == c.AV_PIX_FMT_NONE) {
+        std.log.info("ffmpeg: CUDA hw decode config not found, using CPU decode", .{});
+        return;
+    }
+
+    if (c.av_hwdevice_ctx_create(&hw_decode.hw_device_ctx, c.AV_HWDEVICE_TYPE_CUDA, null, null, 0) < 0) {
+        std.log.warn("ffmpeg: failed to create CUDA hw device, using CPU decode", .{});
+        hw_decode.hw_pix_fmt = c.AV_PIX_FMT_NONE;
+        return;
+    }
+
+    codec_ctx.*.@"opaque" = hw_decode;
+    codec_ctx.*.get_format = getHwFormat;
+    codec_ctx.*.hw_device_ctx = c.av_buffer_ref(hw_decode.hw_device_ctx);
+    if (codec_ctx.*.hw_device_ctx == null) {
+        std.log.warn("ffmpeg: failed to reference CUDA hw device, using CPU decode", .{});
+        codec_ctx.*.@"opaque" = null;
+        codec_ctx.*.get_format = null;
+        hw_decode.hw_pix_fmt = c.AV_PIX_FMT_NONE;
+        return;
+    }
+
+    hw_decode.enabled = true;
+    std.log.info("ffmpeg: CUDA hw decode enabled", .{});
+}
+
+fn getHwFormat(codec_ctx: [*c]c.AVCodecContext, pix_fmts: [*c]const c.enum_AVPixelFormat) callconv(.c) c.enum_AVPixelFormat {
+    const hw_ptr: ?*HwDecodeContext = @ptrCast(@alignCast(codec_ctx.*.@"opaque"));
+    const hw_decode = hw_ptr orelse return pix_fmts[0];
+
+    var i: usize = 0;
+    while (pix_fmts[i] != c.AV_PIX_FMT_NONE) : (i += 1) {
+        if (pix_fmts[i] == hw_decode.hw_pix_fmt) return pix_fmts[i];
+    }
+    return pix_fmts[0];
 }
 
 fn recordReadPacketSample(stats: *DecodeStats, read_ns: i128) void {
