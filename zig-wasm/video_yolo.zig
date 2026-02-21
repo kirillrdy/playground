@@ -12,7 +12,7 @@ fn ortCheck(api: *const c.OrtApi, status: ?*c.OrtStatus) !void {
     return error.OnnxRuntimeError;
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, model_path: []const u8, use_cuda: bool) !void {
+fn runBenchmark(allocator: std.mem.Allocator, model_path: []const u8) !void {
     const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
     const api: *const c.OrtApi = @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable);
@@ -29,16 +29,14 @@ fn runBenchmark(allocator: std.mem.Allocator, model_path: []const u8, use_cuda: 
 
     var cuda_options: ?*c.OrtCUDAProviderOptionsV2 = null;
     defer if (cuda_options != null and api.ReleaseCUDAProviderOptions != null) api.ReleaseCUDAProviderOptions.?(cuda_options);
-    if (use_cuda) {
-        const create_cuda = api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-        const update_cuda = api.UpdateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-        const append_cuda = api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
-        try ortCheck(api, create_cuda(&cuda_options));
-        const keys = [_][*c]const u8{"device_id"};
-        const values = [_][*c]const u8{"0"};
-        try ortCheck(api, update_cuda(cuda_options, &keys, &values, keys.len));
-        try ortCheck(api, append_cuda(session_options, cuda_options));
-    }
+    const create_cuda = api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+    const update_cuda = api.UpdateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+    const append_cuda = api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
+    try ortCheck(api, create_cuda(&cuda_options));
+    const keys = [_][*c]const u8{"device_id"};
+    const values = [_][*c]const u8{"0"};
+    try ortCheck(api, update_cuda(cuda_options, &keys, &values, keys.len));
+    try ortCheck(api, append_cuda(session_options, cuda_options));
 
     const model_path_z = try allocator.dupeZ(u8, model_path);
     defer allocator.free(model_path_z);
@@ -119,19 +117,9 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var use_cuda = true;
     var explicit_model_path: ?[]const u8 = null;
 
     for (args[1..]) |arg| {
-        if (std.mem.startsWith(u8, arg, "--ep=")) {
-            const ep = arg["--ep=".len..];
-            if (std.mem.eql(u8, ep, "cpu")) {
-                use_cuda = false;
-            } else if (std.mem.eql(u8, ep, "cuda")) {
-                use_cuda = true;
-            } else return error.InvalidArguments;
-            continue;
-        }
         if (explicit_model_path == null) {
             explicit_model_path = arg;
             continue;
@@ -146,5 +134,5 @@ pub fn main() !void {
     };
     defer if (explicit_model_path == null) allocator.free(model_path);
 
-    try runBenchmark(allocator, model_path, use_cuda);
+    try runBenchmark(allocator, model_path);
 }
