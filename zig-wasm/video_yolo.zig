@@ -80,11 +80,13 @@ fn processVideo(allocator: std.mem.Allocator, runtime: *onnxruntime.Runtime, vid
     if (packet == null) return error.OutOfMemory;
     defer c.av_packet_free(&packet);
 
-    const width: usize = @intCast(codec_ctx.?.*.width);
-    const height: usize = @intCast(codec_ctx.?.*.height);
-    const width_i32: c_int = @intCast(width);
-    const height_i32: c_int = @intCast(height);
-    const rgb_len = width * height * 3;
+    const src_width_i32: c_int = codec_ctx.?.*.width;
+    const src_height_i32: c_int = codec_ctx.?.*.height;
+    const infer_width: usize = 640;
+    const infer_height: usize = 640;
+    const infer_width_i32: c_int = @intCast(infer_width);
+    const infer_height_i32: c_int = @intCast(infer_height);
+    const rgb_len = infer_width * infer_height * 3;
     const rgb = try allocator.alloc(u8, rgb_len);
     defer allocator.free(rgb);
 
@@ -95,19 +97,19 @@ fn processVideo(allocator: std.mem.Allocator, runtime: *onnxruntime.Runtime, vid
         &dst_linesize,
         rgb.ptr,
         c.AV_PIX_FMT_RGB24,
-        width_i32,
-        height_i32,
+        infer_width_i32,
+        infer_height_i32,
         1,
     ));
 
     const sws_ctx = c.sws_getContext(
-        width_i32,
-        height_i32,
+        src_width_i32,
+        src_height_i32,
         codec_ctx.?.*.pix_fmt,
-        width_i32,
-        height_i32,
+        infer_width_i32,
+        infer_height_i32,
         c.AV_PIX_FMT_RGB24,
-        c.SWS_BILINEAR,
+        c.SWS_FAST_BILINEAR,
         null,
         null,
         null,
@@ -118,12 +120,12 @@ fn processVideo(allocator: std.mem.Allocator, runtime: *onnxruntime.Runtime, vid
     var frame_index: usize = 0;
     while (c.av_read_frame(fmt_ctx, packet) >= 0) {
         if (packet.?.*.stream_index == stream_idx) {
-            try decodePacket(allocator, runtime, codec_ctx.?, frame.?, packet.?, sws_ctx, &dst_data, &dst_linesize, rgb, width, height, &frame_index);
+            try decodePacket(allocator, runtime, codec_ctx.?, frame.?, packet.?, sws_ctx, &dst_data, &dst_linesize, rgb, infer_width, infer_height, &frame_index);
         }
         c.av_packet_unref(packet);
     }
 
-    try decodePacket(allocator, runtime, codec_ctx.?, frame.?, null, sws_ctx, &dst_data, &dst_linesize, rgb, width, height, &frame_index);
+    try decodePacket(allocator, runtime, codec_ctx.?, frame.?, null, sws_ctx, &dst_data, &dst_linesize, rgb, infer_width, infer_height, &frame_index);
 }
 
 fn decodePacket(
@@ -144,10 +146,13 @@ fn decodePacket(
     if (send_ret == c.AVERROR_EOF) return;
     _ = try checkAv(send_ret);
     while (true) {
+        const decode_start_ns = std.time.nanoTimestamp();
         const ret = c.avcodec_receive_frame(codec_ctx, frame);
+        const decode_end_ns = std.time.nanoTimestamp();
         if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) return;
         _ = try checkAv(ret);
 
+        const scale_start_ns = std.time.nanoTimestamp();
         _ = c.sws_scale(
             sws_ctx,
             @ptrCast(&frame.data),
@@ -157,25 +162,41 @@ fn decodePacket(
             dst_data,
             dst_linesize,
         );
+        const scale_end_ns = std.time.nanoTimestamp();
 
         frame_index.* += 1;
-        const detections = runtime.detectFromRgb(allocator, rgb, .{
+        var detect_profile: onnxruntime.DetectProfile = .{};
+        const infer_total_start_ns = std.time.nanoTimestamp();
+        const detections = runtime.detectFromRgbWithProfile(allocator, rgb, .{
             .width = width,
             .height = height,
-        }) catch |err| {
+        }, &detect_profile) catch |err| {
             std.log.err("frame {d} detect error: {}", .{ frame_index.*, err });
             continue;
         };
+        const infer_total_end_ns = std.time.nanoTimestamp();
         defer runtime.freeDetections(allocator, detections);
 
-        std.debug.print("frame={d} detections={d}\n", .{ frame_index.*, detections.len });
-        for (detections) |d| {
-            const label = classLabel(d.class_id);
-            std.debug.print(
-                "  class={s}({d}) score={d:.3} box=[{d:.1},{d:.1},{d:.1},{d:.1}]\n",
-                .{ label, d.class_id, d.score, d.x1, d.y1, d.x2, d.y2 },
-            );
-        }
+        const decode_ms = @as(f64, @floatFromInt(decode_end_ns - decode_start_ns)) / @as(f64, std.time.ns_per_ms);
+        const scale_ms = @as(f64, @floatFromInt(scale_end_ns - scale_start_ns)) / @as(f64, std.time.ns_per_ms);
+        const preprocess_ms = @as(f64, @floatFromInt(detect_profile.preprocess_ns)) / @as(f64, std.time.ns_per_ms);
+        const run_ms = @as(f64, @floatFromInt(detect_profile.run_ns)) / @as(f64, std.time.ns_per_ms);
+        const post_ms = @as(f64, @floatFromInt(detect_profile.decode_ns)) / @as(f64, std.time.ns_per_ms);
+        const infer_total_ms = @as(f64, @floatFromInt(infer_total_end_ns - infer_total_start_ns)) / @as(f64, std.time.ns_per_ms);
+
+        std.debug.print(
+            "frame={d} decode_ms={d:.3} scale_ms={d:.3} preprocess_ms={d:.3} ort_run_ms={d:.3} post_ms={d:.3} infer_total_ms={d:.3} dets={d}\n",
+            .{
+                frame_index.*,
+                decode_ms,
+                scale_ms,
+                preprocess_ms,
+                run_ms,
+                post_ms,
+                infer_total_ms,
+                detections.len,
+            },
+        );
     }
 }
 

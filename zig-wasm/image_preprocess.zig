@@ -14,10 +14,37 @@ pub fn rgbU8ToNchwF32(
 ) ![]f32 {
     if (src_rgb.len != src_size.width * src_size.height * 3) return error.InvalidSourceSize;
     const dst_len = 3 * dst_size.width * dst_size.height;
-    var out = try allocator.alloc(f32, dst_len);
+    const out = try allocator.alloc(f32, dst_len);
     errdefer allocator.free(out);
+    try rgbU8ToNchwF32Into(out, src_rgb, src_size, dst_size);
+    return out;
+}
+
+pub fn rgbU8ToNchwF32Into(
+    out: []f32,
+    src_rgb: []const u8,
+    src_size: ImageSize,
+    dst_size: ImageSize,
+) !void {
+    if (src_rgb.len != src_size.width * src_size.height * 3) return error.InvalidSourceSize;
+    const dst_len = 3 * dst_size.width * dst_size.height;
+    if (out.len != dst_len) return error.InvalidDestinationSize;
 
     const plane = dst_size.width * dst_size.height;
+    if (src_size.width == dst_size.width and src_size.height == dst_size.height) {
+        for (0..dst_size.height) |dy| {
+            for (0..dst_size.width) |dx| {
+                const src_idx = ((dy * src_size.width) + dx) * 3;
+                const dst_idx = (dy * dst_size.width) + dx;
+
+                out[dst_idx] = @as(f32, @floatFromInt(src_rgb[src_idx])) / 255.0;
+                out[plane + dst_idx] = @as(f32, @floatFromInt(src_rgb[src_idx + 1])) / 255.0;
+                out[(2 * plane) + dst_idx] = @as(f32, @floatFromInt(src_rgb[src_idx + 2])) / 255.0;
+            }
+        }
+        return;
+    }
+
     for (0..dst_size.height) |dy| {
         const sy = mapNearest(dy, dst_size.height, src_size.height);
         for (0..dst_size.width) |dx| {
@@ -31,7 +58,6 @@ pub fn rgbU8ToNchwF32(
             out[(2 * plane) + dst_idx] = @as(f32, @floatFromInt(src_rgb[src_idx + 2])) / 255.0;
         }
     }
-    return out;
 }
 
 fn mapNearest(dst_idx: usize, dst_len: usize, src_len: usize) usize {
@@ -66,7 +92,7 @@ test "rgbU8ToNchwF32 2x2 to 1x1 picks nearest center" {
     // (0,0) red      (1,0) green
     // (0,1) blue     (1,1) white
     const src = [_]u8{
-        255, 0, 0, 0, 255, 0,
+        255, 0, 0,   0,   255, 0,
         0,   0, 255, 255, 255, 255,
     };
     const out = try rgbU8ToNchwF32(

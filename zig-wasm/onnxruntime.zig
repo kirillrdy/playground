@@ -5,6 +5,11 @@ const image_decode = @import("image_decode.zig");
 const image_preprocess = @import("image_preprocess.zig");
 
 pub const Detection = yolo.Detection;
+pub const DetectProfile = struct {
+    preprocess_ns: i128 = 0,
+    run_ns: i128 = 0,
+    decode_ns: i128 = 0,
+};
 
 const c = @cImport({
     @cInclude("onnxruntime_c_api.h");
@@ -53,6 +58,10 @@ pub const Runtime = struct {
     env: ?*c.OrtEnv,
     session_options: ?*c.OrtSessionOptions,
     session: ?*c.OrtSession,
+    input_memory_info: ?*c.OrtMemoryInfo,
+    input_name: ?[:0]u8,
+    output_name: ?[:0]u8,
+    reusable_input_tensor: ?[]f32,
 
     pub const InitOptions = struct {
         use_cuda: bool = true,
@@ -76,6 +85,10 @@ pub const Runtime = struct {
             .env = null,
             .session_options = null,
             .session = null,
+            .input_memory_info = null,
+            .input_name = null,
+            .output_name = null,
+            .reusable_input_tensor = null,
         };
         errdefer runtime.deinit();
 
@@ -86,15 +99,52 @@ pub const Runtime = struct {
         const model_path_z = try allocator.dupeZ(u8, model_path);
         defer allocator.free(model_path_z);
         try runtime.check(runtime.api.CreateSession.?(runtime.env, model_path_z.ptr, runtime.session_options, &runtime.session));
+        try runtime.initInferenceCache();
 
         return runtime;
     }
 
     pub fn deinit(self: *@This()) void {
+        if (self.reusable_input_tensor) |tensor| self.allocator.free(tensor);
+        if (self.input_name) |name| self.allocator.free(name);
+        if (self.output_name) |name| self.allocator.free(name);
+        if (self.input_memory_info) |info| self.api.ReleaseMemoryInfo.?(info);
         if (self.session) |session| self.api.ReleaseSession.?(session);
         if (self.session_options) |session_options| self.api.ReleaseSessionOptions.?(session_options);
         if (self.env) |env| self.api.ReleaseEnv.?(env);
         self.* = undefined;
+    }
+
+    fn initInferenceCache(self: *@This()) !void {
+        const input_tensor_len = 1 * 3 * 640 * 640;
+        self.reusable_input_tensor = try self.allocator.alloc(f32, input_tensor_len);
+        errdefer {
+            if (self.reusable_input_tensor) |tensor| self.allocator.free(tensor);
+            self.reusable_input_tensor = null;
+        }
+
+        try self.check(self.api.CreateCpuMemoryInfo.?(c.OrtArenaAllocator, c.OrtMemTypeDefault, &self.input_memory_info));
+        errdefer {
+            if (self.input_memory_info) |info| self.api.ReleaseMemoryInfo.?(info);
+            self.input_memory_info = null;
+        }
+
+        var allocator_ort: ?*c.OrtAllocator = null;
+        try self.check(self.api.GetAllocatorWithDefaultOptions.?(&allocator_ort));
+
+        var input_name_alloc: [*c]u8 = null;
+        try self.check(self.api.SessionGetInputName.?(self.session, 0, allocator_ort, &input_name_alloc));
+        defer _ = self.api.AllocatorFree.?(allocator_ort, input_name_alloc);
+        self.input_name = try self.allocator.dupeZ(u8, std.mem.span(input_name_alloc));
+        errdefer {
+            if (self.input_name) |name| self.allocator.free(name);
+            self.input_name = null;
+        }
+
+        var output_name_alloc: [*c]u8 = null;
+        try self.check(self.api.SessionGetOutputName.?(self.session, 0, allocator_ort, &output_name_alloc));
+        defer _ = self.api.AllocatorFree.?(allocator_ort, output_name_alloc);
+        self.output_name = try self.allocator.dupeZ(u8, std.mem.span(output_name_alloc));
     }
 
     fn check(self: *@This(), status: ?*c.OrtStatus) !void {
@@ -190,14 +240,30 @@ pub const Runtime = struct {
         rgb: []const u8,
         image_size: image_preprocess.ImageSize,
     ) ![]Detection {
+        var profile: DetectProfile = .{};
+        return self.detectFromRgbWithProfile(allocator, rgb, image_size, &profile);
+    }
+
+    pub fn detectFromRgbWithProfile(
+        self: *@This(),
+        allocator: Allocator,
+        rgb: []const u8,
+        image_size: image_preprocess.ImageSize,
+        profile: *DetectProfile,
+    ) ![]Detection {
         const input_size = image_preprocess.ImageSize{ .width = 640, .height = 640 };
-        const input_tensor = try image_preprocess.rgbU8ToNchwF32(allocator, rgb, image_size, input_size);
-        defer allocator.free(input_tensor);
+        const input_tensor = self.reusable_input_tensor orelse return error.RuntimeNotInitialized;
+        const preprocess_start_ns = std.time.nanoTimestamp();
+        try image_preprocess.rgbU8ToNchwF32Into(input_tensor, rgb, image_size, input_size);
+        profile.preprocess_ns = std.time.nanoTimestamp() - preprocess_start_ns;
 
-        const output = try self.runSingleInput(allocator, input_tensor, .{ 1, 3, 640, 640 });
-        defer allocator.free(output.values);
+        const run_start_ns = std.time.nanoTimestamp();
+        const output = try self.runSingleInput(input_tensor);
+        profile.run_ns = std.time.nanoTimestamp() - run_start_ns;
+        defer self.api.ReleaseValue.?(output.output_value);
 
-        return self.decodeYoloOutput(
+        const decode_start_ns = std.time.nanoTimestamp();
+        const detections = try self.decodeYoloOutput(
             allocator,
             output.values,
             output.boxes,
@@ -206,20 +272,23 @@ pub const Runtime = struct {
             0.25,
             0.45,
         );
+        profile.decode_ns = std.time.nanoTimestamp() - decode_start_ns;
+        return detections;
     }
 
-    const InferenceOutput = struct {
-        values: []f32,
+    const InferenceOutputView = struct {
+        output_value: *c.OrtValue,
+        values: []const f32,
         boxes: usize,
         classes: usize,
         layout: yolo.OutputLayout,
     };
 
-    fn runSingleInput(self: *@This(), allocator: Allocator, input: []f32, shape: [4]i64) !InferenceOutput {
-        var memory_info: ?*c.OrtMemoryInfo = null;
-        try self.check(self.api.CreateCpuMemoryInfo.?(c.OrtArenaAllocator, c.OrtMemTypeDefault, &memory_info));
-        defer self.api.ReleaseMemoryInfo.?(memory_info);
-
+    fn runSingleInput(self: *@This(), input: []f32) !InferenceOutputView {
+        const memory_info = self.input_memory_info orelse return error.RuntimeNotInitialized;
+        const input_name = self.input_name orelse return error.RuntimeNotInitialized;
+        const output_name = self.output_name orelse return error.RuntimeNotInitialized;
+        const shape = [_]i64{ 1, 3, 640, 640 };
         var input_value: ?*c.OrtValue = null;
         try self.check(self.api.CreateTensorWithDataAsOrtValue.?(
             memory_info,
@@ -232,20 +301,9 @@ pub const Runtime = struct {
         ));
         defer self.api.ReleaseValue.?(input_value);
 
-        var allocator_ort: ?*c.OrtAllocator = null;
-        try self.check(self.api.GetAllocatorWithDefaultOptions.?(&allocator_ort));
-
-        var input_name_alloc: [*c]u8 = null;
-        try self.check(self.api.SessionGetInputName.?(self.session, 0, allocator_ort, &input_name_alloc));
-        defer _ = self.api.AllocatorFree.?(allocator_ort, input_name_alloc);
-
-        var output_name_alloc: [*c]u8 = null;
-        try self.check(self.api.SessionGetOutputName.?(self.session, 0, allocator_ort, &output_name_alloc));
-        defer _ = self.api.AllocatorFree.?(allocator_ort, output_name_alloc);
-
         var output_value: ?*c.OrtValue = null;
-        const input_names = [_][*c]const u8{input_name_alloc};
-        const output_names = [_][*c]const u8{output_name_alloc};
+        const input_names = [_][*c]const u8{input_name.ptr};
+        const output_names = [_][*c]const u8{output_name.ptr};
         const input_values = [_]?*c.OrtValue{input_value};
         try self.check(self.api.Run.?(
             self.session,
@@ -257,7 +315,6 @@ pub const Runtime = struct {
             1,
             &output_value,
         ));
-        defer self.api.ReleaseValue.?(output_value);
 
         var tensor_info: ?*c.OrtTensorTypeAndShapeInfo = null;
         try self.check(self.api.GetTensorTypeAndShape.?(output_value, &tensor_info));
@@ -265,9 +322,10 @@ pub const Runtime = struct {
 
         var dim_count: usize = 0;
         try self.check(self.api.GetDimensionsCount.?(tensor_info, &dim_count));
-        const dims = try allocator.alloc(i64, dim_count);
-        defer allocator.free(dims);
-        try self.check(self.api.GetDimensions.?(tensor_info, dims.ptr, dim_count));
+        var dims_buf: [8]i64 = undefined;
+        if (dim_count > dims_buf.len) return error.UnsupportedOutputRank;
+        try self.check(self.api.GetDimensions.?(tensor_info, &dims_buf, dim_count));
+        const dims = dims_buf[0..dim_count];
 
         var out_ptr_raw: ?*anyopaque = null;
         try self.check(self.api.GetTensorMutableData.?(output_value, &out_ptr_raw));
@@ -275,13 +333,13 @@ pub const Runtime = struct {
 
         var total: usize = 1;
         for (dims) |d| total *= @as(usize, @intCast(d));
-        const copied = try allocator.alloc(f32, total);
-        @memcpy(copied, out_ptr[0..total]);
 
         const spec = inferOutputSpec(dim_count, dims, total);
+        const output_value_nonnull = output_value orelse return error.OnnxRuntimeError;
 
         return .{
-            .values = copied,
+            .output_value = output_value_nonnull,
+            .values = out_ptr[0..total],
             .boxes = spec.boxes,
             .classes = spec.classes,
             .layout = spec.layout,
