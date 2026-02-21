@@ -44,10 +44,6 @@
             .url = "https://github.com/jetzig-framework/jetquery/archive/a5a97b5f10dbd43b4dd18d9fddb7a1d9f1403c91.tar.gz",
             .hash = "jetquery-0.0.0-TNf3zuDABgCbhjXEg2zcJSfspQd2MNwxZw3gdr1Do17U",
         },
-        .zts = .{
-            .url = "git+https://github.com/zigster64/zts?ref=main#224c00c91df5ece10d4f2c1bf0941860f00e0db8",
-            .hash = "zts-0.14.1-_M80OeuzAgCFTHHiQlm0I6k1pVnZ9ClMetC7iZV5_Q9D",
-        },
     },
     .paths = .{
         "build.zig",

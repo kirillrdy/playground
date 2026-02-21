@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) !void {
         .wasm = b.createModule(.{ .root_source_file = b.path("wasm.zig"), .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }), .optimize = optimize }),
     };
 
-    inline for (&.{ "httpz", "jetquery", "zts" }) |dependency_name| {
+    inline for (&.{ "httpz", "jetquery" }) |dependency_name| {
         modules.server.addImport(dependency_name, b.dependency(dependency_name, .{}).module(dependency_name));
     }
 

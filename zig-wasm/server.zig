@@ -6,10 +6,165 @@ const jetquery = @import("jetquery");
 const Schema = @import("Schema.zig");
 const postgres = @import("postgres.zig");
 const string = []const u8;
-const zts = @import("zts");
 
 const print = std.log.info;
 const port = 3000;
+
+const templates = struct {
+    const Error = error{
+        SectionNotFound,
+        MissingTemplateArg,
+    };
+
+    fn parseSectionName(line: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len < 2 or trimmed[0] != '.') return null;
+        const name = std.mem.trim(u8, trimmed[1..], " \t");
+        if (name.len == 0) return null;
+        return name;
+    }
+
+    fn findHeaderEnd(template: string) usize {
+        var index: usize = 0;
+        while (index < template.len) {
+            const line_start = index;
+            const newline_index = std.mem.indexOfScalarPos(u8, template, index, '\n') orelse template.len;
+            const line = template[line_start..newline_index];
+            if (parseSectionName(line) != null) return line_start;
+            index = if (newline_index == template.len) template.len else newline_index + 1;
+        }
+        return template.len;
+    }
+
+    fn sectionRange(template: string, section: string) ?struct { start: usize, end: usize } {
+        var index: usize = 0;
+        var section_start: ?usize = null;
+
+        while (index < template.len) {
+            const line_start = index;
+            const newline_index = std.mem.indexOfScalarPos(u8, template, index, '\n') orelse template.len;
+            const line = template[line_start..newline_index];
+
+            if (parseSectionName(line)) |name| {
+                if (section_start != null) return .{ .start = section_start.?, .end = line_start };
+                if (std.mem.eql(u8, name, section)) {
+                    section_start = if (newline_index == template.len) template.len else newline_index + 1;
+                }
+            }
+            index = if (newline_index == template.len) template.len else newline_index + 1;
+        }
+
+        if (section_start) |start| return .{ .start = start, .end = template.len };
+        return null;
+    }
+
+    fn writeArg(writer: anytype, args: anytype, name: []const u8, specifier: []const u8) !bool {
+        const Args = @TypeOf(args);
+        const info = @typeInfo(Args);
+        if (info != .@"struct") @compileError("template args must be a struct");
+
+        inline for (info.@"struct".fields) |field| {
+            if (std.mem.eql(u8, field.name, name)) {
+                const value = @field(args, field.name);
+                if (std.mem.eql(u8, specifier, "s")) {
+                    switch (@typeInfo(@TypeOf(value))) {
+                        .pointer => |ptr| {
+                            switch (ptr.size) {
+                                .slice => {
+                                    if (ptr.child == u8) {
+                                        try writer.writeAll(value);
+                                    } else {
+                                        try writer.print("{any}", .{value});
+                                    }
+                                },
+                                .many, .c => {
+                                    if (ptr.child == u8) {
+                                        try writer.writeAll(std.mem.span(value));
+                                    } else {
+                                        try writer.print("{any}", .{value});
+                                    }
+                                },
+                                .one => {
+                                    switch (@typeInfo(ptr.child)) {
+                                        .array => |arr| {
+                                            if (arr.child == u8) {
+                                                try writer.writeAll(value[0..]);
+                                            } else {
+                                                try writer.print("{any}", .{value});
+                                            }
+                                        },
+                                        else => try writer.print("{any}", .{value}),
+                                    }
+                                },
+                            }
+                        },
+                        .array => |arr| {
+                            if (arr.child == u8) {
+                                try writer.writeAll(value[0..]);
+                            } else {
+                                try writer.print("{any}", .{value});
+                            }
+                        },
+                        else => try writer.print("{any}", .{value}),
+                    }
+                } else if (std.mem.eql(u8, specifier, "d")) {
+                    switch (@typeInfo(@TypeOf(value))) {
+                        .int, .comptime_int => try writer.print("{d}", .{value}),
+                        else => try writer.print("{any}", .{value}),
+                    }
+                } else {
+                    try writer.print("{any}", .{value});
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn renderWithArgs(writer: anytype, template: string, args: anytype) !void {
+        var literal_start: usize = 0;
+        var index: usize = 0;
+
+        while (index < template.len) : (index += 1) {
+            if (template[index] != '{' or index + 1 >= template.len or template[index + 1] != '[') continue;
+
+            const close_bracket = std.mem.indexOfScalarPos(u8, template, index + 2, ']') orelse continue;
+            const close_brace = std.mem.indexOfScalarPos(u8, template, close_bracket + 1, '}') orelse continue;
+
+            const name = template[index + 2 .. close_bracket];
+            const specifier = template[close_bracket + 1 .. close_brace];
+            if (!std.mem.eql(u8, specifier, "s") and !std.mem.eql(u8, specifier, "d") and !std.mem.eql(u8, specifier, "any")) continue;
+
+            try writer.writeAll(template[literal_start..index]);
+            if (!try writeArg(writer, args, name, specifier)) return Error.MissingTemplateArg;
+
+            index = close_brace;
+            literal_start = index + 1;
+        }
+
+        if (literal_start < template.len) {
+            try writer.writeAll(template[literal_start..]);
+        }
+    }
+
+    fn writeHeader(template: string, writer: anytype) !void {
+        try writer.writeAll(template[0..findHeaderEnd(template)]);
+    }
+
+    fn printHeader(template: string, args: anytype, writer: anytype) !void {
+        try renderWithArgs(writer, template[0..findHeaderEnd(template)], args);
+    }
+
+    fn write(template: string, section: string, writer: anytype) !void {
+        const range = sectionRange(template, section) orelse return Error.SectionNotFound;
+        try writer.writeAll(template[range.start..range.end]);
+    }
+
+    fn print(template: string, section: string, args: anytype, writer: anytype) !void {
+        const range = sectionRange(template, section) orelse return Error.SectionNotFound;
+        try renderWithArgs(writer, template[range.start..range.end], args);
+    }
+};
 
 pub const wasm_app_name = "main";
 pub const server_name = "main";
@@ -114,19 +269,19 @@ fn responseType(name: string, options: responseOptions) type {
         out: *std.io.Writer,
         repo: *Repo,
         fn print(self: @This(), comptime section: string, args: anytype) !void {
-            try zts.print(self.template, section, args, self.out);
+            try templates.print(self.template, section, args, self.out);
         }
 
         fn printHeader(self: @This(), args: anytype) !void {
-            try zts.printHeader(self.template, args, self.out);
+            try templates.printHeader(self.template, args, self.out);
         }
 
         fn writeHeader(self: @This()) !void {
-            try zts.writeHeader(self.template, self.out);
+            try templates.writeHeader(self.template, self.out);
         }
 
         fn write(self: @This(), section: string) !void {
-            try zts.write(self.template, section, self.out);
+            try templates.write(self.template, section, self.out);
         }
     };
 }
@@ -145,11 +300,11 @@ fn makeHandlerWithOptions(name: string, options: responseOptions) httpzHandler {
             var writerAllocating = std.Io.Writer.Allocating.init(httpzResponse.arena);
             const writer = &writerAllocating.writer;
             const layout = @embedFile("views/layout.html");
-            try zts.writeHeader(layout, writer);
-            try zts.print(layout, "title", .{ .title = space, .css = Paths.css_file }, writer);
+            try templates.writeHeader(layout, writer);
+            try templates.print(layout, "title", .{ .title = space, .css = Paths.css_file }, writer);
             const response = responseType(name, options){ .out = writer, .repo = repo };
             try func(response);
-            try zts.write(layout, "close-body", writer);
+            try templates.write(layout, "close-body", writer);
             httpzResponse.body = writerAllocating.written();
         }
     }.handler;
@@ -165,25 +320,25 @@ const Repo = jetquery.Repo(.postgresql, Schema);
 fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
     const resultRowType = @typeInfo(@TypeOf(records)).pointer.child;
     const template = @embedFile("views/table.html");
-    try zts.printHeader(template, .{ .title = title }, writer);
+    try templates.printHeader(template, .{ .title = title }, writer);
     const query_fields = @typeInfo(resultRowType).@"struct".fields;
 
     inline for (query_fields) |field| {
         if (!std.mem.startsWith(u8, field.name, "_")) {
-            try zts.print(template, "th", .{ .value = removeUndescores(field.name) }, writer);
+            try templates.print(template, "th", .{ .value = removeUndescores(field.name) }, writer);
         }
     }
-    try zts.write(template, "th-close", writer);
+    try templates.write(template, "th-close", writer);
 
     for (records) |file| {
-        try zts.write(template, "tr", writer);
+        try templates.write(template, "tr", writer);
         inline for (query_fields) |field| {
             if (comptime !std.mem.startsWith(u8, field.name, "_")) {
                 const value = @field(file, field.name);
 
                 switch (@TypeOf(value)) {
-                    i32 => try zts.print(template, "td-number", .{ .value = value }, writer),
-                    string => try zts.print(template, "td-string", .{ .value = value }, writer),
+                    i32 => try templates.print(template, "td-number", .{ .value = value }, writer),
+                    string => try templates.print(template, "td-string", .{ .value = value }, writer),
                     jetquery.DateTime => {
                         try writer.writeAll(
                             \\<td class="px-6 py-4">
@@ -195,9 +350,9 @@ fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
                 }
             }
         }
-        try zts.write(template, "tr-close", writer);
+        try templates.write(template, "tr-close", writer);
     }
-    try zts.write(template, "tbody-close", writer);
+    try templates.write(template, "tbody-close", writer);
 }
 
 const Files = struct {
