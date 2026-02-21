@@ -123,7 +123,6 @@ fn processVideo(allocator: std.mem.Allocator, runtime: *onnxruntime.Runtime, vid
         c.av_packet_unref(packet);
     }
 
-    _ = try checkAv(c.avcodec_send_packet(codec_ctx, null));
     try decodePacket(allocator, runtime, codec_ctx.?, frame.?, null, sws_ctx, &dst_data, &dst_linesize, rgb, width, height, &frame_index);
 }
 
@@ -141,7 +140,9 @@ fn decodePacket(
     height: usize,
     frame_index: *usize,
 ) !void {
-    _ = try checkAv(c.avcodec_send_packet(codec_ctx, packet));
+    const send_ret = c.avcodec_send_packet(codec_ctx, packet);
+    if (send_ret == c.AVERROR_EOF) return;
+    _ = try checkAv(send_ret);
     while (true) {
         const ret = c.avcodec_receive_frame(codec_ctx, frame);
         if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) return;
