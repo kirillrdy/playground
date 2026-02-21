@@ -39,7 +39,6 @@ fn rgbU8ToNchwF32(dst: []f32, rgb: []const u8, width: usize, height: usize) void
 fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8) !void {
     const input_w: usize = 640;
     const input_h: usize = 640;
-    const warmup_frames: usize = 20;
 
     const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
@@ -163,7 +162,6 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8) !void {
     const input_values = [_]?*c.OrtValue{input_value};
 
     var decoded_frames: usize = 0;
-    var measured_frames: usize = 0;
     var total_ns: i128 = 0;
 
     var done = false;
@@ -215,24 +213,22 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8) !void {
             const end_ns = std.time.nanoTimestamp();
 
             decoded_frames += 1;
-            if (decoded_frames > warmup_frames) {
-                measured_frames += 1;
-                total_ns += end_ns - start_ns;
-            }
+            total_ns += end_ns - start_ns;
 
             c.av_frame_unref(frame);
         }
     }
 
-    if (measured_frames == 0 or total_ns <= 0) {
-        std.debug.print("0.00\n", .{});
+    if (decoded_frames == 0 or total_ns <= 0) {
+        std.debug.print("duration_s=0.000 frames=0 fps=0.00\n", .{});
         return;
     }
 
+    const duration_s = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
     const fps =
-        (@as(f64, @floatFromInt(measured_frames)) * @as(f64, @floatFromInt(std.time.ns_per_s))) /
+        (@as(f64, @floatFromInt(decoded_frames)) * @as(f64, @floatFromInt(std.time.ns_per_s))) /
         @as(f64, @floatFromInt(total_ns));
-    std.debug.print("{d:.2}\n", .{fps});
+    std.debug.print("duration_s={d:.3} frames={d} fps={d:.2}\n", .{ duration_s, decoded_frames, fps });
 }
 
 pub fn main() !void {
