@@ -1,7 +1,6 @@
 const std = @import("std");
 const wasm_app_name = @import("server.zig").wasm_app_name;
 const server_name = @import("server.zig").server_name;
-const css_file = @import("server.zig").file_names.css;
 const string = []const u8;
 
 fn createModule(b: *std.Build, src: string, target: anytype, optimize: anytype) *std.Build.Module {
@@ -46,26 +45,6 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(server);
     b.installArtifact(wasm_app);
     b.installArtifact(dev_server);
-
-    const tailwindcss = b.addSystemCommand(&.{
-        "tailwindcss",
-        "-i",
-    });
-    tailwindcss.addFileArg(b.path("main.css"));
-    var dir = try std.fs.cwd().openDir("views/", .{ .iterate = true });
-    defer dir.close();
-
-    var walker = try dir.walk(b.allocator);
-    defer walker.deinit();
-
-    while (try walker.next()) |entry| {
-        if (entry.kind == .file) {
-            tailwindcss.addFileInput(b.path(b.fmt("views/{s}", .{entry.path})));
-        }
-    }
-
-    tailwindcss.addArg("-o");
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(tailwindcss.addOutputFileArg(css_file), .bin, css_file).step);
 
     const run_server = b.addRunArtifact(dev_server);
     // By making the run step depend on the install step, it will be run from the

@@ -172,7 +172,6 @@ pub const server_name = "main";
 pub const file_names = struct {
     const wasm = wasm_app_name ++ ".wasm";
     const wasm_js = "wasm.js";
-    pub const css = "main.css";
 };
 
 fn resource(name: string) type {
@@ -188,7 +187,6 @@ const Paths = struct {
     const wasm = "/wasm";
     const wasm_file = "/" ++ file_names.wasm;
     const wasm_js_file = "/" ++ file_names.wasm_js;
-    const css_file = "/" ++ file_names.css;
 };
 
 pub fn main() !void {
@@ -214,7 +212,6 @@ pub fn main() !void {
     router.get(Paths.wasm, makeHandler("handlers/wasm"), .{});
     router.get(Paths.wasm_js_file, wasmJsFile, .{});
     router.get(Paths.wasm_file, wasmFile, .{});
-    router.get(Paths.css_file, cssFile, .{});
     router.get("/favicon.ico", faviconHandler, .{});
 
     print("processor model: {s}", .{builtin.cpu.model.name});
@@ -292,7 +289,7 @@ fn makeHandlerWithOptions(name: string, options: responseOptions) httpzHandler {
             const writer = &writerAllocating.writer;
             const layout = @embedFile("views/layout.html");
             try templates.writeHeader(layout, writer);
-            try templates.print(layout, "title", .{ .title = space, .css = Paths.css_file }, writer);
+            try templates.print(layout, "title", .{ .title = space }, writer);
             const response = responseType(name, options){ .out = writer, .repo = repo };
             try func(response);
             try templates.write(layout, "close-body", writer);
@@ -491,11 +488,6 @@ fn wasmFile(_: *Repo, _: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .WASM;
     res.body = try sendFile(res.arena, file_names.wasm);
 }
-fn cssFile(_: *Repo, _: *httpz.Request, res: *httpz.Response) !void {
-    res.content_type = .CSS;
-    res.body = try sendFile(res.arena, file_names.css);
-}
-
 fn faviconHandler(_: *Repo, _: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .SVG;
     res.body = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"></svg>";

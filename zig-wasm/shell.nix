@@ -7,6 +7,5 @@ pkgs.mkShell {
     zig_0_15
     zls_0_15
     openssl
-    tailwindcss_4
   ];
 }
