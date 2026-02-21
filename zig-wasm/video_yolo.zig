@@ -38,14 +38,9 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
     defer release_cuda(cuda_options);
     try ortCheck(api, append_cuda(session_options, cuda_options));
 
-    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
-    defer allocator.free(exe_dir);
-    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.onnx", .{exe_dir});
-    defer allocator.free(model_path);
-    const model_path_z = try allocator.dupeZ(u8, model_path);
-    defer allocator.free(model_path_z);
+    const model_path_z: [*:0]const u8 = "zig-out/bin/model.onnx";
     var session: ?*c.OrtSession = null;
-    try ortCheck(api, api.CreateSession.?(env, model_path_z.ptr, session_options, &session));
+    try ortCheck(api, api.CreateSession.?(env, model_path_z, session_options, &session));
     defer if (session) |v| api.ReleaseSession.?(v);
 
     var memory_info: ?*c.OrtMemoryInfo = null;
