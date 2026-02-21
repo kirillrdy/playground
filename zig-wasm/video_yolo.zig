@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("config");
 
 const c = @cImport({
     @cInclude("onnxruntime_c_api.h");
@@ -38,9 +39,10 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
     defer release_cuda(cuda_options);
     try ortCheck(api, append_cuda(session_options, cuda_options));
 
-    const model_path_z: [*:0]const u8 = "zig-out/bin/model.onnx";
+    const model_path_z = try allocator.dupeZ(u8, config.model_path);
+    defer allocator.free(model_path_z);
     var session: ?*c.OrtSession = null;
-    try ortCheck(api, api.CreateSession.?(env, model_path_z, session_options, &session));
+    try ortCheck(api, api.CreateSession.?(env, model_path_z.ptr, session_options, &session));
     defer if (session) |v| api.ReleaseSession.?(v);
 
     var memory_info: ?*c.OrtMemoryInfo = null;

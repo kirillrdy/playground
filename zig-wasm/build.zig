@@ -84,6 +84,8 @@ pub fn build(b: *std.Build) !void {
     modules.server.addImport("zigimg", zigimg.module("zigimg"));
     if (onnx_dev_root) |path| modules.server.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     if (onnx_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
+    const video_yolo_options = b.addOptions();
+    modules.video_yolo.addOptions("config", video_yolo_options);
 
     inline for (&.{"httpz"}) |dependency_name| {
         modules.server.addImport(dependency_name, b.dependency(dependency_name, .{}).module(dependency_name));
@@ -131,6 +133,7 @@ pub fn build(b: *std.Build) !void {
     const fetch_model = b.addSystemCommand(&.{ "curl", "-fL", "--retry", "3", "-o" });
     const model_output = fetch_model.addOutputFileArg("model.onnx");
     fetch_model.addArg(model_url);
+    video_yolo_options.addOptionPath("model_path", model_output);
     const install_model = b.addInstallFileWithDir(model_output, .bin, "model.onnx");
     b.getInstallStep().dependOn(&install_model.step);
 
