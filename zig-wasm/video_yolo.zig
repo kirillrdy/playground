@@ -30,35 +30,6 @@ fn parseKbLine(line: []const u8, prefix: []const u8) ?u64 {
     return std.fmt.parseInt(u64, tail[0..end], 10) catch null;
 }
 
-fn printSelfMemoryRollup() void {
-    const path = "/proc/self/smaps_rollup";
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        std.log.warn("cannot open {s}: {}", .{ path, err });
-        return;
-    };
-    defer file.close();
-
-    const data = file.readToEndAlloc(std.heap.page_allocator, 1 << 20) catch |err| {
-        std.log.warn("cannot read {s}: {}", .{ path, err });
-        return;
-    };
-    defer std.heap.page_allocator.free(data);
-
-    std.debug.print("memory snapshot ({s}):\n", .{path});
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "Rss:") or
-            std.mem.startsWith(u8, line, "Pss:") or
-            std.mem.startsWith(u8, line, "Shared_Clean:") or
-            std.mem.startsWith(u8, line, "Shared_Dirty:") or
-            std.mem.startsWith(u8, line, "Private_Clean:") or
-            std.mem.startsWith(u8, line, "Private_Dirty:"))
-        {
-            std.debug.print("{s}\n", .{line});
-        }
-    }
-}
-
 fn isSmapsHeaderLine(line: []const u8) bool {
     const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return false;
     const addr = line[0..first_space];
@@ -94,75 +65,6 @@ fn mappingLess(_: void, lhs: MappingStat, rhs: MappingStat) bool {
     return lhs.rss_kb > rhs.rss_kb;
 }
 
-fn printTopMemoryMappings(allocator: std.mem.Allocator) void {
-    const path = "/proc/self/smaps";
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        std.log.warn("cannot open {s}: {}", .{ path, err });
-        return;
-    };
-    defer file.close();
-
-    const data = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
-        std.log.warn("cannot read {s}: {}", .{ path, err });
-        return;
-    };
-    defer allocator.free(data);
-
-    var maps = std.ArrayList(MappingStat).initCapacity(allocator, 0) catch |err| {
-        std.log.warn("cannot allocate mapping list: {}", .{err});
-        return;
-    };
-    defer maps.deinit(allocator);
-    var current_idx: ?usize = null;
-
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        if (isSmapsHeaderLine(line)) {
-            var m: MappingStat = .{};
-            const name = parseMappingName(line);
-            m.name_len = copyName(&m.name, name);
-            maps.append(allocator, m) catch break;
-            current_idx = maps.items.len - 1;
-            continue;
-        }
-
-        if (current_idx == null) continue;
-        const idx = current_idx.?;
-
-        if (parseKbLine(line, "Rss:")) |v| {
-            maps.items[idx].rss_kb = v;
-            continue;
-        }
-        if (parseKbLine(line, "Pss:")) |v| {
-            maps.items[idx].pss_kb = v;
-            continue;
-        }
-        if (parseKbLine(line, "Private_Clean:")) |v| {
-            maps.items[idx].private_clean_kb = v;
-            continue;
-        }
-        if (parseKbLine(line, "Private_Dirty:")) |v| {
-            maps.items[idx].private_dirty_kb = v;
-            continue;
-        }
-    }
-
-    std.sort.heap(MappingStat, maps.items, {}, mappingLess);
-    std.debug.print("top mappings by Private_Dirty (kB):\n", .{});
-    std.debug.print("{s:>12} {s:>12} {s:>12} {s:>12}  {s}\n", .{ "PrivDirty", "PrivClean", "RSS", "PSS", "Mapping" });
-
-    const top_n: usize = @min(12, maps.items.len);
-    for (maps.items[0..top_n]) |m| {
-        std.debug.print("{d:>12} {d:>12} {d:>12} {d:>12}  {s}\n", .{
-            m.private_dirty_kb,
-            m.private_clean_kb,
-            m.rss_kb,
-            m.pss_kb,
-            m.name[0..m.name_len],
-        });
-    }
-}
-
 fn runEmptyFrameInference(allocator: std.mem.Allocator, model_path: []const u8, use_cuda: bool) !void {
     const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
@@ -195,15 +97,9 @@ fn runEmptyFrameInference(allocator: std.mem.Allocator, model_path: []const u8, 
 
         const keys = [_][*c]const u8{
             "device_id",
-            "cudnn_conv_use_max_workspace",
-            "cudnn_conv_algo_search",
-            "gpu_mem_limit",
         };
         const values = [_][*c]const u8{
             "0",
-            "0",
-            "HEURISTIC",
-            "268435456",
         };
         try ortCheck(api, update_cuda(cuda_options, &keys, &values, keys.len));
         try ortCheck(api, append_cuda(session_options, cuda_options));
@@ -291,8 +187,6 @@ fn runEmptyFrameInference(allocator: std.mem.Allocator, model_path: []const u8, 
     std.debug.print("run min: {d:.3} ms\n", .{min_ms});
     std.debug.print("run max: {d:.3} ms\n", .{max_ms});
     std.debug.print("throughput: {d:.2} fps\n", .{(@as(f64, @floatFromInt(measured_iters)) * 1000.0) / total_ms});
-    printSelfMemoryRollup();
-    printTopMemoryMappings(allocator);
 }
 
 pub fn main() !void {
@@ -304,8 +198,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var use_cuda = true;
-    var model_path: []const u8 = "model.onnx";
-    var seen_model_path = false;
+    var explicit_model_path: ?[]const u8 = null;
 
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--ep=")) {
@@ -321,15 +214,21 @@ pub fn main() !void {
             continue;
         }
 
-        if (!seen_model_path) {
-            model_path = arg;
-            seen_model_path = true;
+        if (explicit_model_path == null) {
+            explicit_model_path = arg;
             continue;
         }
 
         std.debug.print("usage: {s} [--ep=cpu|cuda] [model.onnx]\n", .{args[0]});
         return error.InvalidArguments;
     }
+
+    const model_path = if (explicit_model_path) |path| path else blk: {
+        const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
+        defer allocator.free(exe_dir);
+        break :blk try std.fmt.allocPrint(allocator, "{s}/model.onnx", .{exe_dir});
+    };
+    defer if (explicit_model_path == null) allocator.free(model_path);
 
     try runEmptyFrameInference(allocator, model_path, use_cuda);
 }
