@@ -12,7 +12,7 @@ fn ortCheck(api: *const c.OrtApi, status: ?*c.OrtStatus) !void {
     return error.OnnxRuntimeError;
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, model_path: []const u8) !void {
+fn runBenchmark(allocator: std.mem.Allocator) !void {
     const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
     const api: *const c.OrtApi = @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable);
@@ -38,6 +38,10 @@ fn runBenchmark(allocator: std.mem.Allocator, model_path: []const u8) !void {
     try ortCheck(api, update_cuda(cuda_options, &keys, &values, keys.len));
     try ortCheck(api, append_cuda(session_options, cuda_options));
 
+    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
+    defer allocator.free(exe_dir);
+    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.onnx", .{exe_dir});
+    defer allocator.free(model_path);
     const model_path_z = try allocator.dupeZ(u8, model_path);
     defer allocator.free(model_path_z);
     var session: ?*c.OrtSession = null;
@@ -114,25 +118,5 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    var explicit_model_path: ?[]const u8 = null;
-
-    for (args[1..]) |arg| {
-        if (explicit_model_path == null) {
-            explicit_model_path = arg;
-            continue;
-        }
-        return error.InvalidArguments;
-    }
-
-    const model_path = if (explicit_model_path) |path| path else blk: {
-        const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
-        defer allocator.free(exe_dir);
-        break :blk try std.fmt.allocPrint(allocator, "{s}/model.onnx", .{exe_dir});
-    };
-    defer if (explicit_model_path == null) allocator.free(model_path);
-
-    try runBenchmark(allocator, model_path);
+    try runBenchmark(allocator);
 }
