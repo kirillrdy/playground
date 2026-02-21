@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) !void {
     const modules = .{
         .server = createModule(b, "server.zig", target, optimize),
         .dev_server = createModule(b, "dev_server.zig", target, optimize),
-        .wasm = b.createModule(.{ .root_source_file = b.path("wasm.zig"), .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }), .optimize = optimize }),
+        .wasm = createModule(b, "wasm.zig", b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }), optimize),
     };
 
     const sqlite3 = b.dependency("sqlite3", .{
