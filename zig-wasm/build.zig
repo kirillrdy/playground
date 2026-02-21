@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) !void {
     const modules = .{
         .server = createModule(b, "server.zig", target, optimize),
         .dev_server = createModule(b, "dev_server.zig", target, optimize),
+        .video_yolo = createModule(b, "video_yolo.zig", target, optimize),
         .wasm = createModule(b, "wasm.zig", b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }), optimize),
     };
     const onnx_include_path = b.option([]const u8, "onnx-include", "Path to directory containing onnxruntime_c_api.h");
@@ -52,7 +53,9 @@ pub fn build(b: *std.Build) !void {
     modules.server.addIncludePath(sqlite3.path("."));
     modules.dev_server.addIncludePath(sqlite3.path("."));
     modules.server.addImport("zigimg", zigimg.module("zigimg"));
+    modules.video_yolo.addImport("zigimg", zigimg.module("zigimg"));
     if (onnx_dev_root) |path| modules.server.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
+    if (onnx_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
 
     inline for (&.{"httpz"}) |dependency_name| {
         modules.server.addImport(dependency_name, b.dependency(dependency_name, .{}).module(dependency_name));
@@ -63,6 +66,11 @@ pub fn build(b: *std.Build) !void {
     if (onnx_out_root) |path| server.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
     server.linkSystemLibrary("onnxruntime");
 
+    const video_yolo = b.addExecutable(.{ .name = "video_yolo", .root_module = modules.video_yolo });
+    video_yolo.linkLibC();
+    if (onnx_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
+    video_yolo.linkSystemLibrary("onnxruntime");
+
     const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = modules.dev_server });
     dev_server.linkLibrary(sqlite3_lib);
 
@@ -71,6 +79,7 @@ pub fn build(b: *std.Build) !void {
     wasm_app.rdynamic = true;
 
     b.installArtifact(server);
+    b.installArtifact(video_yolo);
     b.installArtifact(wasm_app);
     b.installArtifact(dev_server);
 
@@ -95,6 +104,13 @@ pub fn build(b: *std.Build) !void {
     fetch_model.addArg(model_url);
     const install_model = b.addInstallFileWithDir(model_output, .bin, "model.onnx");
 
+    const run_video_yolo = b.addRunArtifact(video_yolo);
+    run_video_yolo.step.dependOn(b.getInstallStep());
+    run_video_yolo.step.dependOn(&install_model.step);
+    if (b.args) |args| {
+        run_video_yolo.addArgs(args);
+    }
+
     const server_test = b.addRunArtifact(b.addTest(.{
         .root_module = modules.server,
     }));
@@ -114,6 +130,7 @@ pub fn build(b: *std.Build) !void {
     b.step("model", "Download model.onnx into zig-out/bin").dependOn(&install_model.step);
     run_server.step.dependOn(&install_model.step);
     b.step("run", "Run dev server").dependOn(&run_server.step);
+    b.step("run-video", "Run video_yolo detector").dependOn(&run_video_yolo.step);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&server_test.step);
     test_step.dependOn(&yolo_test.step);
