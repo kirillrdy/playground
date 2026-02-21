@@ -54,7 +54,17 @@ pub const Runtime = struct {
     session_options: ?*c.OrtSessionOptions,
     session: ?*c.OrtSession,
 
+    pub const InitOptions = struct {
+        use_cuda: bool = true,
+        cuda_device_id: i32 = 0,
+        require_cuda: bool = false,
+    };
+
     pub fn init(allocator: Allocator, model_path: []const u8) !@This() {
+        return initWithOptions(allocator, model_path, .{});
+    }
+
+    pub fn initWithOptions(allocator: Allocator, model_path: []const u8, options: InitOptions) !@This() {
         const base = c.OrtGetApiBase();
         if (base == null) return error.OnnxRuntimeUnavailable;
         const get_api = base.?.*.GetApi orelse return error.OnnxRuntimeUnavailable;
@@ -71,6 +81,7 @@ pub const Runtime = struct {
 
         try runtime.check(runtime.api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "zig-wasm", &runtime.env));
         try runtime.check(runtime.api.CreateSessionOptions.?(&runtime.session_options));
+        try runtime.configureExecutionProvider(options);
 
         const model_path_z = try allocator.dupeZ(u8, model_path);
         defer allocator.free(model_path_z);
@@ -94,6 +105,57 @@ pub const Runtime = struct {
             std.log.err("onnxruntime: {s}", .{std.mem.span(message)});
         }
         return error.OnnxRuntimeError;
+    }
+
+    fn configureExecutionProvider(self: *@This(), options: InitOptions) !void {
+        if (!options.use_cuda) return;
+
+        const create_cuda_options = self.api.CreateCUDAProviderOptions orelse {
+            if (options.require_cuda) return error.CudaExecutionProviderUnavailable;
+            std.log.warn("onnxruntime: CUDA provider API unavailable, falling back to CPU", .{});
+            return;
+        };
+        const update_cuda_options = self.api.UpdateCUDAProviderOptions orelse {
+            if (options.require_cuda) return error.CudaExecutionProviderUnavailable;
+            std.log.warn("onnxruntime: CUDA provider options API unavailable, falling back to CPU", .{});
+            return;
+        };
+        const release_cuda_options = self.api.ReleaseCUDAProviderOptions orelse {
+            if (options.require_cuda) return error.CudaExecutionProviderUnavailable;
+            std.log.warn("onnxruntime: CUDA provider release API unavailable, falling back to CPU", .{});
+            return;
+        };
+        const append_cuda = self.api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse {
+            if (options.require_cuda) return error.CudaExecutionProviderUnavailable;
+            std.log.warn("onnxruntime: CUDA append API unavailable, falling back to CPU", .{});
+            return;
+        };
+
+        var cuda_options: ?*c.OrtCUDAProviderOptionsV2 = null;
+        try self.check(create_cuda_options(&cuda_options));
+        defer release_cuda_options(cuda_options);
+
+        var device_id_buf: [16]u8 = undefined;
+        const device_id_value = try std.fmt.bufPrintZ(&device_id_buf, "{d}", .{options.cuda_device_id});
+        const keys = [_][*c]const u8{"device_id"};
+        const values = [_][*c]const u8{device_id_value.ptr};
+        try self.check(update_cuda_options(cuda_options, &keys, &values, 1));
+
+        const cuda_status = append_cuda(self.session_options, cuda_options);
+        if (cuda_status == null) {
+            std.log.info("onnxruntime: CUDA execution provider enabled (device {d})", .{options.cuda_device_id});
+            return;
+        }
+
+        defer self.api.ReleaseStatus.?(cuda_status);
+        const msg = self.api.GetErrorMessage.?(cuda_status);
+        const error_message = if (msg != null) std.mem.span(msg) else "unknown error";
+        if (options.require_cuda) {
+            std.log.err("onnxruntime: CUDA execution provider required but unavailable: {s}", .{error_message});
+            return error.CudaExecutionProviderUnavailable;
+        }
+
+        std.log.warn("onnxruntime: CUDA execution provider unavailable, falling back to CPU: {s}", .{error_message});
     }
 
     pub fn decodeYoloOutput(

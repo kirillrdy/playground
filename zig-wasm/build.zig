@@ -20,6 +20,15 @@ fn nixBuildPath(allocator: std.mem.Allocator, attr: []const u8) ?[]const u8 {
     return allocator.dupe(u8, trimNewline(result.stdout)) catch null;
 }
 
+fn nixBuildExprPath(allocator: std.mem.Allocator, expr: []const u8) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "nix", "build", "--impure", "--no-link", "--print-out-paths", "--expr", expr },
+    }) catch return null;
+    if (result.term != .Exited or result.term.Exited != 0) return null;
+    return allocator.dupe(u8, trimNewline(result.stdout)) catch null;
+}
+
 pub fn build(b: *std.Build) !void {
     const start = try std.time.Instant.now();
     const target = b.standardTargetOptions(.{});
@@ -36,8 +45,28 @@ pub fn build(b: *std.Build) !void {
     const ffmpeg_include_path = b.option([]const u8, "ffmpeg-include", "Path to directory containing FFmpeg headers");
     const ffmpeg_lib_path = b.option([]const u8, "ffmpeg-lib", "Path to directory containing FFmpeg libraries");
     const model_url = b.option([]const u8, "model-url", "URL to download ONNX model from") orelse "https://raw.githubusercontent.com/Hyuto/yolov8-onnxruntime-web/master/public/model/yolov8n.onnx";
-    const onnx_dev_root = onnx_include_path orelse nixBuildPath(b.allocator, "nixpkgs#onnxruntime.dev");
-    const onnx_out_root = onnx_lib_path orelse nixBuildPath(b.allocator, "nixpkgs#onnxruntime");
+    const onnx_gpu_dev_expr =
+        \\let
+        \\  flake = builtins.getFlake "nixpkgs";
+        \\  pkgs = import flake.outPath {
+        \\    system = builtins.currentSystem;
+        \\    config.allowUnfree = true;
+        \\  };
+        \\  ort = pkgs.onnxruntime.override { cudaSupport = true; };
+        \\in ort.dev
+    ;
+    const onnx_gpu_out_expr =
+        \\let
+        \\  flake = builtins.getFlake "nixpkgs";
+        \\  pkgs = import flake.outPath {
+        \\    system = builtins.currentSystem;
+        \\    config.allowUnfree = true;
+        \\  };
+        \\  ort = pkgs.onnxruntime.override { cudaSupport = true; };
+        \\in ort
+    ;
+    const onnx_dev_root = onnx_include_path orelse nixBuildExprPath(b.allocator, onnx_gpu_dev_expr);
+    const onnx_out_root = onnx_lib_path orelse nixBuildExprPath(b.allocator, onnx_gpu_out_expr);
     const ffmpeg_dev_root = ffmpeg_include_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.dev");
     const ffmpeg_out_root = ffmpeg_lib_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.lib");
     if (onnx_dev_root == null) return error.MissingOnnxRuntimeDev;
