@@ -1,6 +1,7 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const builtin = @import("builtin");
+const onnxruntime = @import("onnxruntime.zig");
 const Allocator = std.mem.Allocator;
 const string = []const u8;
 const c = @cImport({
@@ -9,6 +10,7 @@ const c = @cImport({
 
 const print = std.log.info;
 const port = 3000;
+const uploads_dir = "uploads";
 
 const templates = struct {
     const Error = error{
@@ -178,6 +180,7 @@ fn resource(name: string) type {
     return struct {
         const index = "/" ++ name;
         const new = "/" ++ name ++ "/new";
+        const show = "/" ++ name ++ "/:id";
     };
 }
 
@@ -197,7 +200,13 @@ pub fn main() !void {
     defer repo.deinit();
     try schemaPlusSeeds(&repo);
 
-    var server = try httpz.Server(@TypeOf(&repo)).init(allocator, .{ .port = port, .request = .{ .max_multiform_count = 1 } }, &repo);
+    var server = try httpz.Server(@TypeOf(&repo)).init(allocator, .{
+        .port = port,
+        .request = .{
+            .max_multiform_count = 8,
+            .max_body_size = 20 * 1024 * 1024,
+        },
+    }, &repo);
     defer {
         print("shutting down httpz", .{});
         server.stop();
@@ -207,6 +216,7 @@ pub fn main() !void {
     var router = try server.router(.{});
     router.get(Paths.files.index, makeHandlerWithOptions("Files/index", .{ .default_template = false }), .{});
     router.get(Paths.files.new, makeHandler("Files/new"), .{});
+    router.get(Paths.files.show, Files.show, .{});
     router.post(Paths.files.index, Files.create, .{});
     router.get(Paths.root, makeHandler("handlers/home"), .{});
     router.get(Paths.wasm, makeHandler("handlers/wasm"), .{});
@@ -306,27 +316,66 @@ test "tolower" {
 const Repo = struct {
     allocator: Allocator,
     db: *c.sqlite3,
+    detector: ?onnxruntime.Runtime,
 
     const FileRecord = struct {
         id: i32,
         filename: string,
+        detections_count: i32,
         created_at: string,
         updated_at: string,
     };
 
+    const UploadedFile = struct {
+        id: i64,
+        filename: string,
+    };
+
+    const DetectionRecord = struct {
+        id: i32,
+        class_id: i32,
+        score: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        created_at: string,
+    };
+
     fn init(allocator: Allocator) !Repo {
+        std.fs.cwd().makePath(uploads_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
         var db_ptr: ?*c.sqlite3 = null;
         if (c.sqlite3_open("app.db", &db_ptr) != c.SQLITE_OK) {
             if (db_ptr) |db| _ = c.sqlite3_close(db);
             return error.SqliteOpenFailed;
         }
+
+        var detector: ?onnxruntime.Runtime = null;
+        const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
+        defer allocator.free(exe_dir);
+        const model_path = try std.fmt.allocPrint(allocator, "{s}/model.onnx", .{exe_dir});
+        defer allocator.free(model_path);
+
+        if (onnxruntime.Runtime.init(allocator, model_path)) |runtime| {
+            detector = runtime;
+            print("onnxruntime detector initialized with model: {s}", .{model_path});
+        } else |err| {
+            std.log.err("failed to initialize onnxruntime session with default model path {s}: {}", .{ model_path, err });
+        }
+
         return .{
             .allocator = allocator,
             .db = db_ptr.?,
+            .detector = detector,
         };
     }
 
     fn deinit(self: *Repo) void {
+        if (self.detector) |*detector| detector.deinit();
         _ = c.sqlite3_close(self.db);
     }
 
@@ -344,12 +393,20 @@ const Repo = struct {
 
     fn allFiles(self: *Repo) ![]FileRecord {
         const sql =
-            \\SELECT id, filename, created_at, updated_at
-            \\FROM files
-            \\ORDER BY id DESC
+            \\SELECT
+            \\  f.id,
+            \\  f.filename,
+            \\  CAST(COUNT(d.id) AS INTEGER) AS detections_count,
+            \\  f.created_at,
+            \\  f.updated_at
+            \\FROM files f
+            \\LEFT JOIN detections d ON d.file_id = f.id
+            \\GROUP BY f.id, f.filename, f.created_at, f.updated_at
+            \\ORDER BY f.id DESC
         ;
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            std.log.err("sqlite prepare failed in allFiles: {s}", .{std.mem.span(c.sqlite3_errmsg(self.db))});
             return error.SqlitePrepareFailed;
         }
         defer _ = c.sqlite3_finalize(stmt);
@@ -366,11 +423,12 @@ const Repo = struct {
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const filename = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
-            const created_at = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
-            const updated_at = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+            const created_at = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+            const updated_at = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4)));
             try files.append(self.allocator, .{
                 .id = c.sqlite3_column_int(stmt, 0),
                 .filename = filename,
+                .detections_count = c.sqlite3_column_int(stmt, 2),
                 .created_at = created_at,
                 .updated_at = updated_at,
             });
@@ -385,6 +443,167 @@ const Repo = struct {
             self.allocator.free(file.updated_at);
         }
         self.allocator.free(files);
+    }
+
+    fn insertOrGetFile(self: *Repo, filename: []const u8) !UploadedFile {
+        const escaped = try escapeSqlString(self.allocator, filename);
+        defer self.allocator.free(escaped);
+
+        const insert_sql = try std.fmt.allocPrint(
+            self.allocator,
+            "INSERT OR IGNORE INTO files(filename) VALUES ('{s}')",
+            .{escaped},
+        );
+        defer self.allocator.free(insert_sql);
+        try self.execZ(insert_sql);
+
+        const select_sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT id, filename FROM files WHERE filename = '{s}' LIMIT 1",
+            .{escaped},
+        );
+        defer self.allocator.free(select_sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, select_sql.ptr, @intCast(select_sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteRowNotFound;
+
+        return .{
+            .id = c.sqlite3_column_int64(stmt, 0),
+            .filename = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1))),
+        };
+    }
+
+    fn freeUploadedFile(self: *Repo, file: UploadedFile) void {
+        self.allocator.free(file.filename);
+    }
+
+    fn saveUploadedFile(self: *Repo, file_id: i64, filename: []const u8, bytes: []const u8) ![]u8 {
+        const safe_name = try sanitizeFilename(self.allocator, filename);
+        defer self.allocator.free(safe_name);
+
+        const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{d}_{s}", .{ uploads_dir, file_id, safe_name });
+        errdefer self.allocator.free(rel_path);
+
+        var file = try std.fs.cwd().createFile(rel_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(bytes);
+        return rel_path;
+    }
+
+    fn sanitizeFilename(allocator: Allocator, name: []const u8) ![]u8 {
+        var out = try std.ArrayList(u8).initCapacity(allocator, name.len);
+        errdefer out.deinit(allocator);
+        for (name) |ch| {
+            const safe = switch (ch) {
+                'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_' => ch,
+                else => '_',
+            };
+            try out.append(allocator, safe);
+        }
+        if (out.items.len == 0) try out.append(allocator, '_');
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn getFileNameById(self: *Repo, file_id: i64) !?[]u8 {
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT filename FROM files WHERE id = {d} LIMIT 1",
+            .{file_id},
+        );
+        defer self.allocator.free(sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0)));
+    }
+
+    fn allDetectionsByFileId(self: *Repo, file_id: i64) ![]DetectionRecord {
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            \\SELECT id, class_id, score, x1, y1, x2, y2, created_at
+            \\FROM detections
+            \\WHERE file_id = {d}
+            \\ORDER BY score DESC, id DESC
+        , .{file_id});
+        defer self.allocator.free(sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var rows = try std.ArrayList(DetectionRecord).initCapacity(self.allocator, 0);
+        errdefer {
+            for (rows.items) |row| self.allocator.free(row.created_at);
+            rows.deinit(self.allocator);
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try rows.append(self.allocator, .{
+                .id = c.sqlite3_column_int(stmt, 0),
+                .class_id = c.sqlite3_column_int(stmt, 1),
+                .score = @floatCast(c.sqlite3_column_double(stmt, 2)),
+                .x1 = @floatCast(c.sqlite3_column_double(stmt, 3)),
+                .y1 = @floatCast(c.sqlite3_column_double(stmt, 4)),
+                .x2 = @floatCast(c.sqlite3_column_double(stmt, 5)),
+                .y2 = @floatCast(c.sqlite3_column_double(stmt, 6)),
+                .created_at = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 7))),
+            });
+        }
+
+        return rows.toOwnedSlice(self.allocator);
+    }
+
+    fn freeDetectionsByFile(self: *Repo, rows: []DetectionRecord) void {
+        for (rows) |row| self.allocator.free(row.created_at);
+        self.allocator.free(rows);
+    }
+
+    fn insertDetections(self: *Repo, file_id: i64, detections: []const onnxruntime.Detection) !void {
+        for (detections) |d| {
+            const sql = try std.fmt.allocPrint(
+                self.allocator,
+                "INSERT INTO detections(file_id,class_id,score,x1,y1,x2,y2) VALUES ({d},{d},{d},{d},{d},{d},{d})",
+                .{
+                    file_id,
+                    @as(i64, @intCast(d.class_id)),
+                    d.score,
+                    d.x1,
+                    d.y1,
+                    d.x2,
+                    d.y2,
+                },
+            );
+            defer self.allocator.free(sql);
+            try self.execZ(sql);
+        }
+    }
+
+    fn execZ(self: *Repo, sql: []const u8) !void {
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        try self.exec(sql_z);
+    }
+
+    fn escapeSqlString(allocator: Allocator, input: []const u8) ![]u8 {
+        var out = try std.ArrayList(u8).initCapacity(allocator, input.len);
+        errdefer out.deinit(allocator);
+        for (input) |ch| {
+            try out.append(allocator, ch);
+            if (ch == '\'') try out.append(allocator, '\'');
+        }
+        return out.toOwnedSlice(allocator);
     }
 };
 
@@ -409,7 +628,21 @@ fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
 
                 switch (@TypeOf(value)) {
                     i32 => try templates.print(template, "td-number", .{ .value = value }, writer),
-                    string => try templates.print(template, "td-string", .{ .value = value }, writer),
+                    i64 => try templates.print(template, "td-number", .{ .value = value }, writer),
+                    f32 => try templates.print(template, "td", .{ .value = value }, writer),
+                    string => {
+                        if (comptime std.mem.eql(u8, field.name, "filename")) {
+                            if (std.mem.eql(u8, title, "Files")) {
+                                try writer.print(
+                                    \\<td class="px-6 py-4"><a class="text-blue-600 hover:underline" href="/files/{d}">{s}</a></td>
+                                , .{ @field(file, "id"), value });
+                            } else {
+                                try templates.print(template, "td-string", .{ .value = value }, writer);
+                            }
+                        } else {
+                            try templates.print(template, "td-string", .{ .value = value }, writer);
+                        }
+                    },
                     else => @compileError("what type is this " ++ @typeName(@TypeOf(value))),
                 }
             }
@@ -423,21 +656,108 @@ const Files = struct {
     fn index(response: anytype) !void {
         const files = try response.repo.allFiles();
         defer response.repo.freeFiles(files);
-        try table(response.out, @typeName(@This()), files);
+        try table(response.out, "Files", files);
     }
     fn new(response: anytype) !void {
         try response.writeHeader();
     }
 
-    fn create(_: *Repo, request: *httpz.Request, response: *httpz.Response) !void {
-        const form = try request.multiFormData();
-        print("started {d} \n", .{form.len});
-        var iterator = form.iterator();
-        while (iterator.next()) |kv| {
-            print("hello {s} {s} {any}\n", .{ kv.key, kv.value.value, kv.value.filename });
+    fn show(repo: *Repo, request: *httpz.Request, response: *httpz.Response) !void {
+        var writerAllocating = std.Io.Writer.Allocating.init(response.arena);
+        const writer = &writerAllocating.writer;
+        const layout = @embedFile("views/layout.html");
+        try templates.writeHeader(layout, writer);
+        try templates.print(layout, "title", .{ .title = "Files" }, writer);
+
+        const id_str = request.param("id") orelse {
+            response.status = 400;
+            try writer.writeAll("missing id");
+            try templates.write(layout, "close-body", writer);
+            response.body = writerAllocating.written();
+            return;
+        };
+
+        const file_id = std.fmt.parseInt(i64, id_str, 10) catch {
+            response.status = 400;
+            try writer.writeAll("invalid id");
+            try templates.write(layout, "close-body", writer);
+            response.body = writerAllocating.written();
+            return;
+        };
+
+        const maybe_file_name = try repo.getFileNameById(file_id);
+        if (maybe_file_name == null) {
+            response.status = 404;
+            try writer.writeAll("file not found");
+            try templates.write(layout, "close-body", writer);
+            response.body = writerAllocating.written();
+            return;
         }
-        print("ended \n", .{});
-        response.body = "hello";
+        const file_name = maybe_file_name.?;
+        defer repo.allocator.free(file_name);
+
+        const template = @embedFile("views/files/show.html");
+        try templates.printHeader(template, .{ .file_id = file_id, .file_name = file_name }, writer);
+        const detections = try repo.allDetectionsByFileId(file_id);
+        defer repo.freeDetectionsByFile(detections);
+        try table(writer, "Detections", detections);
+
+        try templates.write(layout, "close-body", writer);
+        response.body = writerAllocating.written();
+    }
+
+    fn create(repo: *Repo, request: *httpz.Request, response: *httpz.Response) !void {
+        const form = request.multiFormData() catch |err| {
+            print("multipart parse failed: {}", .{err});
+            response.status = 400;
+            response.body = "invalid multipart form data";
+            return;
+        };
+        var iterator = form.iterator();
+        var has_file = false;
+        while (iterator.next()) |kv| {
+            if (std.mem.eql(u8, kv.key, "file")) {
+                has_file = true;
+                const incoming_name = kv.value.filename orelse "upload.bin";
+                const stored = repo.insertOrGetFile(incoming_name) catch |err| {
+                    print("file insert failed for {s}: {}", .{ incoming_name, err });
+                    response.status = 500;
+                    response.body = "failed to store file";
+                    return;
+                };
+                defer repo.freeUploadedFile(stored);
+
+                const saved_path = repo.saveUploadedFile(stored.id, stored.filename, kv.value.value) catch |err| {
+                    print("file save failed for {s}: {}", .{ stored.filename, err });
+                    response.status = 500;
+                    response.body = "failed to save uploaded file";
+                    return;
+                };
+                defer repo.allocator.free(saved_path);
+                print("saved upload to {s}", .{saved_path});
+
+                if (repo.detector != null) {
+                    var detector = &repo.detector.?;
+                    const detections = detector.detectFromImageBytes(repo.allocator, kv.value.value) catch |err| {
+                        print("detection failed for {s}: {}", .{ stored.filename, err });
+                        continue;
+                    };
+                    defer detector.freeDetections(repo.allocator, detections);
+                    repo.insertDetections(stored.id, detections) catch |err| {
+                        print("failed to persist detections for file id={d}: {}", .{ stored.id, err });
+                        continue;
+                    };
+                }
+            }
+        }
+        if (has_file) {
+            response.status = 303;
+            response.header("Location", Paths.files.index);
+            response.body = "redirecting";
+        } else {
+            response.status = 400;
+            response.body = "missing file";
+        }
     }
 };
 
@@ -462,6 +782,20 @@ fn schemaPlusSeeds(repo: *Repo) !void {
     );
     try repo.exec("INSERT OR IGNORE INTO files(filename) VALUES ('bar')");
     try repo.exec("INSERT OR IGNORE INTO files(filename) VALUES ('foo')");
+    try repo.exec(
+        \\CREATE TABLE IF NOT EXISTS detections (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  file_id INTEGER NOT NULL,
+        \\  class_id INTEGER NOT NULL,
+        \\  score REAL NOT NULL,
+        \\  x1 REAL NOT NULL,
+        \\  y1 REAL NOT NULL,
+        \\  x2 REAL NOT NULL,
+        \\  y2 REAL NOT NULL,
+        \\  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\  FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        \\)
+    );
 }
 
 fn sendFile(allocator: Allocator, comptime name: string) !string {

@@ -5,3 +5,23 @@ zig build --watch -fincremental
 also
 
 zig build db
+zig build model
+
+ONNX Runtime scaffold (YOLO integration path):
+
+- ONNX Runtime is always enabled in build.
+- If headers/libs are not in default toolchain paths, pass:
+  - `-Donnx-include=/path/to/include`
+  - `-Donnx-lib=/path/to/lib`
+- If unset, build tries to resolve paths via Nix:
+  - `nixpkgs#onnxruntime.dev.outPath`
+  - `nixpkgs#onnxruntime.outPath`
+- Download default model to `zig-out/bin/model.onnx`:
+  - `zig build model`
+  - optional custom URL: `zig build model -Dmodel-url=https://.../model.onnx`
+- Model path is resolved automatically as `<selfExeDir>/model.onnx`, so with current build steps:
+  - `zig build run`
+- YOLO post-processing lives in `yolo.zig` (decode + NMS); it is included in `zig build test`.
+- Image tensor preprocessing lives in `image_preprocess.zig` (RGB u8 -> NCHW f32), also covered by `zig build test`.
+- Upload inference decodes common image formats (PNG/JPEG/etc via `zigimg`) in `image_decode.zig` before preprocessing/running ONNX, with PPM(P6) fallback.
+- Output shape inference supports both common YOLO layouts: `[1,8400,84]` and `[1,84,8400]`.

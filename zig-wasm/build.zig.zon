@@ -44,6 +44,10 @@
             .url = "git+https://github.com/allyourcodebase/sqlite3#8f840560eae88ab66668c6827c64ffbd0d74ef37",
             .hash = "sqlite3-3.51.0-DMxLWssOAABZ8cAvU_LfBIbp0kZjm824PU8sSLXpEDdr",
         },
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg#78ccfc1625e767ed8b617044894ffd9a9a77fdc9",
+            .hash = "zigimg-0.1.0-8_eo2ix7FwDYaaUeexKLSrFdhhQ2AMrj9G4vMs4znbKg",
+        },
     },
     .paths = .{
         "build.zig",
