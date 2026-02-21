@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config");
+const yolo = @import("yolo.zig");
 
 const c = @cImport({
     @cInclude("onnxruntime_c_api.h");
@@ -20,6 +21,39 @@ fn ortCheck(api: *const c.OrtApi, status: ?*c.OrtStatus) !void {
 fn avCheck(code: c_int) !void {
     if (code >= 0) return;
     return error.FfmpegError;
+}
+
+const OutputSpec = struct {
+    boxes: usize,
+    classes: usize,
+    layout: yolo.OutputLayout,
+};
+
+fn inferOutputSpec(dim_count: usize, dims: []const i64, total_values: usize) OutputSpec {
+    if (dim_count >= 3) {
+        const d1 = @as(usize, @intCast(dims[dim_count - 2]));
+        const d2 = @as(usize, @intCast(dims[dim_count - 1]));
+        if (d1 > d2) {
+            const attrs = d2;
+            return .{
+                .boxes = d1,
+                .classes = if (attrs > 4) attrs - 4 else 80,
+                .layout = .boxes_first,
+            };
+        } else {
+            const attrs = d1;
+            return .{
+                .boxes = d2,
+                .classes = if (attrs > 4) attrs - 4 else 80,
+                .layout = .attributes_first,
+            };
+        }
+    }
+    return .{
+        .boxes = total_values / (80 + 4),
+        .classes = 80,
+        .layout = .boxes_first,
+    };
 }
 
 fn rgbU8ToNchwF32(dst: []f32, rgb: []const u8, width: usize, height: usize) void {
@@ -213,6 +247,28 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8) !void {
             const end_ns = std.time.nanoTimestamp();
 
             decoded_frames += 1;
+            var tensor_info: ?*c.OrtTensorTypeAndShapeInfo = null;
+            try ortCheck(api, api.GetTensorTypeAndShape.?(output_value, &tensor_info));
+            defer api.ReleaseTensorTypeAndShapeInfo.?(tensor_info);
+
+            var dim_count: usize = 0;
+            try ortCheck(api, api.GetDimensionsCount.?(tensor_info, &dim_count));
+            var dims_buf: [8]i64 = undefined;
+            if (dim_count > dims_buf.len) return error.UnsupportedOutputRank;
+            try ortCheck(api, api.GetDimensions.?(tensor_info, &dims_buf, dim_count));
+            const dims = dims_buf[0..dim_count];
+
+            var out_ptr_raw: ?*anyopaque = null;
+            try ortCheck(api, api.GetTensorMutableData.?(output_value, &out_ptr_raw));
+            const out_ptr: [*]f32 = @ptrCast(@alignCast(out_ptr_raw));
+
+            var total: usize = 1;
+            for (dims) |d| total *= @as(usize, @intCast(d));
+            const spec = inferOutputSpec(dim_count, dims, total);
+            const raw = try yolo.decodeV8(allocator, out_ptr[0..total], spec.boxes, spec.classes, spec.layout, 0.25);
+            defer allocator.free(raw);
+            const dets = try yolo.nms(allocator, raw, 0.45);
+            defer allocator.free(dets);
             total_ns += end_ns - start_ns;
 
             c.av_frame_unref(frame);
