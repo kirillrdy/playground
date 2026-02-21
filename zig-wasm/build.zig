@@ -42,8 +42,6 @@ pub fn build(b: *std.Build) !void {
     };
     const onnx_include_path = b.option([]const u8, "onnx-include", "Path to directory containing onnxruntime_c_api.h");
     const onnx_lib_path = b.option([]const u8, "onnx-lib", "Path to directory containing libonnxruntime");
-    const ffmpeg_include_path = b.option([]const u8, "ffmpeg-include", "Path to directory containing FFmpeg headers");
-    const ffmpeg_lib_path = b.option([]const u8, "ffmpeg-lib", "Path to directory containing FFmpeg libraries");
     const model_url = b.option([]const u8, "model-url", "URL to download ONNX model from") orelse "https://raw.githubusercontent.com/Hyuto/yolov8-onnxruntime-web/master/public/model/yolov8n.onnx";
     const onnx_gpu_dev_expr =
         \\let
@@ -67,12 +65,8 @@ pub fn build(b: *std.Build) !void {
     ;
     const onnx_dev_root = onnx_include_path orelse nixBuildExprPath(b.allocator, onnx_gpu_dev_expr);
     const onnx_out_root = onnx_lib_path orelse nixBuildExprPath(b.allocator, onnx_gpu_out_expr);
-    const ffmpeg_dev_root = ffmpeg_include_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.dev");
-    const ffmpeg_out_root = ffmpeg_lib_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.lib");
     if (onnx_dev_root == null) return error.MissingOnnxRuntimeDev;
     if (onnx_out_root == null) return error.MissingOnnxRuntime;
-    if (ffmpeg_dev_root == null) return error.MissingFfmpegDev;
-    if (ffmpeg_out_root == null) return error.MissingFfmpeg;
 
     const sqlite3 = b.dependency("sqlite3", .{
         .target = target,
@@ -88,10 +82,8 @@ pub fn build(b: *std.Build) !void {
     modules.server.addIncludePath(sqlite3.path("."));
     modules.dev_server.addIncludePath(sqlite3.path("."));
     modules.server.addImport("zigimg", zigimg.module("zigimg"));
-    modules.video_yolo.addImport("zigimg", zigimg.module("zigimg"));
     if (onnx_dev_root) |path| modules.server.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     if (onnx_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
-    if (ffmpeg_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
 
     inline for (&.{"httpz"}) |dependency_name| {
         modules.server.addImport(dependency_name, b.dependency(dependency_name, .{}).module(dependency_name));
@@ -104,13 +96,9 @@ pub fn build(b: *std.Build) !void {
 
     const video_yolo = b.addExecutable(.{ .name = "video_yolo", .root_module = modules.video_yolo });
     video_yolo.linkLibC();
+    if (onnx_dev_root) |path| video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     if (onnx_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
-    if (ffmpeg_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
     video_yolo.linkSystemLibrary("onnxruntime");
-    video_yolo.linkSystemLibrary("avformat");
-    video_yolo.linkSystemLibrary("avcodec");
-    video_yolo.linkSystemLibrary("avutil");
-    video_yolo.linkSystemLibrary("swscale");
 
     const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = modules.dev_server });
     dev_server.linkLibrary(sqlite3_lib);
@@ -144,6 +132,7 @@ pub fn build(b: *std.Build) !void {
     const model_output = fetch_model.addOutputFileArg("model.onnx");
     fetch_model.addArg(model_url);
     const install_model = b.addInstallFileWithDir(model_output, .bin, "model.onnx");
+    b.getInstallStep().dependOn(&install_model.step);
 
     const run_video_yolo = b.addRunArtifact(video_yolo);
     run_video_yolo.step.dependOn(b.getInstallStep());
