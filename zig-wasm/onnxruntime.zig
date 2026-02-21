@@ -119,8 +119,17 @@ pub const Runtime = struct {
         const image = try image_decode.decodeRgb(allocator, image_bytes);
         defer allocator.free(image.rgb);
 
+        return self.detectFromRgb(allocator, image.rgb, image.size);
+    }
+
+    pub fn detectFromRgb(
+        self: *@This(),
+        allocator: Allocator,
+        rgb: []const u8,
+        image_size: image_preprocess.ImageSize,
+    ) ![]Detection {
         const input_size = image_preprocess.ImageSize{ .width = 640, .height = 640 };
-        const input_tensor = try image_preprocess.rgbU8ToNchwF32(allocator, image.rgb, image.size, input_size);
+        const input_tensor = try image_preprocess.rgbU8ToNchwF32(allocator, rgb, image_size, input_size);
         defer allocator.free(input_tensor);
 
         const output = try self.runSingleInput(allocator, input_tensor, .{ 1, 3, 640, 640 });
