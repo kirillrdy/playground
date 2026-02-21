@@ -40,9 +40,9 @@
             .url = "git+https://github.com/karlseguin/http.zig?ref=main#90e7fc07ef7157a4da6922571fb4daef38b48998",
             .hash = "httpz-0.0.0-PNVzrHLABgDoVnzqKpEbx2rZIzmMclEdoEmdJDfZmxsv",
         },
-        .jetquery = .{
-            .url = "https://github.com/jetzig-framework/jetquery/archive/a5a97b5f10dbd43b4dd18d9fddb7a1d9f1403c91.tar.gz",
-            .hash = "jetquery-0.0.0-TNf3zuDABgCbhjXEg2zcJSfspQd2MNwxZw3gdr1Do17U",
+        .sqlite3 = .{
+            .url = "git+https://github.com/allyourcodebase/sqlite3#8f840560eae88ab66668c6827c64ffbd0d74ef37",
+            .hash = "sqlite3-3.51.0-DMxLWssOAABZ8cAvU_LfBIbp0kZjm824PU8sSLXpEDdr",
         },
     },
     .paths = .{

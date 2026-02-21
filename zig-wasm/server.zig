@@ -2,10 +2,10 @@ const std = @import("std");
 const httpz = @import("httpz");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const jetquery = @import("jetquery");
-const Schema = @import("Schema.zig");
-const postgres = @import("postgres.zig");
 const string = []const u8;
+const c = @cImport({
+    @cInclude("sqlite3.h");
+});
 
 const print = std.log.info;
 const port = 3000;
@@ -195,18 +195,9 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
 
-    // TODO somehow use arena allocator ? repo per request ???
-    var repo = try Repo.init(allocator, .{
-        .adapter = .{
-            .database = postgres.db_name,
-            .username = postgres.db_user,
-            .password = "",
-            .hostname = "127.0.0.1",
-            .port = 5432,
-        },
-    });
-
-    schemaPlusSeeds(&repo) catch {};
+    var repo = try Repo.init(allocator);
+    defer repo.deinit();
+    try schemaPlusSeeds(&repo);
 
     var server = try httpz.Server(@TypeOf(&repo)).init(allocator, .{ .port = port, .request = .{ .max_multiform_count = 1 } }, &repo);
     defer {
@@ -315,7 +306,90 @@ test "tolower" {
     _ = lowerString("somethingverylong");
     try std.testing.expectEqualStrings("kirill", &output);
 }
-const Repo = jetquery.Repo(.postgresql, Schema);
+const Repo = struct {
+    allocator: Allocator,
+    db: *c.sqlite3,
+
+    const FileRecord = struct {
+        id: i32,
+        filename: string,
+        created_at: string,
+        updated_at: string,
+    };
+
+    fn init(allocator: Allocator) !Repo {
+        var db_ptr: ?*c.sqlite3 = null;
+        if (c.sqlite3_open("app.db", &db_ptr) != c.SQLITE_OK) {
+            if (db_ptr) |db| _ = c.sqlite3_close(db);
+            return error.SqliteOpenFailed;
+        }
+        return .{
+            .allocator = allocator,
+            .db = db_ptr.?,
+        };
+    }
+
+    fn deinit(self: *Repo) void {
+        _ = c.sqlite3_close(self.db);
+    }
+
+    fn exec(self: *Repo, sql: [*:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        if (c.sqlite3_exec(self.db, sql, null, null, &err_msg) != c.SQLITE_OK) {
+            if (err_msg != null) {
+                const msg: [*:0]u8 = @ptrCast(err_msg);
+                std.log.err("sqlite exec failed: {s}", .{std.mem.span(msg)});
+                c.sqlite3_free(err_msg);
+            }
+            return error.SqliteExecFailed;
+        }
+    }
+
+    fn allFiles(self: *Repo) ![]FileRecord {
+        const sql =
+            \\SELECT id, filename, created_at, updated_at
+            \\FROM files
+            \\ORDER BY id DESC
+        ;
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var files = try std.ArrayList(FileRecord).initCapacity(self.allocator, 0);
+        errdefer {
+            for (files.items) |file| {
+                self.allocator.free(file.filename);
+                self.allocator.free(file.created_at);
+                self.allocator.free(file.updated_at);
+            }
+            files.deinit(self.allocator);
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const filename = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+            const created_at = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)));
+            const updated_at = try self.allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)));
+            try files.append(self.allocator, .{
+                .id = c.sqlite3_column_int(stmt, 0),
+                .filename = filename,
+                .created_at = created_at,
+                .updated_at = updated_at,
+            });
+        }
+        return files.toOwnedSlice(self.allocator);
+    }
+
+    fn freeFiles(self: *Repo, files: []FileRecord) void {
+        for (files) |file| {
+            self.allocator.free(file.filename);
+            self.allocator.free(file.created_at);
+            self.allocator.free(file.updated_at);
+        }
+        self.allocator.free(files);
+    }
+};
 
 fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
     const resultRowType = @typeInfo(@TypeOf(records)).pointer.child;
@@ -339,13 +413,6 @@ fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
                 switch (@TypeOf(value)) {
                     i32 => try templates.print(template, "td-number", .{ .value = value }, writer),
                     string => try templates.print(template, "td-string", .{ .value = value }, writer),
-                    jetquery.DateTime => {
-                        try writer.writeAll(
-                            \\<td class="px-6 py-4">
-                        );
-                        try value.strftime(writer, "%Y-%m-%d %H:%M:%S");
-                        try writer.writeAll("</td>");
-                    },
                     else => @compileError("what type is this " ++ @typeName(@TypeOf(value))),
                 }
             }
@@ -357,8 +424,8 @@ fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
 
 const Files = struct {
     fn index(response: anytype) !void {
-        const files = try jetquery.Query(.postgresql, Schema, .File).all(response.repo);
-        defer response.repo.free(files);
+        const files = try response.repo.allFiles();
+        defer response.repo.freeFiles(files);
         try table(response.out, @typeName(@This()), files);
     }
     fn new(response: anytype) !void {
@@ -388,18 +455,16 @@ const handlers = struct {
 };
 
 fn schemaPlusSeeds(repo: *Repo) !void {
-    const t = jetquery.schema.table;
-    try repo.createTable(
-        "files",
-        &.{
-            t.primaryKey("id", .{}),
-            t.column("filename", .string, .{ .unique = true }),
-            t.timestamps(.{}),
-        },
-        .{ .if_not_exists = true },
+    try repo.exec(
+        \\CREATE TABLE IF NOT EXISTS files (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  filename TEXT NOT NULL UNIQUE,
+        \\  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\)
     );
-    try repo.insert(.File, .{ .filename = "bar" });
-    try repo.insert(.File, .{ .filename = "foo" });
+    try repo.exec("INSERT OR IGNORE INTO files(filename) VALUES ('bar')");
+    try repo.exec("INSERT OR IGNORE INTO files(filename) VALUES ('foo')");
 }
 
 fn sendFile(allocator: Allocator, comptime name: string) !string {

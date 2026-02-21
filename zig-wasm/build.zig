@@ -16,16 +16,29 @@ pub fn build(b: *std.Build) !void {
     const modules = .{
         .server = createModule(b, "server.zig", target, optimize),
         .dev_server = createModule(b, "dev_server.zig", target, optimize),
-        .db = createModule(b, "db.zig", target, optimize),
         .wasm = b.createModule(.{ .root_source_file = b.path("wasm.zig"), .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }), .optimize = optimize }),
     };
 
-    inline for (&.{ "httpz", "jetquery" }) |dependency_name| {
+    const sqlite3 = b.dependency("sqlite3", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const sqlite3_lib = sqlite3.artifact("sqlite3");
+    const sqlite3_shell = sqlite3.artifact("shell");
+
+    modules.server.addIncludePath(sqlite3.path("."));
+    modules.dev_server.addIncludePath(sqlite3.path("."));
+
+    inline for (&.{"httpz"}) |dependency_name| {
         modules.server.addImport(dependency_name, b.dependency(dependency_name, .{}).module(dependency_name));
     }
 
     const server = b.addExecutable(.{ .name = server_name, .root_module = modules.server });
+    server.linkLibrary(sqlite3_lib);
+
     const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = modules.dev_server });
+    dev_server.linkLibrary(sqlite3_lib);
+
     const wasm_app = b.addExecutable(.{ .name = wasm_app_name, .root_module = modules.wasm });
     wasm_app.entry = .disabled;
     wasm_app.rdynamic = true;
@@ -64,7 +77,13 @@ pub fn build(b: *std.Build) !void {
         run_server.addArgs(args);
     }
 
-    b.step("db", "Run psql client").dependOn(&b.addRunArtifact(b.addExecutable(.{ .name = "db", .root_module = modules.db })).step);
+    const run_db = b.addRunArtifact(sqlite3_shell);
+    run_db.addArg("app.db");
+    if (b.args) |args| {
+        run_db.addArgs(args);
+    }
+
+    b.step("db", "Run sqlite3 shell").dependOn(&run_db.step);
     b.step("run", "Run dev server").dependOn(&run_server.step);
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = modules.server,

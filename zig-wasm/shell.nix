@@ -8,6 +8,5 @@ pkgs.mkShell {
     zls_0_15
     openssl
     tailwindcss_4
-    postgresql
   ];
 }
