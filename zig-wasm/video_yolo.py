@@ -202,7 +202,6 @@ def main():
         print(f"duration_s={duration_s:.3f} frames={frames} fps={fps:.2f}")
         if infer_total_ns > 0:
             infer_fps = (frames * 1_000_000_000.0) / infer_total_ns
-            print(f"infer_duration_s={infer_total_ns / 1_000_000_000.0:.3f} infer_fps={infer_fps:.2f}")
         print(
             "breakdown_s "
             f"prep={prep_total_ns / 1_000_000_000.0:.3f} "
