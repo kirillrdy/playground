@@ -32,13 +32,12 @@ const TensorQueue = struct {
     free_len: usize = 0,
     ready_head: usize = 0,
     ready_len: usize = 0,
-    done_producers: usize = 0,
-    producer_count: usize,
+    wg: *std.Thread.WaitGroup,
     mutex: std.Thread.Mutex = .{},
     not_empty: std.Thread.Condition = .{},
     not_full: std.Thread.Condition = .{},
 
-    fn init(allocator: std.mem.Allocator, capacity: usize, tensor_len: usize, producers: usize) !TensorQueue {
+    fn init(allocator: std.mem.Allocator, capacity: usize, tensor_len: usize, wg: *std.Thread.WaitGroup) !TensorQueue {
         const storage = try allocator.alloc(f32, capacity * tensor_len);
         errdefer allocator.free(storage);
         const free_ring = try allocator.alloc(usize, capacity);
@@ -54,7 +53,7 @@ const TensorQueue = struct {
             .free_ring = free_ring,
             .ready_ring = ready_ring,
             .free_len = capacity,
-            .producer_count = producers,
+            .wg = wg,
         };
     }
 
@@ -91,8 +90,8 @@ const TensorQueue = struct {
     fn acquireReadSlot(self: *TensorQueue) ?usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        while (self.ready_len == 0 and self.done_producers < self.producer_count) self.not_empty.wait(&self.mutex);
-        if (self.ready_len == 0 and self.done_producers >= self.producer_count) return null;
+        while (self.ready_len == 0 and !self.wg.isDone()) self.not_empty.wait(&self.mutex);
+        if (self.ready_len == 0 and self.wg.isDone()) return null;
         const idx = self.ready_ring[self.ready_head];
         self.ready_head = (self.ready_head + 1) % self.capacity;
         self.ready_len -= 1;
@@ -108,16 +107,16 @@ const TensorQueue = struct {
         self.not_full.signal();
     }
 
-    fn producerDone(self: *TensorQueue) void {
+    fn producerDoneSignal(self: *TensorQueue) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.done_producers += 1;
         self.not_empty.broadcast();
     }
 };
 
 const DecoderCtx = struct {
     queue: *TensorQueue,
+    wg: *std.Thread.WaitGroup,
     video_path_z: [:0]const u8,
 };
 
@@ -273,14 +272,17 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
 }
 
 fn decoderThreadMain(ctx: *DecoderCtx) void {
+    defer ctx.wg.finish();
     decodeVideoIntoQueue(ctx) catch |err| {
         std.log.err("decoder error ({s}): {}", .{ ctx.video_path_z, err });
     };
-    ctx.queue.producerDone();
+    ctx.queue.producerDoneSignal();
 }
 
 fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize) !void {
-    var queue = try TensorQueue.init(allocator, queue_capacity, input_len, producer_count);
+    var wg: std.Thread.WaitGroup = .{};
+    wg.startMany(producer_count);
+    var queue = try TensorQueue.init(allocator, queue_capacity, input_len, &wg);
     defer queue.deinit();
 
     const video_path_z = try allocator.dupeZ(u8, video_path);
@@ -296,6 +298,7 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     for (0..producer_count) |i| {
         decoder_ctxs[i] = .{
             .queue = &queue,
+            .wg = &wg,
             .video_path_z = video_path_z,
         };
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
