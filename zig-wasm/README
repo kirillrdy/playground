@@ -16,6 +16,15 @@ ONNX Runtime scaffold (YOLO integration path):
 - If unset, build tries to resolve paths via Nix:
   - `nixpkgs#onnxruntime.dev.outPath`
   - `nixpkgs#onnxruntime.outPath`
+- CUDA/NVCC are also resolved by build (no `nix-shell` env needed):
+  - optional overrides:
+    - `-Dcuda-include=/path/to/cuda/root`
+    - `-Dcuda-lib=/path/to/cuda/root`
+    - `-Dnvcc=/path/to/nvcc`
+  - if unset, build tries to resolve via Nix:
+    - `nixpkgs#cudaPackages.cudatoolkit`
+    - `nixpkgs#cudaPackages.cuda_cudart`
+    - `nixpkgs#cudaPackages.cuda_nvcc`
 - Download default model to `zig-out/bin/model.onnx`:
   - `zig build model`
   - optional custom URL: `zig build model -Dmodel-url=https://.../model.onnx`

@@ -44,6 +44,9 @@ pub fn build(b: *std.Build) !void {
     const onnx_lib_path = b.option([]const u8, "onnx-lib", "Path to directory containing libonnxruntime");
     const ffmpeg_include_path = b.option([]const u8, "ffmpeg-include", "Path to directory containing FFmpeg headers");
     const ffmpeg_lib_path = b.option([]const u8, "ffmpeg-lib", "Path to directory containing FFmpeg libraries");
+    const cuda_include_path = b.option([]const u8, "cuda-include", "Path to directory containing CUDA headers");
+    const cuda_lib_path = b.option([]const u8, "cuda-lib", "Path to directory containing CUDA runtime libraries");
+    const nvcc_path = b.option([]const u8, "nvcc", "Path to nvcc compiler binary");
     const model_url = b.option([]const u8, "model-url", "URL to download ONNX model from") orelse "https://raw.githubusercontent.com/Hyuto/yolov8-onnxruntime-web/master/public/model/yolov8n.onnx";
     const onnx_gpu_dev_expr =
         \\let
@@ -65,14 +68,47 @@ pub fn build(b: *std.Build) !void {
         \\  ort = pkgs.onnxruntime.override { cudaSupport = true; };
         \\in ort
     ;
+    const cuda_toolkit_expr =
+        \\let
+        \\  flake = builtins.getFlake "nixpkgs";
+        \\  pkgs = import flake.outPath {
+        \\    system = builtins.currentSystem;
+        \\    config.allowUnfree = true;
+        \\  };
+        \\in pkgs.cudaPackages.cudatoolkit
+    ;
+    const cuda_cudart_expr =
+        \\let
+        \\  flake = builtins.getFlake "nixpkgs";
+        \\  pkgs = import flake.outPath {
+        \\    system = builtins.currentSystem;
+        \\    config.allowUnfree = true;
+        \\  };
+        \\in pkgs.cudaPackages.cuda_cudart
+    ;
+    const cuda_nvcc_expr =
+        \\let
+        \\  flake = builtins.getFlake "nixpkgs";
+        \\  pkgs = import flake.outPath {
+        \\    system = builtins.currentSystem;
+        \\    config.allowUnfree = true;
+        \\  };
+        \\in pkgs.cudaPackages.cuda_nvcc
+    ;
     const onnx_dev_root = onnx_include_path orelse nixBuildExprPath(b.allocator, onnx_gpu_dev_expr);
     const onnx_out_root = onnx_lib_path orelse nixBuildExprPath(b.allocator, onnx_gpu_out_expr);
     const ffmpeg_dev_root = ffmpeg_include_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.dev");
     const ffmpeg_out_root = ffmpeg_lib_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.lib");
+    const cuda_dev_root = cuda_include_path orelse nixBuildExprPath(b.allocator, cuda_toolkit_expr);
+    const cuda_out_root = cuda_lib_path orelse nixBuildExprPath(b.allocator, cuda_cudart_expr);
+    const nvcc_root = nixBuildExprPath(b.allocator, cuda_nvcc_expr);
+    const resolved_nvcc = nvcc_path orelse if (nvcc_root) |path| b.fmt("{s}/bin/nvcc", .{path}) else "nvcc";
     if (onnx_dev_root == null) return error.MissingOnnxRuntimeDev;
     if (onnx_out_root == null) return error.MissingOnnxRuntime;
     if (ffmpeg_dev_root == null) return error.MissingFfmpegDev;
     if (ffmpeg_out_root == null) return error.MissingFfmpeg;
+    if (cuda_dev_root == null) return error.MissingCudaToolkitDev;
+    if (cuda_out_root == null) return error.MissingCudaRuntime;
 
     const sqlite3 = b.dependency("sqlite3", .{
         .target = target,
@@ -91,6 +127,7 @@ pub fn build(b: *std.Build) !void {
     if (onnx_dev_root) |path| modules.server.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     if (onnx_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     if (ffmpeg_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
+    if (cuda_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     const video_yolo_options = b.addOptions();
     modules.video_yolo.addOptions("config", video_yolo_options);
 
@@ -103,17 +140,30 @@ pub fn build(b: *std.Build) !void {
     if (onnx_out_root) |path| server.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
     server.linkSystemLibrary("onnxruntime");
 
+    const preprocess_obj = b.addSystemCommand(&.{
+        resolved_nvcc,
+        "-c",
+        "preprocess.cu",
+        "-o",
+    });
+    const preprocess_o = preprocess_obj.addOutputFileArg("preprocess.o");
+
     const video_yolo = b.addExecutable(.{ .name = "video_yolo", .root_module = modules.video_yolo });
     video_yolo.linkLibC();
+    video_yolo.addObjectFile(preprocess_o);
+    video_yolo.linkSystemLibrary("cudart");
     if (onnx_dev_root) |path| video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     if (ffmpeg_dev_root) |path| video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
+    if (cuda_dev_root) |path| video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
     if (onnx_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
     if (ffmpeg_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
+    if (cuda_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
     video_yolo.linkSystemLibrary("onnxruntime");
     video_yolo.linkSystemLibrary("avformat");
     video_yolo.linkSystemLibrary("avcodec");
     video_yolo.linkSystemLibrary("avutil");
     video_yolo.linkSystemLibrary("swscale");
+    video_yolo.linkSystemLibrary("avfilter");
 
     const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = modules.dev_server });
     dev_server.linkLibrary(sqlite3_lib);
