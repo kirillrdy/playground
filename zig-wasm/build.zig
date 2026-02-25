@@ -7,26 +7,35 @@ fn createModule(b: *std.Build, src: string, target: anytype, optimize: anytype) 
     return b.createModule(.{ .root_source_file = b.path(src), .target = target, .optimize = optimize });
 }
 
-fn trimNewline(input: []const u8) []const u8 {
-    return std.mem.trimRight(u8, input, "\r\n");
+fn optionPath(path: ?[]const u8) ?std.Build.LazyPath {
+    if (path) |p| return .{ .cwd_relative = p };
+    return null;
 }
 
-fn nixBuildPath(allocator: std.mem.Allocator, attr: []const u8) ?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "nix", "build", "--no-link", "--print-out-paths", attr },
-    }) catch return null;
-    if (result.term != .Exited or result.term.Exited != 0) return null;
-    return allocator.dupe(u8, trimNewline(result.stdout)) catch null;
+fn nixBuildAttrLink(b: *std.Build, out_name: []const u8, attr: []const u8) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{ "sh", "-c",
+        \\set -euo pipefail
+        \\out="$1"
+        \\attr="$2"
+        \\path="$(nix build --no-link --print-out-paths "$attr")"
+        \\ln -s "$path" "$out"
+    , "--" });
+    const out = run.addOutputFileArg(out_name);
+    run.addArg(attr);
+    return out;
 }
 
-fn nixBuildExprPath(allocator: std.mem.Allocator, expr: []const u8) ?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "nix", "build", "--impure", "--no-link", "--print-out-paths", "--expr", expr },
-    }) catch return null;
-    if (result.term != .Exited or result.term.Exited != 0) return null;
-    return allocator.dupe(u8, trimNewline(result.stdout)) catch null;
+fn nixBuildExprLink(b: *std.Build, out_name: []const u8, expr: []const u8) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{ "sh", "-c",
+        \\set -euo pipefail
+        \\out="$1"
+        \\expr="$2"
+        \\path="$(nix build --impure --no-link --print-out-paths --expr "$expr")"
+        \\ln -s "$path" "$out"
+    , "--" });
+    const out = run.addOutputFileArg(out_name);
+    run.addArg(expr);
+    return out;
 }
 
 pub fn build(b: *std.Build) !void {
@@ -95,20 +104,14 @@ pub fn build(b: *std.Build) !void {
         \\  };
         \\in pkgs.cudaPackages.cuda_nvcc
     ;
-    const onnx_dev_root = onnx_include_path orelse nixBuildExprPath(b.allocator, onnx_gpu_dev_expr);
-    const onnx_out_root = onnx_lib_path orelse nixBuildExprPath(b.allocator, onnx_gpu_out_expr);
-    const ffmpeg_dev_root = ffmpeg_include_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.dev");
-    const ffmpeg_out_root = ffmpeg_lib_path orelse nixBuildPath(b.allocator, "nixpkgs#ffmpeg.lib");
-    const cuda_dev_root = cuda_include_path orelse nixBuildExprPath(b.allocator, cuda_toolkit_expr);
-    const cuda_out_root = cuda_lib_path orelse nixBuildExprPath(b.allocator, cuda_cudart_expr);
-    const nvcc_root = nixBuildExprPath(b.allocator, cuda_nvcc_expr);
-    const resolved_nvcc = nvcc_path orelse if (nvcc_root) |path| b.fmt("{s}/bin/nvcc", .{path}) else "nvcc";
-    if (onnx_dev_root == null) return error.MissingOnnxRuntimeDev;
-    if (onnx_out_root == null) return error.MissingOnnxRuntime;
-    if (ffmpeg_dev_root == null) return error.MissingFfmpegDev;
-    if (ffmpeg_out_root == null) return error.MissingFfmpeg;
-    if (cuda_dev_root == null) return error.MissingCudaToolkitDev;
-    if (cuda_out_root == null) return error.MissingCudaRuntime;
+    const onnx_dev_root = optionPath(onnx_include_path) orelse nixBuildExprLink(b, "onnx_dev_root", onnx_gpu_dev_expr);
+    const onnx_out_root = optionPath(onnx_lib_path) orelse nixBuildExprLink(b, "onnx_out_root", onnx_gpu_out_expr);
+    const ffmpeg_dev_root = optionPath(ffmpeg_include_path) orelse nixBuildAttrLink(b, "ffmpeg_dev_root", "nixpkgs#ffmpeg.dev");
+    const ffmpeg_out_root = optionPath(ffmpeg_lib_path) orelse nixBuildAttrLink(b, "ffmpeg_out_root", "nixpkgs#ffmpeg.lib");
+    const cuda_dev_root = optionPath(cuda_include_path) orelse nixBuildExprLink(b, "cuda_dev_root", cuda_toolkit_expr);
+    const cuda_out_root = optionPath(cuda_lib_path) orelse nixBuildExprLink(b, "cuda_out_root", cuda_cudart_expr);
+    const cuda_nvcc_root = nixBuildExprLink(b, "cuda_nvcc_root", cuda_nvcc_expr);
+    const resolved_nvcc = optionPath(nvcc_path) orelse cuda_nvcc_root.path(b, "bin/nvcc");
 
     const sqlite3 = b.dependency("sqlite3", .{
         .target = target,
@@ -124,10 +127,10 @@ pub fn build(b: *std.Build) !void {
     modules.server.addIncludePath(sqlite3.path("."));
     modules.dev_server.addIncludePath(sqlite3.path("."));
     modules.server.addImport("zigimg", zigimg.module("zigimg"));
-    if (onnx_dev_root) |path| modules.server.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
-    if (onnx_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
-    if (ffmpeg_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
-    if (cuda_dev_root) |path| modules.video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
+    modules.server.addIncludePath(onnx_dev_root.path(b, "include"));
+    modules.video_yolo.addIncludePath(onnx_dev_root.path(b, "include"));
+    modules.video_yolo.addIncludePath(ffmpeg_dev_root.path(b, "include"));
+    modules.video_yolo.addIncludePath(cuda_dev_root.path(b, "include"));
     const video_yolo_options = b.addOptions();
     modules.video_yolo.addOptions("config", video_yolo_options);
 
@@ -137,27 +140,32 @@ pub fn build(b: *std.Build) !void {
 
     const server = b.addExecutable(.{ .name = server_name, .root_module = modules.server });
     server.linkLibrary(sqlite3_lib);
-    if (onnx_out_root) |path| server.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
+    server.addLibraryPath(onnx_out_root.path(b, "lib"));
     server.linkSystemLibrary("onnxruntime");
 
-    const preprocess_obj = b.addSystemCommand(&.{
-        resolved_nvcc,
-        "-c",
-        "preprocess.cu",
-        "-o",
-    });
+    const preprocess_obj = b.addSystemCommand(&.{ "sh", "-c",
+        \\set -euo pipefail
+        \\nvcc="$1"
+        \\src="$2"
+        \\out="$3"
+        \\cuda_include="$4"
+        \\"$nvcc" -c "$src" -o "$out" -I"$cuda_include"
+    , "--" });
+    preprocess_obj.addFileArg(resolved_nvcc);
+    preprocess_obj.addFileArg(b.path("preprocess.cu"));
     const preprocess_o = preprocess_obj.addOutputFileArg("preprocess.o");
+    preprocess_obj.addDirectoryArg(cuda_dev_root.path(b, "include"));
 
     const video_yolo = b.addExecutable(.{ .name = "video_yolo", .root_module = modules.video_yolo });
     video_yolo.linkLibC();
     video_yolo.addObjectFile(preprocess_o);
     video_yolo.linkSystemLibrary("cudart");
-    if (onnx_dev_root) |path| video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
-    if (ffmpeg_dev_root) |path| video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
-    if (cuda_dev_root) |path| video_yolo.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{path}) });
-    if (onnx_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
-    if (ffmpeg_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
-    if (cuda_out_root) |path| video_yolo.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{path}) });
+    video_yolo.addIncludePath(onnx_dev_root.path(b, "include"));
+    video_yolo.addIncludePath(ffmpeg_dev_root.path(b, "include"));
+    video_yolo.addIncludePath(cuda_dev_root.path(b, "include"));
+    video_yolo.addLibraryPath(onnx_out_root.path(b, "lib"));
+    video_yolo.addLibraryPath(ffmpeg_out_root.path(b, "lib"));
+    video_yolo.addLibraryPath(cuda_out_root.path(b, "lib"));
     video_yolo.linkSystemLibrary("onnxruntime");
     video_yolo.linkSystemLibrary("avformat");
     video_yolo.linkSystemLibrary("avcodec");
