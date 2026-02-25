@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) !void {
     const cuda_include_path = b.option([]const u8, "cuda-include", "Path to directory containing CUDA headers");
     const cuda_lib_path = b.option([]const u8, "cuda-lib", "Path to directory containing CUDA runtime libraries");
     const nvcc_path = b.option([]const u8, "nvcc", "Path to nvcc compiler binary");
-    const model_url = b.option([]const u8, "model-url", "URL to download ONNX model from") orelse "https://raw.githubusercontent.com/Hyuto/yolov8-onnxruntime-web/master/public/model/yolov8n.onnx";
+    const model_url = b.option([]const u8, "model-url", "URL to download ONNX model from") orelse "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx";
     const onnx_gpu_dev_expr =
         \\let
         \\  flake = builtins.getFlake "nixpkgs";

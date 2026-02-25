@@ -7,25 +7,37 @@ const c = @cImport({
     @cInclude("libavformat/avformat.h");
     @cInclude("libavcodec/avcodec.h");
     @cInclude("libavutil/avutil.h");
+    @cInclude("libavutil/hwcontext.h");
+    @cInclude("libavutil/hwcontext_cuda.h");
+    @cInclude("libavutil/pixdesc.h");
+    @cInclude("libavfilter/avfilter.h");
+    @cInclude("libavfilter/buffersink.h");
+    @cInclude("libavfilter/buffersrc.h");
     @cInclude("libswscale/swscale.h");
+    @cInclude("cuda_runtime.h");
 });
+
+extern fn launch_nv12_to_rgb_nchw(
+    src_y: [*]const u8,
+    src_uv: [*]const u8,
+    src_pitch_y: c_int,
+    src_pitch_uv: c_int,
+    dst: [*]f32,
+    width: c_int,
+    height: c_int,
+    stream: ?*anyopaque,
+) void;
 
 const input_w: usize = 640;
 const input_h: usize = 640;
 const input_len: usize = 1 * 3 * input_w * input_h;
 const queue_capacity: usize = 32;
 
-const OutputSpec = struct {
-    boxes: usize,
-    classes: usize,
-    layout: yolo.OutputLayout,
-};
-
 const TensorQueue = struct {
     allocator: std.mem.Allocator,
     tensor_len: usize,
     capacity: usize,
-    storage: []f32,
+    storage_d: [*]f32,
     free_ring: []usize,
     ready_ring: []usize,
     free_head: usize = 0,
@@ -38,8 +50,10 @@ const TensorQueue = struct {
     not_full: std.Thread.Condition = .{},
 
     fn init(allocator: std.mem.Allocator, capacity: usize, tensor_len: usize, wg: *std.Thread.WaitGroup) !TensorQueue {
-        const storage = try allocator.alloc(f32, capacity * tensor_len);
-        errdefer allocator.free(storage);
+        var storage_ptr: ?*anyopaque = null;
+        if (c.cudaMalloc(&storage_ptr, capacity * tensor_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+        const storage_d: [*]f32 = @ptrCast(@alignCast(storage_ptr));
+
         const free_ring = try allocator.alloc(usize, capacity);
         errdefer allocator.free(free_ring);
         const ready_ring = try allocator.alloc(usize, capacity);
@@ -49,7 +63,7 @@ const TensorQueue = struct {
             .allocator = allocator,
             .tensor_len = tensor_len,
             .capacity = capacity,
-            .storage = storage,
+            .storage_d = storage_d,
             .free_ring = free_ring,
             .ready_ring = ready_ring,
             .free_len = capacity,
@@ -60,12 +74,12 @@ const TensorQueue = struct {
     fn deinit(self: *TensorQueue) void {
         self.allocator.free(self.ready_ring);
         self.allocator.free(self.free_ring);
-        self.allocator.free(self.storage);
+        _ = c.cudaFree(self.storage_d);
     }
 
-    fn slot(self: *TensorQueue, idx: usize) []f32 {
+    fn slot(self: *TensorQueue, idx: usize) [*]f32 {
         const start = idx * self.tensor_len;
-        return self.storage[start .. start + self.tensor_len];
+        return self.storage_d + start;
     }
 
     fn acquireWriteSlot(self: *TensorQueue) usize {
@@ -118,7 +132,25 @@ const DecoderCtx = struct {
     queue: *TensorQueue,
     wg: *std.Thread.WaitGroup,
     video_path_z: [:0]const u8,
+    cuda_stream: c.cudaStream_t,
 };
+
+fn get_format(ctx: ?*c.AVCodecContext, pix_fmts: ?[*]const c.enum_AVPixelFormat) callconv(.c) c.enum_AVPixelFormat {
+    _ = ctx;
+    var p = pix_fmts.?;
+    var first: c.enum_AVPixelFormat = c.AV_PIX_FMT_NONE;
+    var first_sw: c.enum_AVPixelFormat = c.AV_PIX_FMT_NONE;
+    while (p[0] != c.AV_PIX_FMT_NONE) : (p += 1) {
+        const fmt = p[0];
+        if (first == c.AV_PIX_FMT_NONE) first = fmt;
+        const desc = c.av_pix_fmt_desc_get(fmt);
+        if (desc != null and (desc.?.*.flags & c.AV_PIX_FMT_FLAG_HWACCEL) == 0 and first_sw == c.AV_PIX_FMT_NONE) {
+            first_sw = fmt;
+        }
+    }
+    if (first_sw != c.AV_PIX_FMT_NONE) return first_sw;
+    return first;
+}
 
 fn ortCheck(api: *const c.OrtApi, status: ?*c.OrtStatus) !void {
     if (status == null) return;
@@ -133,45 +165,57 @@ fn avCheck(code: c_int) !void {
     return error.FfmpegError;
 }
 
-fn inferOutputSpec(dim_count: usize, dims: []const i64, total_values: usize) OutputSpec {
-    if (dim_count >= 3) {
-        const d1 = @as(usize, @intCast(dims[dim_count - 2]));
-        const d2 = @as(usize, @intCast(dims[dim_count - 1]));
-        if (d1 > d2) {
-            const attrs = d2;
-            return .{
-                .boxes = d1,
-                .classes = if (attrs > 4) attrs - 4 else 80,
-                .layout = .boxes_first,
-            };
-        } else {
-            const attrs = d1;
-            return .{
-                .boxes = d2,
-                .classes = if (attrs > 4) attrs - 4 else 80,
-                .layout = .attributes_first,
-            };
-        }
-    }
-    return .{
-        .boxes = total_values / (80 + 4),
-        .classes = 80,
-        .layout = .boxes_first,
-    };
-}
+fn decodeYolo26Heads(
+    allocator: std.mem.Allocator,
+    logits: []const f32,
+    boxes: []const f32,
+    det_count: usize,
+    class_count: usize,
+    conf_threshold: f32,
+) ![]yolo.Detection {
+    var out = try std.ArrayList(yolo.Detection).initCapacity(allocator, 0);
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, det_count);
 
-fn rgbU8ToNchwF32(dst: []f32, rgb: []const u8, width: usize, height: usize) void {
-    const plane = width * height;
-    for (0..height) |y| {
-        const row_base = y * width;
-        for (0..width) |x| {
-            const src_idx = (row_base + x) * 3;
-            const dst_idx = row_base + x;
-            dst[dst_idx] = @as(f32, @floatFromInt(rgb[src_idx])) * (1.0 / 255.0);
-            dst[plane + dst_idx] = @as(f32, @floatFromInt(rgb[src_idx + 1])) * (1.0 / 255.0);
-            dst[(2 * plane) + dst_idx] = @as(f32, @floatFromInt(rgb[src_idx + 2])) * (1.0 / 255.0);
+    for (0..det_count) |i| {
+        const logit_row = logits[(i * class_count)..][0..class_count];
+        var best_class: usize = 0;
+        var best_logit: f32 = logit_row[0];
+        for (1..class_count) |j| {
+            if (logit_row[j] > best_logit) {
+                best_logit = logit_row[j];
+                best_class = j;
+            }
         }
+
+        const score = 1.0 / (1.0 + @exp(-best_logit));
+        if (score < conf_threshold) continue;
+
+        const cx = boxes[(i * 4) + 0];
+        const cy = boxes[(i * 4) + 1];
+        const w = boxes[(i * 4) + 2];
+        const h = boxes[(i * 4) + 3];
+        const normalized = (@abs(cx) <= 1.5 and @abs(cy) <= 1.5 and @abs(w) <= 1.5 and @abs(h) <= 1.5);
+        const scale_x: f32 = if (normalized) @floatFromInt(input_w) else 1.0;
+        const scale_y: f32 = if (normalized) @floatFromInt(input_h) else 1.0;
+
+        try out.append(allocator, .{
+            .class_id = best_class,
+            .score = score,
+            .x1 = (cx - (w / 2.0)) * scale_x,
+            .y1 = (cy - (h / 2.0)) * scale_y,
+            .x2 = (cx + (w / 2.0)) * scale_x,
+            .y2 = (cy + (h / 2.0)) * scale_y,
+        });
     }
+
+    std.mem.sort(yolo.Detection, out.items, {}, struct {
+        fn lessThan(_: void, a: yolo.Detection, b: yolo.Detection) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
@@ -186,50 +230,33 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
     const codecpar = stream.?.*.codecpar;
     const decoder = c.avcodec_find_decoder(codecpar.?.*.codec_id) orelse return error.UnsupportedCodec;
 
+    // HW Context
+    var hw_device_ctx: ?*c.AVBufferRef = null;
+    try avCheck(c.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_CUDA, null, null, 0));
+    defer c.av_buffer_unref(&hw_device_ctx);
+
     var codec_ctx = c.avcodec_alloc_context3(decoder);
     if (codec_ctx == null) return error.OutOfMemory;
     defer c.avcodec_free_context(&codec_ctx);
+
     try avCheck(c.avcodec_parameters_to_context(codec_ctx, codecpar));
+    codec_ctx.?.*.hw_device_ctx = c.av_buffer_ref(hw_device_ctx);
+    codec_ctx.?.*.get_format = get_format;
     try avCheck(c.avcodec_open2(codec_ctx, decoder, null));
 
+    // Filter graph is initialized lazily from the first decoded frame so
+    // pix_fmt / hw_frames_ctx match the actual decoder output.
+    var filter_graph: ?*c.AVFilterGraph = null;
+    defer if (filter_graph != null) c.avfilter_graph_free(&filter_graph);
+    var buffer_ctx: ?*c.AVFilterContext = null;
+    var buffersink_ctx: ?*c.AVFilterContext = null;
+
     var frame = c.av_frame_alloc();
-    if (frame == null) return error.OutOfMemory;
     defer c.av_frame_free(&frame);
-
+    var filt_frame = c.av_frame_alloc();
+    defer c.av_frame_free(&filt_frame);
     var packet = c.av_packet_alloc();
-    if (packet == null) return error.OutOfMemory;
     defer c.av_packet_free(&packet);
-
-    const sws_ctx = c.sws_getContext(
-        codec_ctx.?.*.width,
-        codec_ctx.?.*.height,
-        codec_ctx.?.*.pix_fmt,
-        input_w,
-        input_h,
-        c.AV_PIX_FMT_RGB24,
-        c.SWS_BILINEAR,
-        null,
-        null,
-        null,
-    ) orelse return error.OutOfMemory;
-    defer c.sws_freeContext(sws_ctx);
-
-    const rgb_len = input_w * input_h * 3;
-    const rgb = try std.heap.c_allocator.alloc(u8, rgb_len);
-    defer std.heap.c_allocator.free(rgb);
-    var dst_data = [_][*c]u8{
-        @ptrCast(rgb.ptr),
-        null,
-        null,
-        null,
-    };
-    var dst_linesize = [_]c_int{
-        @intCast(input_w * 3),
-        0,
-        0,
-        0,
-    };
-
     var done = false;
     while (!done) {
         const read_ret = c.av_read_frame(fmt_ctx, packet);
@@ -238,35 +265,100 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
             done = true;
         } else {
             defer c.av_packet_unref(packet);
-            if (packet.?.*.stream_index != stream_idx) continue;
-            try avCheck(c.avcodec_send_packet(codec_ctx, packet));
+            if (packet.?.*.stream_index == stream_idx) {
+                try avCheck(c.avcodec_send_packet(codec_ctx, packet));
+            }
         }
 
         while (true) {
             const recv_ret = c.avcodec_receive_frame(codec_ctx, frame);
             if (recv_ret == c.AVERROR(c.EAGAIN)) break;
             if (recv_ret == c.AVERROR_EOF) {
+                // Flush filter
+                if (buffer_ctx != null and c.av_buffersrc_add_frame_flags(buffer_ctx, null, 0) >= 0) {
+                     // Could pull remaining frames here if loop continued
+                }
                 done = true;
                 break;
             }
             try avCheck(recv_ret);
 
-            _ = c.sws_scale(
-                sws_ctx,
-                &frame.?.*.data,
-                &frame.?.*.linesize,
-                0,
-                codec_ctx.?.*.height,
-                &dst_data,
-                &dst_linesize,
-            );
+            if (filter_graph == null) {
+                filter_graph = c.avfilter_graph_alloc();
+                if (filter_graph == null) return error.OutOfMemory;
 
-            const slot_idx = ctx.queue.acquireWriteSlot();
-            const slot = ctx.queue.slot(slot_idx);
-            rgbU8ToNchwF32(slot, rgb, input_w, input_h);
-            ctx.queue.publishReady(slot_idx);
+                var args_buf: [512]u8 = undefined;
+                const args = try std.fmt.bufPrintZ(&args_buf,
+                    "video_size={d}x{d}:pix_fmt={d}:time_base={d}/{d}:pixel_aspect={d}/{d}",
+                    .{
+                        frame.?.*.width, frame.?.*.height,
+                        frame.?.*.format,
+                        stream.?.*.time_base.num, stream.?.*.time_base.den,
+                        codec_ctx.?.*.sample_aspect_ratio.num, codec_ctx.?.*.sample_aspect_ratio.den,
+                    },
+                );
 
+                const buffer_filter = c.avfilter_get_by_name("buffer");
+                const buffersink_filter = c.avfilter_get_by_name("buffersink");
+
+                try avCheck(c.avfilter_graph_create_filter(&buffer_ctx, buffer_filter, "in", args.ptr, null, filter_graph));
+                try avCheck(c.avfilter_graph_create_filter(&buffersink_ctx, buffersink_filter, "out", null, null, filter_graph));
+                buffer_ctx.?.*.hw_device_ctx = c.av_buffer_ref(hw_device_ctx);
+                if (frame.?.*.hw_frames_ctx != null) {
+                    const src_params = c.av_buffersrc_parameters_alloc() orelse return error.OutOfMemory;
+                    defer c.av_free(src_params);
+                    src_params.?.*.hw_frames_ctx = c.av_buffer_ref(frame.?.*.hw_frames_ctx);
+                    try avCheck(c.av_buffersrc_parameters_set(buffer_ctx, src_params));
+                }
+
+                var inputs = c.avfilter_inout_alloc();
+                var outputs = c.avfilter_inout_alloc();
+                defer c.avfilter_inout_free(&inputs);
+                defer c.avfilter_inout_free(&outputs);
+
+                outputs.?.*.name = c.av_strdup("in");
+                outputs.?.*.filter_ctx = buffer_ctx;
+                outputs.?.*.pad_idx = 0;
+                outputs.?.*.next = null;
+
+                inputs.?.*.name = c.av_strdup("out");
+                inputs.?.*.filter_ctx = buffersink_ctx;
+                inputs.?.*.pad_idx = 0;
+                inputs.?.*.next = null;
+
+                const hw_filter_spec = "scale_cuda=640:640:format=nv12";
+                const sw_filter_spec = "format=nv12,hwupload_cuda,scale_cuda=640:640:format=nv12";
+                const filter_spec = if (frame.?.*.hw_frames_ctx != null) hw_filter_spec else sw_filter_spec;
+                try avCheck(c.avfilter_graph_parse_ptr(filter_graph, filter_spec, &inputs, &outputs, null));
+                try avCheck(c.avfilter_graph_config(filter_graph, null));
+            }
+
+            try avCheck(c.av_buffersrc_add_frame_flags(buffer_ctx, frame, c.AV_BUFFERSRC_FLAG_KEEP_REF));
             c.av_frame_unref(frame);
+
+            while (true) {
+                const filt_ret = c.av_buffersink_get_frame(buffersink_ctx, filt_frame);
+                if (filt_ret == c.AVERROR(c.EAGAIN) or filt_ret == c.AVERROR_EOF) break;
+                try avCheck(filt_ret);
+
+                const slot_idx = ctx.queue.acquireWriteSlot();
+                const slot = ctx.queue.slot(slot_idx);
+
+                launch_nv12_to_rgb_nchw(
+                    filt_frame.?.*.data[0],
+                    filt_frame.?.*.data[1],
+                    filt_frame.?.*.linesize[0],
+                    filt_frame.?.*.linesize[1],
+                    slot,
+                    640,
+                    640,
+                    ctx.cuda_stream,
+                );
+
+                _ = c.cudaStreamSynchronize(ctx.cuda_stream);
+                ctx.queue.publishReady(slot_idx);
+                c.av_frame_unref(filt_frame);
+            }
         }
     }
 }
@@ -296,14 +388,16 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     defer for (decoder_threads) |t| if (t) |thr| thr.join();
 
     for (0..producer_count) |i| {
+        var stream: c.cudaStream_t = null;
+        if (c.cudaStreamCreate(&stream) != c.cudaSuccess) return error.CudaStreamCreateFailed;
         decoder_ctxs[i] = .{
             .queue = &queue,
             .wg = &wg,
             .video_path_z = video_path_z,
+            .cuda_stream = stream.?,
         };
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
     }
-
     const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
     const api: *const c.OrtApi = @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable);
@@ -336,21 +430,26 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     defer if (session) |s| api.ReleaseSession.?(s);
 
     var memory_info: ?*c.OrtMemoryInfo = null;
-    try ortCheck(api, api.CreateCpuMemoryInfo.?(c.OrtArenaAllocator, c.OrtMemTypeDefault, &memory_info));
+    try ortCheck(api, api.CreateMemoryInfo.?("Cpu", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
     defer if (memory_info) |mi| api.ReleaseMemoryInfo.?(mi);
+    const host_input = try allocator.alloc(f32, input_len);
+    defer allocator.free(host_input);
 
     var ort_allocator: ?*c.OrtAllocator = null;
     try ortCheck(api, api.GetAllocatorWithDefaultOptions.?(&ort_allocator));
     var input_name_alloc: [*c]u8 = null;
     try ortCheck(api, api.SessionGetInputName.?(session, 0, ort_allocator, &input_name_alloc));
     defer _ = api.AllocatorFree.?(ort_allocator, input_name_alloc);
-    var output_name_alloc: [*c]u8 = null;
-    try ortCheck(api, api.SessionGetOutputName.?(session, 0, ort_allocator, &output_name_alloc));
-    defer _ = api.AllocatorFree.?(ort_allocator, output_name_alloc);
+    var output0_name_alloc: [*c]u8 = null;
+    var output1_name_alloc: [*c]u8 = null;
+    try ortCheck(api, api.SessionGetOutputName.?(session, 0, ort_allocator, &output0_name_alloc));
+    try ortCheck(api, api.SessionGetOutputName.?(session, 1, ort_allocator, &output1_name_alloc));
+    defer _ = api.AllocatorFree.?(ort_allocator, output0_name_alloc);
+    defer _ = api.AllocatorFree.?(ort_allocator, output1_name_alloc);
 
     const input_shape = [_]i64{ 1, 3, @intCast(input_h), @intCast(input_w) };
     const input_names = [_][*c]const u8{input_name_alloc};
-    const output_names = [_][*c]const u8{output_name_alloc};
+    const output_names = [_][*c]const u8{ output0_name_alloc, output1_name_alloc };
 
     var decoded_frames: usize = 0;
     var total_ns: i128 = 0;
@@ -358,12 +457,15 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     while (queue.acquireReadSlot()) |slot_idx| {
         defer queue.releaseReadSlot(slot_idx);
         const slot = queue.slot(slot_idx);
+        if (c.cudaMemcpy(host_input.ptr, slot, input_len * @sizeOf(f32), c.cudaMemcpyDeviceToHost) != c.cudaSuccess) {
+            return error.CudaCopyFailed;
+        }
 
         var input_value: ?*c.OrtValue = null;
         try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
             memory_info,
-            slot.ptr,
-            slot.len * @sizeOf(f32),
+            host_input.ptr,
+            input_len * @sizeOf(f32),
             &input_shape,
             input_shape.len,
             c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
@@ -371,8 +473,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
         ));
         defer if (input_value) |v| api.ReleaseValue.?(v);
 
-        var output_value: ?*c.OrtValue = null;
-        defer if (output_value) |v| api.ReleaseValue.?(v);
+        var output_values = [_]?*c.OrtValue{ null, null };
+        defer for (output_values) |v| if (v) |x| api.ReleaseValue.?(x);
         const input_values = [_]?*c.OrtValue{input_value};
 
         const start_ns = std.time.nanoTimestamp();
@@ -383,29 +485,49 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
             &input_values,
             1,
             &output_names,
-            1,
-            &output_value,
+            output_names.len,
+            &output_values,
         ));
         const end_ns = std.time.nanoTimestamp();
 
-        var tensor_info: ?*c.OrtTensorTypeAndShapeInfo = null;
-        try ortCheck(api, api.GetTensorTypeAndShape.?(output_value, &tensor_info));
-        defer api.ReleaseTensorTypeAndShapeInfo.?(tensor_info);
-        var dim_count: usize = 0;
-        try ortCheck(api, api.GetDimensionsCount.?(tensor_info, &dim_count));
-        var dims_buf: [8]i64 = undefined;
-        if (dim_count > dims_buf.len) return error.UnsupportedOutputRank;
-        try ortCheck(api, api.GetDimensions.?(tensor_info, &dims_buf, dim_count));
-        const dims = dims_buf[0..dim_count];
-        var out_ptr_raw: ?*anyopaque = null;
-        try ortCheck(api, api.GetTensorMutableData.?(output_value, &out_ptr_raw));
-        const out_ptr: [*]f32 = @ptrCast(@alignCast(out_ptr_raw));
-        var total: usize = 1;
-        for (dims) |d| total *= @as(usize, @intCast(d));
-        const spec = inferOutputSpec(dim_count, dims, total);
-        const raw = try yolo.decodeV8(allocator, out_ptr[0..total], spec.boxes, spec.classes, spec.layout, 0.25);
-        defer allocator.free(raw);
-        const dets = try yolo.nms(allocator, raw, 0.45);
+        var logits: []const f32 = &.{};
+        var boxes: []const f32 = &.{};
+        var det_count: usize = 0;
+        var class_count: usize = 0;
+
+        for (output_values) |output_value| {
+            var tensor_info: ?*c.OrtTensorTypeAndShapeInfo = null;
+            try ortCheck(api, api.GetTensorTypeAndShape.?(output_value, &tensor_info));
+            defer api.ReleaseTensorTypeAndShapeInfo.?(tensor_info);
+            var dim_count: usize = 0;
+            try ortCheck(api, api.GetDimensionsCount.?(tensor_info, &dim_count));
+            var dims_buf: [8]i64 = undefined;
+            if (dim_count > dims_buf.len) return error.UnsupportedOutputRank;
+            try ortCheck(api, api.GetDimensions.?(tensor_info, &dims_buf, dim_count));
+            if (dim_count != 3) return error.UnsupportedOutputShape;
+            const rows: usize = @intCast(dims_buf[1]);
+            const cols: usize = @intCast(dims_buf[2]);
+
+            var out_ptr_raw: ?*anyopaque = null;
+            try ortCheck(api, api.GetTensorMutableData.?(output_value, &out_ptr_raw));
+            const out_ptr: [*]f32 = @ptrCast(@alignCast(out_ptr_raw));
+            const total = rows * cols;
+            const slice = out_ptr[0..total];
+
+            if (cols == 4) {
+                boxes = slice;
+                if (det_count == 0) det_count = rows else if (det_count != rows) return error.UnsupportedOutputShape;
+            } else if (cols > 4) {
+                logits = slice;
+                class_count = cols;
+                if (det_count == 0) det_count = rows else if (det_count != rows) return error.UnsupportedOutputShape;
+            } else {
+                return error.UnsupportedOutputShape;
+            }
+        }
+        if (det_count == 0 or class_count == 0 or logits.len == 0 or boxes.len == 0) return error.UnsupportedOutputShape;
+
+        const dets = try decodeYolo26Heads(allocator, logits, boxes, det_count, class_count, 0.25);
         defer allocator.free(dets);
 
         decoded_frames += 1;
