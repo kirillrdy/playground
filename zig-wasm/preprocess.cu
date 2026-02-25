@@ -6,22 +6,28 @@ __device__ inline float clamp01(float v) {
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
-__global__ void nv12_to_rgb_nchw_kernel(
+__global__ void nv12_resize_to_rgb_nchw_kernel(
     const unsigned char *src_y,
     const unsigned char *src_uv,
     int src_pitch_y,
     int src_pitch_uv,
     float *dst,
-    int width,
-    int height
+    int src_width,
+    int src_height,
+    int dst_width,
+    int dst_height
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
+    if (x >= dst_width || y >= dst_height) return;
 
-    const int y_idx = y * src_pitch_y + x;
-    const int uv_x = (x / 2) * 2;
-    const int uv_y = y / 2;
+    // Nearest-neighbor sampling from source frame to model input size.
+    const int src_x = (x * src_width) / dst_width;
+    const int src_row = (y * src_height) / dst_height;
+
+    const int y_idx = src_row * src_pitch_y + src_x;
+    const int uv_x = (src_x / 2) * 2;
+    const int uv_y = src_row / 2;
     const int uv_idx = uv_y * src_pitch_uv + uv_x;
 
     const float Y = static_cast<float>(src_y[y_idx]);
@@ -36,26 +42,28 @@ __global__ void nv12_to_rgb_nchw_kernel(
     g = clamp01(g);
     b = clamp01(b);
 
-    const int plane = width * height;
-    const int idx = y * width + x;
+    const int plane = dst_width * dst_height;
+    const int idx = y * dst_width + x;
     dst[idx] = r;
     dst[plane + idx] = g;
     dst[(2 * plane) + idx] = b;
 }
 
-extern "C" void launch_nv12_to_rgb_nchw(
+extern "C" void launch_nv12_resize_to_rgb_nchw(
     const unsigned char *src_y,
     const unsigned char *src_uv,
     int src_pitch_y,
     int src_pitch_uv,
     float *dst,
-    int width,
-    int height,
+    int src_width,
+    int src_height,
+    int dst_width,
+    int dst_height,
     void *stream
 ) {
     const dim3 block(16, 16);
-    const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
-    nv12_to_rgb_nchw_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
-        src_y, src_uv, src_pitch_y, src_pitch_uv, dst, width, height
+    const dim3 grid((dst_width + block.x - 1) / block.x, (dst_height + block.y - 1) / block.y);
+    nv12_resize_to_rgb_nchw_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+        src_y, src_uv, src_pitch_y, src_pitch_uv, dst, src_width, src_height, dst_width, dst_height
     );
 }

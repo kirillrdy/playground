@@ -16,14 +16,16 @@ const c = @cImport({
     @cInclude("cuda_runtime.h");
 });
 
-extern fn launch_nv12_to_rgb_nchw(
+extern fn launch_nv12_resize_to_rgb_nchw(
     src_y: [*]const u8,
     src_uv: [*]const u8,
     src_pitch_y: c_int,
     src_pitch_uv: c_int,
     dst: [*]f32,
-    width: c_int,
-    height: c_int,
+    src_width: c_int,
+    src_height: c_int,
+    dst_width: c_int,
+    dst_height: c_int,
     stream: ?*anyopaque,
 ) void;
 
@@ -32,12 +34,10 @@ const input_h: usize = 640;
 const input_len: usize = 1 * 3 * input_w * input_h;
 const queue_capacity: usize = 32;
 
-const TensorQueue = struct {
+const FrameQueue = struct {
     allocator: std.mem.Allocator,
-    tensor_len: usize,
     capacity: usize,
-    storage_d: [*]f32,
-    ready_events: []c.cudaEvent_t,
+    frames: []?*c.AVFrame,
     free_ring: []usize,
     ready_ring: []usize,
     free_head: usize = 0,
@@ -49,24 +49,10 @@ const TensorQueue = struct {
     not_empty: std.Thread.Condition = .{},
     not_full: std.Thread.Condition = .{},
 
-    fn init(allocator: std.mem.Allocator, capacity: usize, tensor_len: usize, wg: *std.Thread.WaitGroup) !TensorQueue {
-        var storage_ptr: ?*anyopaque = null;
-        if (c.cudaMalloc(&storage_ptr, capacity * tensor_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-        const storage_d: [*]f32 = @ptrCast(@alignCast(storage_ptr));
-
-        const ready_events = try allocator.alloc(c.cudaEvent_t, capacity);
-        var events_created: usize = 0;
-        errdefer {
-            for (0..events_created) |i| _ = c.cudaEventDestroy(ready_events[i]);
-            allocator.free(ready_events);
-        }
-        for (0..capacity) |i| {
-            var ev: c.cudaEvent_t = null;
-            if (c.cudaEventCreateWithFlags(&ev, c.cudaEventDisableTiming) != c.cudaSuccess) return error.CudaEventCreateFailed;
-            ready_events[i] = ev;
-            events_created += 1;
-        }
-
+    fn init(allocator: std.mem.Allocator, capacity: usize, wg: *std.Thread.WaitGroup) !FrameQueue {
+        const frames = try allocator.alloc(?*c.AVFrame, capacity);
+        errdefer allocator.free(frames);
+        @memset(frames, null);
         const free_ring = try allocator.alloc(usize, capacity);
         errdefer allocator.free(free_ring);
         const ready_ring = try allocator.alloc(usize, capacity);
@@ -74,10 +60,8 @@ const TensorQueue = struct {
         for (0..capacity) |i| free_ring[i] = i;
         return .{
             .allocator = allocator,
-            .tensor_len = tensor_len,
             .capacity = capacity,
-            .storage_d = storage_d,
-            .ready_events = ready_events,
+            .frames = frames,
             .free_ring = free_ring,
             .ready_ring = ready_ring,
             .free_len = capacity,
@@ -85,20 +69,30 @@ const TensorQueue = struct {
         };
     }
 
-    fn deinit(self: *TensorQueue) void {
-        for (self.ready_events) |ev| _ = c.cudaEventDestroy(ev);
-        self.allocator.free(self.ready_events);
+    fn deinit(self: *FrameQueue) void {
+        for (self.frames) |frame_opt| {
+            if (frame_opt) |frame| {
+                var f: ?*c.AVFrame = frame;
+                c.av_frame_free(&f);
+            }
+        }
+        self.allocator.free(self.frames);
         self.allocator.free(self.ready_ring);
         self.allocator.free(self.free_ring);
-        _ = c.cudaFree(self.storage_d);
     }
 
-    fn slot(self: *TensorQueue, idx: usize) [*]f32 {
-        const start = idx * self.tensor_len;
-        return self.storage_d + start;
+    fn setFrame(self: *FrameQueue, idx: usize, frame: *c.AVFrame) void {
+        std.debug.assert(self.frames[idx] == null);
+        self.frames[idx] = frame;
     }
 
-    fn acquireWriteSlot(self: *TensorQueue) usize {
+    fn takeFrame(self: *FrameQueue, idx: usize) ?*c.AVFrame {
+        const frame = self.frames[idx];
+        self.frames[idx] = null;
+        return frame;
+    }
+
+    fn acquireWriteSlot(self: *FrameQueue) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.free_len == 0) self.not_full.wait(&self.mutex);
@@ -108,7 +102,7 @@ const TensorQueue = struct {
         return idx;
     }
 
-    fn publishReady(self: *TensorQueue, idx: usize) void {
+    fn publishReady(self: *FrameQueue, idx: usize) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const tail = (self.ready_head + self.ready_len) % self.capacity;
@@ -117,12 +111,7 @@ const TensorQueue = struct {
         self.not_empty.signal();
     }
 
-    fn recordAndPublishReady(self: *TensorQueue, idx: usize, stream: c.cudaStream_t) !void {
-        if (c.cudaEventRecord(self.ready_events[idx], stream) != c.cudaSuccess) return error.CudaEventRecordFailed;
-        self.publishReady(idx);
-    }
-
-    fn acquireReadSlot(self: *TensorQueue) ?usize {
+    fn acquireReadSlot(self: *FrameQueue) ?usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.ready_len == 0 and !self.wg.isDone()) self.not_empty.wait(&self.mutex);
@@ -133,7 +122,7 @@ const TensorQueue = struct {
         return idx;
     }
 
-    fn releaseReadSlot(self: *TensorQueue, idx: usize) void {
+    fn releaseSlot(self: *FrameQueue, idx: usize) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const tail = (self.free_head + self.free_len) % self.capacity;
@@ -142,11 +131,7 @@ const TensorQueue = struct {
         self.not_full.signal();
     }
 
-    fn waitReady(self: *TensorQueue, idx: usize) !void {
-        if (c.cudaEventSynchronize(self.ready_events[idx]) != c.cudaSuccess) return error.CudaEventSynchronizeFailed;
-    }
-
-    fn producerDoneSignal(self: *TensorQueue) void {
+    fn producerDoneSignal(self: *FrameQueue) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.not_empty.broadcast();
@@ -154,10 +139,9 @@ const TensorQueue = struct {
 };
 
 const DecoderCtx = struct {
-    queue: *TensorQueue,
+    queue: *FrameQueue,
     wg: *std.Thread.WaitGroup,
     video_path_z: [:0]const u8,
-    cuda_stream: c.cudaStream_t,
 };
 
 fn get_format(ctx: ?*c.AVCodecContext, pix_fmts: ?[*]const c.enum_AVPixelFormat) callconv(.c) c.enum_AVPixelFormat {
@@ -301,7 +285,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
             if (recv_ret == c.AVERROR_EOF) {
                 // Flush filter
                 if (buffer_ctx != null and c.av_buffersrc_add_frame_flags(buffer_ctx, null, 0) >= 0) {
-                     // Could pull remaining frames here if loop continued
+                    // Could pull remaining frames here if loop continued
                 }
                 done = true;
                 break;
@@ -313,13 +297,14 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 if (filter_graph == null) return error.OutOfMemory;
 
                 var args_buf: [512]u8 = undefined;
-                const args = try std.fmt.bufPrintZ(&args_buf,
+                const args = try std.fmt.bufPrintZ(
+                    &args_buf,
                     "video_size={d}x{d}:pix_fmt={d}:time_base={d}/{d}:pixel_aspect={d}/{d}",
                     .{
-                        frame.?.*.width, frame.?.*.height,
-                        frame.?.*.format,
-                        stream.?.*.time_base.num, stream.?.*.time_base.den,
-                        codec_ctx.?.*.sample_aspect_ratio.num, codec_ctx.?.*.sample_aspect_ratio.den,
+                        frame.?.*.width,                       frame.?.*.height,
+                        frame.?.*.format,                      stream.?.*.time_base.num,
+                        stream.?.*.time_base.den,              codec_ctx.?.*.sample_aspect_ratio.num,
+                        codec_ctx.?.*.sample_aspect_ratio.den,
                     },
                 );
 
@@ -351,8 +336,8 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 inputs.?.*.pad_idx = 0;
                 inputs.?.*.next = null;
 
-                const hw_filter_spec = "scale_cuda=640:640:format=nv12";
-                const sw_filter_spec = "format=nv12,hwupload_cuda,scale_cuda=640:640:format=nv12";
+                const hw_filter_spec = "scale_cuda=format=nv12";
+                const sw_filter_spec = "format=nv12,hwupload_cuda,scale_cuda=format=nv12";
                 const filter_spec = if (frame.?.*.hw_frames_ctx != null) hw_filter_spec else sw_filter_spec;
                 try avCheck(c.avfilter_graph_parse_ptr(filter_graph, filter_spec, &inputs, &outputs, null));
                 try avCheck(c.avfilter_graph_config(filter_graph, null));
@@ -367,20 +352,12 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 try avCheck(filt_ret);
 
                 const slot_idx = ctx.queue.acquireWriteSlot();
-                const slot = ctx.queue.slot(slot_idx);
-
-                launch_nv12_to_rgb_nchw(
-                    filt_frame.?.*.data[0],
-                    filt_frame.?.*.data[1],
-                    filt_frame.?.*.linesize[0],
-                    filt_frame.?.*.linesize[1],
-                    slot,
-                    640,
-                    640,
-                    ctx.cuda_stream,
-                );
-
-                try ctx.queue.recordAndPublishReady(slot_idx, ctx.cuda_stream);
+                const owned_frame = c.av_frame_clone(filt_frame) orelse {
+                    ctx.queue.releaseSlot(slot_idx);
+                    return error.OutOfMemory;
+                };
+                ctx.queue.setFrame(slot_idx, owned_frame);
+                ctx.queue.publishReady(slot_idx);
                 c.av_frame_unref(filt_frame);
             }
         }
@@ -398,7 +375,7 @@ fn decoderThreadMain(ctx: *DecoderCtx) void {
 fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize) !void {
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
-    var queue = try TensorQueue.init(allocator, queue_capacity, input_len, &wg);
+    var queue = try FrameQueue.init(allocator, queue_capacity, &wg);
     defer queue.deinit();
 
     const video_path_z = try allocator.dupeZ(u8, video_path);
@@ -412,16 +389,18 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     defer for (decoder_threads) |t| if (t) |thr| thr.join();
 
     for (0..producer_count) |i| {
-        var stream: c.cudaStream_t = null;
-        if (c.cudaStreamCreate(&stream) != c.cudaSuccess) return error.CudaStreamCreateFailed;
         decoder_ctxs[i] = .{
             .queue = &queue,
             .wg = &wg,
             .video_path_z = video_path_z,
-            .cuda_stream = stream.?,
         };
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
     }
+
+    var preprocess_stream_raw: c.cudaStream_t = null;
+    if (c.cudaStreamCreate(&preprocess_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+    const preprocess_stream = preprocess_stream_raw.?;
+    defer _ = c.cudaStreamDestroy(preprocess_stream);
     const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
     const api: *const c.OrtApi = @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable);
@@ -480,10 +459,28 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     const input_shape = [_]i64{ 1, 3, @intCast(input_h), @intCast(input_w) };
     const output_boxes_shape = [_]i64{ 1, 300, 4 };
     const output_logits_shape = [_]i64{ 1, 300, 80 };
+
+    var input_tensor_ptr: ?*anyopaque = null;
+    if (c.cudaMalloc(&input_tensor_ptr, input_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+    defer _ = c.cudaFree(input_tensor_ptr);
+    const input_tensor_d: [*]f32 = @ptrCast(@alignCast(input_tensor_ptr));
+
     const output_boxes_host = try allocator.alloc(f32, 300 * 4);
     defer allocator.free(output_boxes_host);
     const output_logits_host = try allocator.alloc(f32, 300 * 80);
     defer allocator.free(output_logits_host);
+
+    var input_value: ?*c.OrtValue = null;
+    try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
+        memory_info,
+        input_tensor_d,
+        input_len * @sizeOf(f32),
+        &input_shape,
+        input_shape.len,
+        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        &input_value,
+    ));
+    defer if (input_value) |v| api.ReleaseValue.?(v);
 
     var output_boxes_value: ?*c.OrtValue = null;
     try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
@@ -508,31 +505,38 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     ));
     defer if (output_logits_value) |v| api.ReleaseValue.?(v);
 
+    api.ClearBoundInputs.?(io_binding);
+    api.ClearBoundOutputs.?(io_binding);
+    try ortCheck(api, api.BindInput.?(io_binding, input_name_alloc, input_value));
+    try ortCheck(api, api.BindOutput.?(io_binding, output0_name_alloc, output_logits_value));
+    try ortCheck(api, api.BindOutput.?(io_binding, output1_name_alloc, output_boxes_value));
+
     var decoded_frames: usize = 0;
     var total_ns: i128 = 0;
 
     while (queue.acquireReadSlot()) |slot_idx| {
-        defer queue.releaseReadSlot(slot_idx);
-        const slot = queue.slot(slot_idx);
-        try queue.waitReady(slot_idx);
+        defer queue.releaseSlot(slot_idx);
+        const frame = queue.takeFrame(slot_idx) orelse continue;
+        defer {
+            var frame_to_free: ?*c.AVFrame = frame;
+            c.av_frame_free(&frame_to_free);
+        }
+        if (frame.*.data[0] == null or frame.*.data[1] == null) return error.InvalidFrameData;
+        if (frame.*.width <= 0 or frame.*.height <= 0) return error.InvalidFrameData;
 
-        var input_value: ?*c.OrtValue = null;
-        try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
-            memory_info,
-            slot,
-            input_len * @sizeOf(f32),
-            &input_shape,
-            input_shape.len,
-            c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-            &input_value,
-        ));
-        defer if (input_value) |v| api.ReleaseValue.?(v);
-
-        api.ClearBoundInputs.?(io_binding);
-        api.ClearBoundOutputs.?(io_binding);
-        try ortCheck(api, api.BindInput.?(io_binding, input_name_alloc, input_value));
-        try ortCheck(api, api.BindOutput.?(io_binding, output0_name_alloc, output_logits_value));
-        try ortCheck(api, api.BindOutput.?(io_binding, output1_name_alloc, output_boxes_value));
+        launch_nv12_resize_to_rgb_nchw(
+            frame.*.data[0],
+            frame.*.data[1],
+            frame.*.linesize[0],
+            frame.*.linesize[1],
+            input_tensor_d,
+            frame.*.width,
+            frame.*.height,
+            @intCast(input_w),
+            @intCast(input_h),
+            preprocess_stream,
+        );
+        if (c.cudaStreamSynchronize(preprocess_stream) != c.cudaSuccess) return error.CudaStreamSynchronizeFailed;
 
         const start_ns = std.time.nanoTimestamp();
         try ortCheck(api, api.RunWithBinding.?(session, null, io_binding));
