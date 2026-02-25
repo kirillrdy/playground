@@ -456,6 +456,14 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     var memory_info: ?*c.OrtMemoryInfo = null;
     try ortCheck(api, api.CreateMemoryInfo.?("Cuda", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
     defer if (memory_info) |mi| api.ReleaseMemoryInfo.?(mi);
+    var cpu_memory_info: ?*c.OrtMemoryInfo = null;
+    try ortCheck(api, api.CreateCpuMemoryInfo.?(c.OrtArenaAllocator, c.OrtMemTypeDefault, &cpu_memory_info));
+    defer if (cpu_memory_info) |mi| api.ReleaseMemoryInfo.?(mi);
+
+    var io_binding_raw: ?*c.OrtIoBinding = null;
+    try ortCheck(api, api.CreateIoBinding.?(session, &io_binding_raw));
+    const io_binding = io_binding_raw orelse return error.OnnxRuntimeError;
+    defer api.ReleaseIoBinding.?(io_binding);
 
     var ort_allocator: ?*c.OrtAllocator = null;
     try ortCheck(api, api.GetAllocatorWithDefaultOptions.?(&ort_allocator));
@@ -470,8 +478,35 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     defer _ = api.AllocatorFree.?(ort_allocator, output1_name_alloc);
 
     const input_shape = [_]i64{ 1, 3, @intCast(input_h), @intCast(input_w) };
-    const input_names = [_][*c]const u8{input_name_alloc};
-    const output_names = [_][*c]const u8{ output0_name_alloc, output1_name_alloc };
+    const output_boxes_shape = [_]i64{ 1, 300, 4 };
+    const output_logits_shape = [_]i64{ 1, 300, 80 };
+    const output_boxes_host = try allocator.alloc(f32, 300 * 4);
+    defer allocator.free(output_boxes_host);
+    const output_logits_host = try allocator.alloc(f32, 300 * 80);
+    defer allocator.free(output_logits_host);
+
+    var output_boxes_value: ?*c.OrtValue = null;
+    try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
+        cpu_memory_info,
+        output_boxes_host.ptr,
+        output_boxes_host.len * @sizeOf(f32),
+        &output_boxes_shape,
+        output_boxes_shape.len,
+        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        &output_boxes_value,
+    ));
+    defer if (output_boxes_value) |v| api.ReleaseValue.?(v);
+    var output_logits_value: ?*c.OrtValue = null;
+    try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
+        cpu_memory_info,
+        output_logits_host.ptr,
+        output_logits_host.len * @sizeOf(f32),
+        &output_logits_shape,
+        output_logits_shape.len,
+        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        &output_logits_value,
+    ));
+    defer if (output_logits_value) |v| api.ReleaseValue.?(v);
 
     var decoded_frames: usize = 0;
     var total_ns: i128 = 0;
@@ -493,61 +528,17 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
         ));
         defer if (input_value) |v| api.ReleaseValue.?(v);
 
-        var output_values = [_]?*c.OrtValue{ null, null };
-        defer for (output_values) |v| if (v) |x| api.ReleaseValue.?(x);
-        const input_values = [_]?*c.OrtValue{input_value};
+        api.ClearBoundInputs.?(io_binding);
+        api.ClearBoundOutputs.?(io_binding);
+        try ortCheck(api, api.BindInput.?(io_binding, input_name_alloc, input_value));
+        try ortCheck(api, api.BindOutput.?(io_binding, output0_name_alloc, output_logits_value));
+        try ortCheck(api, api.BindOutput.?(io_binding, output1_name_alloc, output_boxes_value));
 
         const start_ns = std.time.nanoTimestamp();
-        try ortCheck(api, api.Run.?(
-            session,
-            null,
-            &input_names,
-            &input_values,
-            1,
-            &output_names,
-            output_names.len,
-            &output_values,
-        ));
+        try ortCheck(api, api.RunWithBinding.?(session, null, io_binding));
         const end_ns = std.time.nanoTimestamp();
 
-        var logits: []const f32 = &.{};
-        var boxes: []const f32 = &.{};
-        var det_count: usize = 0;
-        var class_count: usize = 0;
-
-        for (output_values) |output_value| {
-            var tensor_info: ?*c.OrtTensorTypeAndShapeInfo = null;
-            try ortCheck(api, api.GetTensorTypeAndShape.?(output_value, &tensor_info));
-            defer api.ReleaseTensorTypeAndShapeInfo.?(tensor_info);
-            var dim_count: usize = 0;
-            try ortCheck(api, api.GetDimensionsCount.?(tensor_info, &dim_count));
-            var dims_buf: [8]i64 = undefined;
-            if (dim_count > dims_buf.len) return error.UnsupportedOutputRank;
-            try ortCheck(api, api.GetDimensions.?(tensor_info, &dims_buf, dim_count));
-            if (dim_count != 3) return error.UnsupportedOutputShape;
-            const rows: usize = @intCast(dims_buf[1]);
-            const cols: usize = @intCast(dims_buf[2]);
-
-            var out_ptr_raw: ?*anyopaque = null;
-            try ortCheck(api, api.GetTensorMutableData.?(output_value, &out_ptr_raw));
-            const out_ptr: [*]f32 = @ptrCast(@alignCast(out_ptr_raw));
-            const total = rows * cols;
-            const slice = out_ptr[0..total];
-
-            if (cols == 4) {
-                boxes = slice;
-                if (det_count == 0) det_count = rows else if (det_count != rows) return error.UnsupportedOutputShape;
-            } else if (cols > 4) {
-                logits = slice;
-                class_count = cols;
-                if (det_count == 0) det_count = rows else if (det_count != rows) return error.UnsupportedOutputShape;
-            } else {
-                return error.UnsupportedOutputShape;
-            }
-        }
-        if (det_count == 0 or class_count == 0 or logits.len == 0 or boxes.len == 0) return error.UnsupportedOutputShape;
-
-        const dets = try decodeYolo26Heads(allocator, logits, boxes, det_count, class_count, 0.25);
+        const dets = try decodeYolo26Heads(allocator, output_logits_host, output_boxes_host, 300, 80, 0.25);
         defer allocator.free(dets);
 
         decoded_frames += 1;
