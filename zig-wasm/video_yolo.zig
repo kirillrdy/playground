@@ -38,6 +38,7 @@ const TensorQueue = struct {
     tensor_len: usize,
     capacity: usize,
     storage_d: [*]f32,
+    ready_events: []c.cudaEvent_t,
     free_ring: []usize,
     ready_ring: []usize,
     free_head: usize = 0,
@@ -54,6 +55,19 @@ const TensorQueue = struct {
         if (c.cudaMalloc(&storage_ptr, capacity * tensor_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
         const storage_d: [*]f32 = @ptrCast(@alignCast(storage_ptr));
 
+        const ready_events = try allocator.alloc(c.cudaEvent_t, capacity);
+        var events_created: usize = 0;
+        errdefer {
+            for (0..events_created) |i| _ = c.cudaEventDestroy(ready_events[i]);
+            allocator.free(ready_events);
+        }
+        for (0..capacity) |i| {
+            var ev: c.cudaEvent_t = null;
+            if (c.cudaEventCreateWithFlags(&ev, c.cudaEventDisableTiming) != c.cudaSuccess) return error.CudaEventCreateFailed;
+            ready_events[i] = ev;
+            events_created += 1;
+        }
+
         const free_ring = try allocator.alloc(usize, capacity);
         errdefer allocator.free(free_ring);
         const ready_ring = try allocator.alloc(usize, capacity);
@@ -64,6 +78,7 @@ const TensorQueue = struct {
             .tensor_len = tensor_len,
             .capacity = capacity,
             .storage_d = storage_d,
+            .ready_events = ready_events,
             .free_ring = free_ring,
             .ready_ring = ready_ring,
             .free_len = capacity,
@@ -72,6 +87,8 @@ const TensorQueue = struct {
     }
 
     fn deinit(self: *TensorQueue) void {
+        for (self.ready_events) |ev| _ = c.cudaEventDestroy(ev);
+        self.allocator.free(self.ready_events);
         self.allocator.free(self.ready_ring);
         self.allocator.free(self.free_ring);
         _ = c.cudaFree(self.storage_d);
@@ -101,6 +118,11 @@ const TensorQueue = struct {
         self.not_empty.signal();
     }
 
+    fn recordAndPublishReady(self: *TensorQueue, idx: usize, stream: c.cudaStream_t) !void {
+        if (c.cudaEventRecord(self.ready_events[idx], stream) != c.cudaSuccess) return error.CudaEventRecordFailed;
+        self.publishReady(idx);
+    }
+
     fn acquireReadSlot(self: *TensorQueue) ?usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -119,6 +141,10 @@ const TensorQueue = struct {
         self.free_ring[tail] = idx;
         self.free_len += 1;
         self.not_full.signal();
+    }
+
+    fn waitReady(self: *TensorQueue, idx: usize) !void {
+        if (c.cudaEventSynchronize(self.ready_events[idx]) != c.cudaSuccess) return error.CudaEventSynchronizeFailed;
     }
 
     fn producerDoneSignal(self: *TensorQueue) void {
@@ -355,8 +381,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                     ctx.cuda_stream,
                 );
 
-                _ = c.cudaStreamSynchronize(ctx.cuda_stream);
-                ctx.queue.publishReady(slot_idx);
+                try ctx.queue.recordAndPublishReady(slot_idx, ctx.cuda_stream);
                 c.av_frame_unref(filt_frame);
             }
         }
@@ -430,10 +455,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     defer if (session) |s| api.ReleaseSession.?(s);
 
     var memory_info: ?*c.OrtMemoryInfo = null;
-    try ortCheck(api, api.CreateMemoryInfo.?("Cpu", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
+    try ortCheck(api, api.CreateMemoryInfo.?("Cuda", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
     defer if (memory_info) |mi| api.ReleaseMemoryInfo.?(mi);
-    const host_input = try allocator.alloc(f32, input_len);
-    defer allocator.free(host_input);
 
     var ort_allocator: ?*c.OrtAllocator = null;
     try ortCheck(api, api.GetAllocatorWithDefaultOptions.?(&ort_allocator));
@@ -457,14 +480,12 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     while (queue.acquireReadSlot()) |slot_idx| {
         defer queue.releaseReadSlot(slot_idx);
         const slot = queue.slot(slot_idx);
-        if (c.cudaMemcpy(host_input.ptr, slot, input_len * @sizeOf(f32), c.cudaMemcpyDeviceToHost) != c.cudaSuccess) {
-            return error.CudaCopyFailed;
-        }
+        try queue.waitReady(slot_idx);
 
         var input_value: ?*c.OrtValue = null;
         try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
             memory_info,
-            host_input.ptr,
+            slot,
             input_len * @sizeOf(f32),
             &input_shape,
             input_shape.len,
