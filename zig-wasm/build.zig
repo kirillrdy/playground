@@ -170,7 +170,6 @@ pub fn build(b: *std.Build) !void {
     video_yolo.linkSystemLibrary("avformat");
     video_yolo.linkSystemLibrary("avcodec");
     video_yolo.linkSystemLibrary("avutil");
-    video_yolo.linkSystemLibrary("swscale");
     video_yolo.linkSystemLibrary("avfilter");
 
     const dev_server = b.addExecutable(.{ .name = "dev_server", .root_module = modules.dev_server });

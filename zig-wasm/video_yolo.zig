@@ -13,7 +13,6 @@ const c = @cImport({
     @cInclude("libavfilter/avfilter.h");
     @cInclude("libavfilter/buffersink.h");
     @cInclude("libavfilter/buffersrc.h");
-    @cInclude("libswscale/swscale.h");
     @cInclude("cuda_runtime.h");
 });
 
