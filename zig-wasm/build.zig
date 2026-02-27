@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) !void {
     const cuda_include_path = b.option([]const u8, "cuda-include", "Path to directory containing CUDA headers");
     const cuda_lib_path = b.option([]const u8, "cuda-lib", "Path to directory containing CUDA runtime libraries");
     const nvcc_path = b.option([]const u8, "nvcc", "Path to nvcc compiler binary");
-    const model_preset = b.option([]const u8, "model", "YOLO model preset: n, s, or m") orelse "s";
+    const model_preset = b.option([]const u8, "model", "YOLO model preset: n, s, or m") orelse "n";
     const preset_model_url = modelPresetUrl(model_preset) orelse {
         std.log.err("invalid -Dmodel={s}; expected one of: n, s, m", .{model_preset});
         return error.InvalidModelPreset;
