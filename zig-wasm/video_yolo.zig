@@ -1,6 +1,5 @@
 const std = @import("std");
 const config = @import("config");
-const yolo = @import("yolo.zig");
 
 const c = @cImport({
     @cInclude("onnxruntime_c_api.h");
@@ -33,6 +32,7 @@ const input_w: usize = 640;
 const input_h: usize = 640;
 const input_len: usize = 1 * 3 * input_w * input_h;
 const queue_capacity: usize = 32;
+const inference_workers: usize = 1;
 
 const FrameQueue = struct {
     allocator: std.mem.Allocator,
@@ -144,6 +144,28 @@ const DecoderCtx = struct {
     video_path_z: [:0]const u8,
 };
 
+const Metrics = struct {
+    mutex: std.Thread.Mutex = .{},
+    frames: usize = 0,
+    submit_ns: i128 = 0,
+    queue_wait_ns: i128 = 0,
+
+    fn add(self: *Metrics, frame_count: usize, submit_delta_ns: i128, queue_wait_delta_ns: i128) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.frames += frame_count;
+        self.submit_ns += submit_delta_ns;
+        self.queue_wait_ns += queue_wait_delta_ns;
+    }
+};
+
+const InferenceWorkerCtx = struct {
+    queue: *FrameQueue,
+    api: *const c.OrtApi,
+    model_path_z: [:0]const u8,
+    metrics: *Metrics,
+};
+
 fn get_format(ctx: ?*c.AVCodecContext, pix_fmts: ?[*]const c.enum_AVPixelFormat) callconv(.c) c.enum_AVPixelFormat {
     _ = ctx;
     var p = pix_fmts.?;
@@ -172,59 +194,6 @@ fn ortCheck(api: *const c.OrtApi, status: ?*c.OrtStatus) !void {
 fn avCheck(code: c_int) !void {
     if (code >= 0) return;
     return error.FfmpegError;
-}
-
-fn decodeYolo26Heads(
-    allocator: std.mem.Allocator,
-    logits: []const f32,
-    boxes: []const f32,
-    det_count: usize,
-    class_count: usize,
-    conf_threshold: f32,
-) ![]yolo.Detection {
-    var out = try std.ArrayList(yolo.Detection).initCapacity(allocator, 0);
-    errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, det_count);
-
-    for (0..det_count) |i| {
-        const logit_row = logits[(i * class_count)..][0..class_count];
-        var best_class: usize = 0;
-        var best_logit: f32 = logit_row[0];
-        for (1..class_count) |j| {
-            if (logit_row[j] > best_logit) {
-                best_logit = logit_row[j];
-                best_class = j;
-            }
-        }
-
-        const score = 1.0 / (1.0 + @exp(-best_logit));
-        if (score < conf_threshold) continue;
-
-        const cx = boxes[(i * 4) + 0];
-        const cy = boxes[(i * 4) + 1];
-        const w = boxes[(i * 4) + 2];
-        const h = boxes[(i * 4) + 3];
-        const normalized = (@abs(cx) <= 1.5 and @abs(cy) <= 1.5 and @abs(w) <= 1.5 and @abs(h) <= 1.5);
-        const scale_x: f32 = if (normalized) @floatFromInt(input_w) else 1.0;
-        const scale_y: f32 = if (normalized) @floatFromInt(input_h) else 1.0;
-
-        try out.append(allocator, .{
-            .class_id = best_class,
-            .score = score,
-            .x1 = (cx - (w / 2.0)) * scale_x,
-            .y1 = (cy - (h / 2.0)) * scale_y,
-            .x2 = (cx + (w / 2.0)) * scale_x,
-            .y2 = (cy + (h / 2.0)) * scale_y,
-        });
-    }
-
-    std.mem.sort(yolo.Detection, out.items, {}, struct {
-        fn lessThan(_: void, a: yolo.Detection, b: yolo.Detection) bool {
-            return a.score > b.score;
-        }
-    }.lessThan);
-
-    return out.toOwnedSlice(allocator);
 }
 
 fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
@@ -372,6 +341,178 @@ fn decoderThreadMain(ctx: *DecoderCtx) void {
     ctx.queue.producerDoneSignal();
 }
 
+fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
+    var preprocess_stream_raw: c.cudaStream_t = null;
+    if (c.cudaStreamCreate(&preprocess_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+    const preprocess_stream = preprocess_stream_raw.?;
+    defer _ = c.cudaStreamDestroy(preprocess_stream);
+
+    var inference_stream_raw: c.cudaStream_t = null;
+    if (c.cudaStreamCreate(&inference_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+    const inference_stream = inference_stream_raw.?;
+    defer _ = c.cudaStreamDestroy(inference_stream);
+
+    var env_raw: ?*c.OrtEnv = null;
+    try ortCheck(ctx.api, ctx.api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "video-yolo-zig-worker", &env_raw));
+    const env = env_raw orelse return error.OnnxRuntimeError;
+    defer ctx.api.ReleaseEnv.?(env);
+
+    var session_options_raw: ?*c.OrtSessionOptions = null;
+    try ortCheck(ctx.api, ctx.api.CreateSessionOptions.?(&session_options_raw));
+    const session_options = session_options_raw orelse return error.OnnxRuntimeError;
+    defer ctx.api.ReleaseSessionOptions.?(session_options);
+    try ortCheck(ctx.api, ctx.api.SetInterOpNumThreads.?(session_options, 1));
+    try ortCheck(ctx.api, ctx.api.SetIntraOpNumThreads.?(session_options, 1));
+
+    const create_cuda = ctx.api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+    const update_cuda = ctx.api.UpdateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+    const append_cuda = ctx.api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
+    const release_cuda = ctx.api.ReleaseCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+    var cuda_options_raw: ?*c.OrtCUDAProviderOptionsV2 = null;
+    try ortCheck(ctx.api, create_cuda(&cuda_options_raw));
+    const cuda_options = cuda_options_raw orelse return error.OnnxRuntimeError;
+    defer release_cuda(cuda_options);
+
+    var stream_buf: [32]u8 = undefined;
+    const stream_str = try std.fmt.bufPrintZ(&stream_buf, "{d}", .{@intFromPtr(inference_stream)});
+    const cuda_keys = [_][*c]const u8{"user_compute_stream"};
+    const cuda_values = [_][*c]const u8{stream_str.ptr};
+    try ortCheck(ctx.api, update_cuda(cuda_options, &cuda_keys, &cuda_values, cuda_keys.len));
+    try ortCheck(ctx.api, append_cuda(session_options, cuda_options));
+
+    var session: ?*c.OrtSession = null;
+    try ortCheck(ctx.api, ctx.api.CreateSession.?(env, ctx.model_path_z.ptr, session_options, &session));
+    defer if (session) |s| ctx.api.ReleaseSession.?(s);
+
+    var memory_info: ?*c.OrtMemoryInfo = null;
+    try ortCheck(ctx.api, ctx.api.CreateMemoryInfo.?("Cuda", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
+    defer if (memory_info) |mi| ctx.api.ReleaseMemoryInfo.?(mi);
+
+    var ort_allocator: ?*c.OrtAllocator = null;
+    try ortCheck(ctx.api, ctx.api.GetAllocatorWithDefaultOptions.?(&ort_allocator));
+    var input_name_alloc: [*c]u8 = null;
+    try ortCheck(ctx.api, ctx.api.SessionGetInputName.?(session, 0, ort_allocator, &input_name_alloc));
+    defer _ = ctx.api.AllocatorFree.?(ort_allocator, input_name_alloc);
+    var output0_name_alloc: [*c]u8 = null;
+    var output1_name_alloc: [*c]u8 = null;
+    try ortCheck(ctx.api, ctx.api.SessionGetOutputName.?(session, 0, ort_allocator, &output0_name_alloc));
+    try ortCheck(ctx.api, ctx.api.SessionGetOutputName.?(session, 1, ort_allocator, &output1_name_alloc));
+    defer _ = ctx.api.AllocatorFree.?(ort_allocator, output0_name_alloc);
+    defer _ = ctx.api.AllocatorFree.?(ort_allocator, output1_name_alloc);
+
+    const input_shape = [_]i64{ 1, 3, @intCast(input_h), @intCast(input_w) };
+    const output_boxes_shape = [_]i64{ 1, 300, 4 };
+    const output_logits_shape = [_]i64{ 1, 300, 80 };
+
+    var input_tensor_ptr: ?*anyopaque = null;
+    if (c.cudaMalloc(&input_tensor_ptr, input_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+    defer _ = c.cudaFree(input_tensor_ptr);
+    const input_tensor_d: [*]f32 = @ptrCast(@alignCast(input_tensor_ptr));
+
+    var output_boxes_ptr: ?*anyopaque = null;
+    if (c.cudaMalloc(&output_boxes_ptr, 300 * 4 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+    defer _ = c.cudaFree(output_boxes_ptr);
+    const output_boxes_d: [*]f32 = @ptrCast(@alignCast(output_boxes_ptr));
+
+    var output_logits_ptr: ?*anyopaque = null;
+    if (c.cudaMalloc(&output_logits_ptr, 300 * 80 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+    defer _ = c.cudaFree(output_logits_ptr);
+    const output_logits_d: [*]f32 = @ptrCast(@alignCast(output_logits_ptr));
+
+    var input_value: ?*c.OrtValue = null;
+    try ortCheck(ctx.api, ctx.api.CreateTensorWithDataAsOrtValue.?(
+        memory_info,
+        input_tensor_d,
+        input_len * @sizeOf(f32),
+        &input_shape,
+        input_shape.len,
+        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        &input_value,
+    ));
+    defer if (input_value) |v| ctx.api.ReleaseValue.?(v);
+
+    var output_boxes_value: ?*c.OrtValue = null;
+    try ortCheck(ctx.api, ctx.api.CreateTensorWithDataAsOrtValue.?(
+        memory_info,
+        output_boxes_d,
+        300 * 4 * @sizeOf(f32),
+        &output_boxes_shape,
+        output_boxes_shape.len,
+        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        &output_boxes_value,
+    ));
+    defer if (output_boxes_value) |v| ctx.api.ReleaseValue.?(v);
+
+    var output_logits_value: ?*c.OrtValue = null;
+    try ortCheck(ctx.api, ctx.api.CreateTensorWithDataAsOrtValue.?(
+        memory_info,
+        output_logits_d,
+        300 * 80 * @sizeOf(f32),
+        &output_logits_shape,
+        output_logits_shape.len,
+        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        &output_logits_value,
+    ));
+    defer if (output_logits_value) |v| ctx.api.ReleaseValue.?(v);
+
+    var io_binding_raw: ?*c.OrtIoBinding = null;
+    try ortCheck(ctx.api, ctx.api.CreateIoBinding.?(session, &io_binding_raw));
+    const io_binding = io_binding_raw orelse return error.OnnxRuntimeError;
+    defer ctx.api.ReleaseIoBinding.?(io_binding);
+    ctx.api.ClearBoundInputs.?(io_binding);
+    ctx.api.ClearBoundOutputs.?(io_binding);
+    try ortCheck(ctx.api, ctx.api.BindInput.?(io_binding, input_name_alloc, input_value));
+    try ortCheck(ctx.api, ctx.api.BindOutput.?(io_binding, output0_name_alloc, output_logits_value));
+    try ortCheck(ctx.api, ctx.api.BindOutput.?(io_binding, output1_name_alloc, output_boxes_value));
+
+    var preprocess_event: c.cudaEvent_t = null;
+    if (c.cudaEventCreateWithFlags(&preprocess_event, c.cudaEventDisableTiming) != c.cudaSuccess) return error.CudaEventCreateFailed;
+    defer _ = c.cudaEventDestroy(preprocess_event);
+
+    while (true) {
+        const wait_start_ns = std.time.nanoTimestamp();
+        const maybe_slot_idx = ctx.queue.acquireReadSlot();
+        const wait_end_ns = std.time.nanoTimestamp();
+        const slot_idx = maybe_slot_idx orelse break;
+        const queue_wait_delta_ns = wait_end_ns - wait_start_ns;
+
+        defer ctx.queue.releaseSlot(slot_idx);
+        const frame = ctx.queue.takeFrame(slot_idx) orelse continue;
+        defer {
+            var frame_to_free: ?*c.AVFrame = frame;
+            c.av_frame_free(&frame_to_free);
+        }
+        if (frame.*.data[0] == null or frame.*.data[1] == null) return error.InvalidFrameData;
+        if (frame.*.width <= 0 or frame.*.height <= 0) return error.InvalidFrameData;
+
+        launch_nv12_resize_to_rgb_nchw(
+            frame.*.data[0],
+            frame.*.data[1],
+            frame.*.linesize[0],
+            frame.*.linesize[1],
+            input_tensor_d,
+            frame.*.width,
+            frame.*.height,
+            @intCast(input_w),
+            @intCast(input_h),
+            preprocess_stream,
+        );
+        if (c.cudaEventRecord(preprocess_event, preprocess_stream) != c.cudaSuccess) return error.CudaEventRecordFailed;
+        if (c.cudaStreamWaitEvent(inference_stream, preprocess_event, 0) != c.cudaSuccess) return error.CudaStreamWaitEventFailed;
+
+        const start_ns = std.time.nanoTimestamp();
+        try ortCheck(ctx.api, ctx.api.RunWithBinding.?(session, null, io_binding));
+        const end_ns = std.time.nanoTimestamp();
+        ctx.metrics.add(1, end_ns - start_ns, queue_wait_delta_ns);
+    }
+}
+
+fn inferenceWorkerMain(ctx: *InferenceWorkerCtx) void {
+    runInferenceWorker(ctx) catch |err| {
+        std.log.err("inference worker error: {}", .{err});
+    };
+}
+
 fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize) !void {
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
@@ -397,167 +538,53 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
     }
 
-    var preprocess_stream_raw: c.cudaStream_t = null;
-    if (c.cudaStreamCreate(&preprocess_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
-    const preprocess_stream = preprocess_stream_raw.?;
-    defer _ = c.cudaStreamDestroy(preprocess_stream);
     const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
     const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
     const api: *const c.OrtApi = @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable);
-
-    var env_raw: ?*c.OrtEnv = null;
-    try ortCheck(api, api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "video-yolo-zig", &env_raw));
-    const env = env_raw orelse return error.OnnxRuntimeError;
-    defer api.ReleaseEnv.?(env);
-
-    var session_options_raw: ?*c.OrtSessionOptions = null;
-    try ortCheck(api, api.CreateSessionOptions.?(&session_options_raw));
-    const session_options = session_options_raw orelse return error.OnnxRuntimeError;
-    defer api.ReleaseSessionOptions.?(session_options);
-    try ortCheck(api, api.SetInterOpNumThreads.?(session_options, 1));
-    try ortCheck(api, api.SetIntraOpNumThreads.?(session_options, 1));
-
-    const create_cuda = api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-    const append_cuda = api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
-    const release_cuda = api.ReleaseCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-    var cuda_options_raw: ?*c.OrtCUDAProviderOptionsV2 = null;
-    try ortCheck(api, create_cuda(&cuda_options_raw));
-    const cuda_options = cuda_options_raw orelse return error.OnnxRuntimeError;
-    defer release_cuda(cuda_options);
-    try ortCheck(api, append_cuda(session_options, cuda_options));
-
     const model_path_z = try allocator.dupeZ(u8, config.model_path);
     defer allocator.free(model_path_z);
-    var session: ?*c.OrtSession = null;
-    try ortCheck(api, api.CreateSession.?(env, model_path_z.ptr, session_options, &session));
-    defer if (session) |s| api.ReleaseSession.?(s);
+    var metrics: Metrics = .{};
+    var worker_ctxs: [inference_workers]InferenceWorkerCtx = undefined;
+    var worker_threads: [inference_workers]?std.Thread = .{null} ** inference_workers;
+    const wall_start_ns = std.time.nanoTimestamp();
 
-    var memory_info: ?*c.OrtMemoryInfo = null;
-    try ortCheck(api, api.CreateMemoryInfo.?("Cuda", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
-    defer if (memory_info) |mi| api.ReleaseMemoryInfo.?(mi);
-    var cpu_memory_info: ?*c.OrtMemoryInfo = null;
-    try ortCheck(api, api.CreateCpuMemoryInfo.?(c.OrtArenaAllocator, c.OrtMemTypeDefault, &cpu_memory_info));
-    defer if (cpu_memory_info) |mi| api.ReleaseMemoryInfo.?(mi);
-
-    var io_binding_raw: ?*c.OrtIoBinding = null;
-    try ortCheck(api, api.CreateIoBinding.?(session, &io_binding_raw));
-    const io_binding = io_binding_raw orelse return error.OnnxRuntimeError;
-    defer api.ReleaseIoBinding.?(io_binding);
-
-    var ort_allocator: ?*c.OrtAllocator = null;
-    try ortCheck(api, api.GetAllocatorWithDefaultOptions.?(&ort_allocator));
-    var input_name_alloc: [*c]u8 = null;
-    try ortCheck(api, api.SessionGetInputName.?(session, 0, ort_allocator, &input_name_alloc));
-    defer _ = api.AllocatorFree.?(ort_allocator, input_name_alloc);
-    var output0_name_alloc: [*c]u8 = null;
-    var output1_name_alloc: [*c]u8 = null;
-    try ortCheck(api, api.SessionGetOutputName.?(session, 0, ort_allocator, &output0_name_alloc));
-    try ortCheck(api, api.SessionGetOutputName.?(session, 1, ort_allocator, &output1_name_alloc));
-    defer _ = api.AllocatorFree.?(ort_allocator, output0_name_alloc);
-    defer _ = api.AllocatorFree.?(ort_allocator, output1_name_alloc);
-
-    const input_shape = [_]i64{ 1, 3, @intCast(input_h), @intCast(input_w) };
-    const output_boxes_shape = [_]i64{ 1, 300, 4 };
-    const output_logits_shape = [_]i64{ 1, 300, 80 };
-
-    var input_tensor_ptr: ?*anyopaque = null;
-    if (c.cudaMalloc(&input_tensor_ptr, input_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-    defer _ = c.cudaFree(input_tensor_ptr);
-    const input_tensor_d: [*]f32 = @ptrCast(@alignCast(input_tensor_ptr));
-
-    const output_boxes_host = try allocator.alloc(f32, 300 * 4);
-    defer allocator.free(output_boxes_host);
-    const output_logits_host = try allocator.alloc(f32, 300 * 80);
-    defer allocator.free(output_logits_host);
-
-    var input_value: ?*c.OrtValue = null;
-    try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
-        memory_info,
-        input_tensor_d,
-        input_len * @sizeOf(f32),
-        &input_shape,
-        input_shape.len,
-        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-        &input_value,
-    ));
-    defer if (input_value) |v| api.ReleaseValue.?(v);
-
-    var output_boxes_value: ?*c.OrtValue = null;
-    try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
-        cpu_memory_info,
-        output_boxes_host.ptr,
-        output_boxes_host.len * @sizeOf(f32),
-        &output_boxes_shape,
-        output_boxes_shape.len,
-        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-        &output_boxes_value,
-    ));
-    defer if (output_boxes_value) |v| api.ReleaseValue.?(v);
-    var output_logits_value: ?*c.OrtValue = null;
-    try ortCheck(api, api.CreateTensorWithDataAsOrtValue.?(
-        cpu_memory_info,
-        output_logits_host.ptr,
-        output_logits_host.len * @sizeOf(f32),
-        &output_logits_shape,
-        output_logits_shape.len,
-        c.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-        &output_logits_value,
-    ));
-    defer if (output_logits_value) |v| api.ReleaseValue.?(v);
-
-    api.ClearBoundInputs.?(io_binding);
-    api.ClearBoundOutputs.?(io_binding);
-    try ortCheck(api, api.BindInput.?(io_binding, input_name_alloc, input_value));
-    try ortCheck(api, api.BindOutput.?(io_binding, output0_name_alloc, output_logits_value));
-    try ortCheck(api, api.BindOutput.?(io_binding, output1_name_alloc, output_boxes_value));
-
-    var decoded_frames: usize = 0;
-    var total_ns: i128 = 0;
-
-    while (queue.acquireReadSlot()) |slot_idx| {
-        defer queue.releaseSlot(slot_idx);
-        const frame = queue.takeFrame(slot_idx) orelse continue;
-        defer {
-            var frame_to_free: ?*c.AVFrame = frame;
-            c.av_frame_free(&frame_to_free);
-        }
-        if (frame.*.data[0] == null or frame.*.data[1] == null) return error.InvalidFrameData;
-        if (frame.*.width <= 0 or frame.*.height <= 0) return error.InvalidFrameData;
-
-        launch_nv12_resize_to_rgb_nchw(
-            frame.*.data[0],
-            frame.*.data[1],
-            frame.*.linesize[0],
-            frame.*.linesize[1],
-            input_tensor_d,
-            frame.*.width,
-            frame.*.height,
-            @intCast(input_w),
-            @intCast(input_h),
-            preprocess_stream,
-        );
-        if (c.cudaStreamSynchronize(preprocess_stream) != c.cudaSuccess) return error.CudaStreamSynchronizeFailed;
-
-        const start_ns = std.time.nanoTimestamp();
-        try ortCheck(api, api.RunWithBinding.?(session, null, io_binding));
-        const end_ns = std.time.nanoTimestamp();
-
-        const dets = try decodeYolo26Heads(allocator, output_logits_host, output_boxes_host, 300, 80, 0.25);
-        defer allocator.free(dets);
-
-        decoded_frames += 1;
-        total_ns += end_ns - start_ns;
+    for (0..inference_workers) |i| {
+        worker_ctxs[i] = .{
+            .queue = &queue,
+            .api = api,
+            .model_path_z = model_path_z,
+            .metrics = &metrics,
+        };
+        worker_threads[i] = try std.Thread.spawn(.{}, inferenceWorkerMain, .{&worker_ctxs[i]});
     }
 
-    if (decoded_frames == 0 or total_ns <= 0) {
-        std.debug.print("duration_s=0.000 frames=0 fps=0.00\n", .{});
+    for (worker_threads) |t| if (t) |thr| thr.join();
+
+    const wall_end_ns = std.time.nanoTimestamp();
+    const wall_ns = wall_end_ns - wall_start_ns;
+
+    if (metrics.frames == 0 or metrics.submit_ns <= 0 or wall_ns <= 0) {
+        std.debug.print("submit_s=0.000 wall_s=0.000 queue_wait_s=0.000 workers={d} frames=0 submit_fps=0.00 wall_fps=0.00\n", .{inference_workers});
         return;
     }
-    const duration_s = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
-    const fps =
-        (@as(f64, @floatFromInt(decoded_frames)) * @as(f64, @floatFromInt(std.time.ns_per_s))) /
-        @as(f64, @floatFromInt(total_ns));
-    std.debug.print("duration_s={d:.3} frames={d} fps={d:.2}\n", .{ duration_s, decoded_frames, fps });
+    const submit_s = @as(f64, @floatFromInt(metrics.submit_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const wall_s = @as(f64, @floatFromInt(wall_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const queue_wait_s = @as(f64, @floatFromInt(metrics.queue_wait_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const submit_fps =
+        (@as(f64, @floatFromInt(metrics.frames)) * @as(f64, @floatFromInt(std.time.ns_per_s))) /
+        @as(f64, @floatFromInt(metrics.submit_ns));
+    const wall_fps =
+        (@as(f64, @floatFromInt(metrics.frames)) * @as(f64, @floatFromInt(std.time.ns_per_s))) /
+        @as(f64, @floatFromInt(wall_ns));
+    std.debug.print("submit_s={d:.3} wall_s={d:.3} queue_wait_s={d:.3} workers={d} frames={d} submit_fps={d:.2} wall_fps={d:.2}\n", .{
+        submit_s,
+        wall_s,
+        queue_wait_s,
+        inference_workers,
+        metrics.frames,
+        submit_fps,
+        wall_fps,
+    });
 }
 
 pub fn main() !void {

@@ -12,27 +12,40 @@ fn optionPath(path: ?[]const u8) ?std.Build.LazyPath {
     return null;
 }
 
+fn modelPresetUrl(preset: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, preset, "n")) return "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx";
+    if (std.mem.eql(u8, preset, "s")) return "https://huggingface.co/onnx-community/yolo26s-ONNX/resolve/main/onnx/model.onnx";
+    if (std.mem.eql(u8, preset, "m")) return "https://huggingface.co/onnx-community/yolo26m-ONNX/resolve/main/onnx/model.onnx";
+    return null;
+}
+
 fn nixBuildAttrLink(b: *std.Build, out_name: []const u8, attr: []const u8) std.Build.LazyPath {
-    const run = b.addSystemCommand(&.{ "sh", "-c",
+    const run = b.addSystemCommand(&.{
+        "sh", "-c",
         \\set -euo pipefail
         \\out="$1"
         \\attr="$2"
         \\path="$(nix build --no-link --print-out-paths "$attr")"
         \\ln -s "$path" "$out"
-    , "--" });
+        ,
+        "--",
+    });
     const out = run.addOutputFileArg(out_name);
     run.addArg(attr);
     return out;
 }
 
 fn nixBuildExprLink(b: *std.Build, out_name: []const u8, expr: []const u8) std.Build.LazyPath {
-    const run = b.addSystemCommand(&.{ "sh", "-c",
+    const run = b.addSystemCommand(&.{
+        "sh", "-c",
         \\set -euo pipefail
         \\out="$1"
         \\expr="$2"
         \\path="$(nix build --impure --no-link --print-out-paths --expr "$expr")"
         \\ln -s "$path" "$out"
-    , "--" });
+        ,
+        "--",
+    });
     const out = run.addOutputFileArg(out_name);
     run.addArg(expr);
     return out;
@@ -56,7 +69,12 @@ pub fn build(b: *std.Build) !void {
     const cuda_include_path = b.option([]const u8, "cuda-include", "Path to directory containing CUDA headers");
     const cuda_lib_path = b.option([]const u8, "cuda-lib", "Path to directory containing CUDA runtime libraries");
     const nvcc_path = b.option([]const u8, "nvcc", "Path to nvcc compiler binary");
-    const model_url = b.option([]const u8, "model-url", "URL to download ONNX model from") orelse "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx";
+    const model_preset = b.option([]const u8, "model", "YOLO model preset: n, s, or m") orelse "s";
+    const preset_model_url = modelPresetUrl(model_preset) orelse {
+        std.log.err("invalid -Dmodel={s}; expected one of: n, s, m", .{model_preset});
+        return error.InvalidModelPreset;
+    };
+    const model_url = b.option([]const u8, "model-url", "URL to download ONNX model from (overrides -Dmodel)") orelse preset_model_url;
     const onnx_gpu_dev_expr =
         \\let
         \\  flake = builtins.getFlake "nixpkgs";
@@ -143,14 +161,17 @@ pub fn build(b: *std.Build) !void {
     server.addLibraryPath(onnx_out_root.path(b, "lib"));
     server.linkSystemLibrary("onnxruntime");
 
-    const preprocess_obj = b.addSystemCommand(&.{ "sh", "-c",
+    const preprocess_obj = b.addSystemCommand(&.{
+        "sh", "-c",
         \\set -euo pipefail
         \\nvcc="$1"
         \\src="$2"
         \\out="$3"
         \\cuda_include="$4"
-        \\"$nvcc" -c "$src" -o "$out" -I"$cuda_include"
-    , "--" });
+        \\"$nvcc" -arch=sm_89 -c "$src" -o "$out" -I"$cuda_include"
+        ,
+        "--",
+    });
     preprocess_obj.addFileArg(resolved_nvcc);
     preprocess_obj.addFileArg(b.path("preprocess.cu"));
     const preprocess_o = preprocess_obj.addOutputFileArg("preprocess.o");
