@@ -176,6 +176,15 @@ fn clamp01(v: f32) f32 {
     return v;
 }
 
+fn sigmoid(x: f32) f32 {
+    if (x >= 0.0) {
+        const z = std.math.exp(-x);
+        return 1.0 / (1.0 + z);
+    }
+    const z = std.math.exp(x);
+    return z / (1.0 + z);
+}
+
 fn normalizeBox(x1_in: f32, y1_in: f32, x2_in: f32, y2_in: f32) struct { x1: f32, y1: f32, x2: f32, y2: f32 } {
     var x1 = x1_in;
     var y1 = y1_in;
@@ -225,7 +234,7 @@ fn writeFrameDetections(ctx: *InferenceWorkerCtx, frame_index: usize, boxes: []c
         var best_class: usize = 0;
         var best_score: f32 = 0.0;
         for (0..80) |class_idx| {
-            const score = logits[box_idx * 80 + class_idx];
+            const score = sigmoid(logits[box_idx * 80 + class_idx]);
             if (score > best_score) {
                 best_score = score;
                 best_class = class_idx;

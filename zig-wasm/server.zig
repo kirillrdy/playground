@@ -354,7 +354,7 @@ const Repo = struct {
     };
 
     const UploadListRecord = struct {
-        id: i64,
+        id: string,
         filename: string,
     };
 
@@ -481,15 +481,11 @@ const Repo = struct {
         var iterator = dir.iterate();
         while (try iterator.next()) |entry| {
             if (entry.kind != .file) continue;
-            const underscore_index = std.mem.indexOfScalar(u8, entry.name, '_');
-            if (underscore_index == null) continue;
-            const idx = underscore_index.?;
-            const id: i64 = std.fmt.parseInt(i64, entry.name[0..idx], 10) catch continue;
-            if (id <= 0) continue;
-            const display_name: []const u8 = entry.name[idx + 1 ..];
+            const name_copy = try self.allocator.dupe(u8, entry.name);
+            errdefer self.allocator.free(name_copy);
             try files.append(self.allocator, .{
-                .id = id,
-                .filename = try self.allocator.dupe(u8, display_name),
+                .id = name_copy,
+                .filename = try self.allocator.dupe(u8, entry.name),
             });
         }
 
@@ -506,7 +502,10 @@ const Repo = struct {
     }
 
     fn freeUploadNames(self: *Repo, files: []UploadListRecord) void {
-        for (files) |file| self.allocator.free(file.filename);
+        for (files) |file| {
+            self.allocator.free(file.id);
+            self.allocator.free(file.filename);
+        }
         self.allocator.free(files);
     }
 
@@ -587,11 +586,11 @@ const Repo = struct {
         return null;
     }
 
-    fn ensureVideoDetections(self: *Repo, stored_upload_name: []const u8, file_id: i64) ![]u8 {
+    fn ensureVideoDetections(self: *Repo, stored_upload_name: []const u8) ![]u8 {
         self.processing_mutex.lock();
         defer self.processing_mutex.unlock();
 
-        const detections_name = try std.fmt.allocPrint(self.allocator, "{d}.jsonl", .{file_id});
+        const detections_name = try std.fmt.allocPrint(self.allocator, "{s}.jsonl", .{stored_upload_name});
         errdefer self.allocator.free(detections_name);
         const detections_rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ processed_dir, detections_name });
         defer self.allocator.free(detections_rel_path);
@@ -649,6 +648,27 @@ const Repo = struct {
             if (std.mem.indexOf(u8, line, "\"detections\":") == null) return false;
         }
         return saw_any;
+    }
+
+    fn getFileIdByName(self: *Repo, file_name: []const u8) !?i64 {
+        const escaped = try escapeSqlString(self.allocator, file_name);
+        defer self.allocator.free(escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT id FROM files WHERE filename = '{s}' LIMIT 1",
+            .{escaped},
+        );
+        defer self.allocator.free(sql);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return c.sqlite3_column_int64(stmt, 0);
     }
 
     fn getFileNameById(self: *Repo, file_id: i64) !?[]u8 {
@@ -785,10 +805,21 @@ fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
                     string => {
                         if (comptime std.mem.eql(u8, field.name, "filename")) {
                             if (comptime @hasField(resultRowType, "id")) {
-                                if (std.mem.eql(u8, title, "Files") and @field(file, "id") > 0) {
-                                    try writer.print(
-                                        \\<td class="px-6 py-4"><a class="text-blue-600 hover:underline" href="/files/{d}">{s}</a></td>
-                                    , .{ @field(file, "id"), value });
+                                if (std.mem.eql(u8, title, "Files")) {
+                                    const id_value = @field(file, "id");
+                                    switch (@TypeOf(id_value)) {
+                                        string => try writer.print(
+                                            \\<td class="px-6 py-4"><a class="text-blue-600 hover:underline" href="/files/{s}">{s}</a></td>
+                                        , .{ id_value, value }),
+                                        i32, i64 => if (id_value > 0) {
+                                            try writer.print(
+                                                \\<td class="px-6 py-4"><a class="text-blue-600 hover:underline" href="/files/{d}">{s}</a></td>
+                                            , .{ id_value, value });
+                                        } else {
+                                            try templates.print(template, "td-string", .{ .value = value }, writer);
+                                        },
+                                        else => try templates.print(template, "td-string", .{ .value = value }, writer),
+                                    }
                                 } else {
                                     try templates.print(template, "td-string", .{ .value = value }, writer);
                                 }
@@ -825,41 +856,66 @@ const Files = struct {
         try templates.writeHeader(layout, writer);
         try templates.print(layout, "title", .{ .title = "Files" }, writer);
 
-        const id_str = request.param("id") orelse {
+        const id_raw = request.param("id") orelse {
             response.status = 400;
             try writer.writeAll("missing id");
             try templates.write(layout, "close-body", writer);
             response.body = writerAllocating.written();
             return;
         };
+        const id_str = try decodeUrlComponent(repo.allocator, id_raw);
+        defer repo.allocator.free(id_str);
 
-        const file_id = std.fmt.parseInt(i64, id_str, 10) catch {
-            response.status = 400;
-            try writer.writeAll("invalid id");
-            try templates.write(layout, "close-body", writer);
-            response.body = writerAllocating.written();
-            return;
-        };
+        const parsed_file_id = std.fmt.parseInt(i64, id_str, 10) catch null;
+        var file_id_opt: ?i64 = null;
+        var file_name: []u8 = undefined;
 
-        const maybe_file_name = try repo.getFileNameById(file_id);
-        if (maybe_file_name == null) {
-            response.status = 404;
-            try writer.writeAll("file not found");
-            try templates.write(layout, "close-body", writer);
-            response.body = writerAllocating.written();
-            return;
+        if (parsed_file_id) |file_id| {
+            const maybe_file_name = try repo.getFileNameById(file_id);
+            if (maybe_file_name == null) {
+                response.status = 404;
+                try writer.writeAll("file not found");
+                try templates.write(layout, "close-body", writer);
+                response.body = writerAllocating.written();
+                return;
+            }
+            file_name = maybe_file_name.?;
+            file_id_opt = file_id;
+        } else {
+            if (!isSafeAssetName(id_str)) {
+                response.status = 400;
+                try writer.writeAll("invalid id");
+                try templates.write(layout, "close-body", writer);
+                response.body = writerAllocating.written();
+                return;
+            }
+
+            const upload_path = try std.fmt.allocPrint(repo.allocator, "{s}/{s}", .{ uploads_dir, id_str });
+            defer repo.allocator.free(upload_path);
+            std.fs.cwd().access(upload_path, .{}) catch {
+                response.status = 404;
+                try writer.writeAll("file not found");
+                try templates.write(layout, "close-body", writer);
+                response.body = writerAllocating.written();
+                return;
+            };
+
+            file_name = try repo.allocator.dupe(u8, id_str);
+            file_id_opt = try repo.getFileIdByName(id_str);
         }
-        const file_name = maybe_file_name.?;
         defer repo.allocator.free(file_name);
 
         const template = @embedFile("views/files/show.html");
-        try templates.printHeader(template, .{ .file_id = file_id, .file_name = file_name }, writer);
+        try templates.printHeader(template, .{ .file_id = id_str, .file_name = file_name }, writer);
 
-        const stored_name = try repo.findStoredUploadNameById(file_id);
+        const stored_name = if (file_id_opt) |file_id|
+            try repo.findStoredUploadNameById(file_id)
+        else
+            try repo.allocator.dupe(u8, file_name);
         if (stored_name) |upload_name| {
             defer repo.allocator.free(upload_name);
             if (isVideoFileName(upload_name)) {
-                const detections_name = try std.fmt.allocPrint(repo.allocator, "{d}.jsonl", .{file_id});
+                const detections_name = try std.fmt.allocPrint(repo.allocator, "{s}.jsonl", .{upload_name});
                 defer repo.allocator.free(detections_name);
 
                 try writer.writeAll(
@@ -935,14 +991,22 @@ const Files = struct {
                     \\</script>
                 );
             } else {
+                if (file_id_opt) |file_id| {
+                    const detections = try repo.allDetectionsByFileId(file_id);
+                    defer repo.freeDetectionsByFile(detections);
+                    try table(writer, "Detections", detections);
+                } else {
+                    try writer.writeAll("<div class=\"mx-4 mt-4 text-slate-600\">No stored detections for this file.</div>");
+                }
+            }
+        } else {
+            if (file_id_opt) |file_id| {
                 const detections = try repo.allDetectionsByFileId(file_id);
                 defer repo.freeDetectionsByFile(detections);
                 try table(writer, "Detections", detections);
+            } else {
+                try writer.writeAll("<div class=\"mx-4 mt-4 text-slate-600\">No stored detections for this file.</div>");
             }
-        } else {
-            const detections = try repo.allDetectionsByFileId(file_id);
-            defer repo.freeDetectionsByFile(detections);
-            try table(writer, "Detections", detections);
         }
 
         try templates.write(layout, "close-body", writer);
@@ -1106,6 +1170,15 @@ fn readAssetToArena(arena: Allocator, dir_name: []const u8, name: []const u8) ![
     return buffer;
 }
 
+fn decodeUrlComponent(allocator: Allocator, raw: []const u8) ![]u8 {
+    const buf = try allocator.dupe(u8, raw);
+    const decoded = std.Uri.percentDecodeInPlace(buf);
+    if (decoded.ptr == buf.ptr and decoded.len == buf.len) return buf;
+    const out = try allocator.dupe(u8, decoded);
+    allocator.free(buf);
+    return out;
+}
+
 const ByteRange = struct {
     start: u64,
     end: u64,
@@ -1148,11 +1221,12 @@ fn invalidRange(res: *httpz.Response, file_size: u64) !void {
 }
 
 fn uploadFileHandler(_: *Repo, req: *httpz.Request, res: *httpz.Response) !void {
-    const name = req.param("name") orelse {
+    const name_raw = req.param("name") orelse {
         res.status = 400;
         res.body = "missing file name";
         return;
     };
+    const name = try decodeUrlComponent(res.arena, name_raw);
     if (!isSafeAssetName(name)) {
         res.status = 400;
         res.body = "invalid file name";
@@ -1208,31 +1282,37 @@ fn uploadFileHandler(_: *Repo, req: *httpz.Request, res: *httpz.Response) !void 
 }
 
 fn processedFileHandler(repo: *Repo, req: *httpz.Request, res: *httpz.Response) !void {
-    const name = req.param("name") orelse {
+    const name_raw = req.param("name") orelse {
         res.status = 400;
         res.body = "missing file name";
         return;
     };
+    const name = try decodeUrlComponent(res.arena, name_raw);
     if (!isSafeAssetName(name)) {
         res.status = 400;
         res.body = "invalid file name";
         return;
     }
     if (std.ascii.endsWithIgnoreCase(name, ".jsonl")) {
-        const file_id = parseDetectionsFileId(name) orelse {
+        const upload_name = parseDetectionsSourceName(name) orelse {
             res.status = 400;
             res.body = "invalid detections file name";
             return;
         };
-        const stored_name = try repo.findStoredUploadNameById(file_id);
-        if (stored_name == null) {
+        if (!isSafeAssetName(upload_name)) {
+            res.status = 400;
+            res.body = "invalid detections file name";
+            return;
+        }
+        const upload_path = try std.fmt.allocPrint(repo.allocator, "{s}/{s}", .{ uploads_dir, upload_name });
+        defer repo.allocator.free(upload_path);
+        std.fs.cwd().access(upload_path, .{}) catch {
             res.status = 404;
             res.body = "not found";
             return;
-        }
-        defer repo.allocator.free(stored_name.?);
-        _ = repo.ensureVideoDetections(stored_name.?, file_id) catch |err| {
-            std.log.err("video detections failed for id={d}: {}", .{ file_id, err });
+        };
+        _ = repo.ensureVideoDetections(upload_name) catch |err| {
+            std.log.err("video detections failed for {s}: {}", .{ upload_name, err });
             res.status = 500;
             res.body = "failed to process video";
             return;
@@ -1250,9 +1330,8 @@ fn processedFileHandler(repo: *Repo, req: *httpz.Request, res: *httpz.Response) 
     };
 }
 
-fn parseDetectionsFileId(name: []const u8) ?i64 {
+fn parseDetectionsSourceName(name: []const u8) ?[]const u8 {
     if (!std.ascii.endsWithIgnoreCase(name, ".jsonl")) return null;
     if (name.len <= ".jsonl".len) return null;
-    const stem = name[0 .. name.len - ".jsonl".len];
-    return std.fmt.parseInt(i64, stem, 10) catch null;
+    return name[0 .. name.len - ".jsonl".len];
 }
