@@ -1106,6 +1106,47 @@ fn readAssetToArena(arena: Allocator, dir_name: []const u8, name: []const u8) ![
     return buffer;
 }
 
+const ByteRange = struct {
+    start: u64,
+    end: u64,
+};
+
+fn parseRangeHeader(value: []const u8, file_size: u64) ?ByteRange {
+    if (!std.mem.startsWith(u8, value, "bytes=")) return null;
+    const spec = value["bytes=".len..];
+    if (spec.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, spec, ',')) |_| return null; // single range only
+
+    const dash_idx = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+    const start_part = spec[0..dash_idx];
+    const end_part = spec[dash_idx + 1 ..];
+
+    if (file_size == 0) return null;
+
+    if (start_part.len == 0) {
+        const suffix_len = std.fmt.parseInt(u64, end_part, 10) catch return null;
+        if (suffix_len == 0) return null;
+        if (suffix_len >= file_size) return .{ .start = 0, .end = file_size - 1 };
+        return .{ .start = file_size - suffix_len, .end = file_size - 1 };
+    }
+
+    const start = std.fmt.parseInt(u64, start_part, 10) catch return null;
+    if (start >= file_size) return null;
+    if (end_part.len == 0) return .{ .start = start, .end = file_size - 1 };
+
+    var end = std.fmt.parseInt(u64, end_part, 10) catch return null;
+    if (end < start) return null;
+    if (end >= file_size) end = file_size - 1;
+    return .{ .start = start, .end = end };
+}
+
+fn invalidRange(res: *httpz.Response, file_size: u64) !void {
+    res.status = 416;
+    const content_range = try std.fmt.allocPrint(res.arena, "bytes */{d}", .{file_size});
+    res.header("Content-Range", content_range);
+    res.body = "range not satisfiable";
+}
+
 fn uploadFileHandler(_: *Repo, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.param("name") orelse {
         res.status = 400;
@@ -1117,8 +1158,8 @@ fn uploadFileHandler(_: *Repo, req: *httpz.Request, res: *httpz.Response) !void 
         res.body = "invalid file name";
         return;
     }
-    res.header("Content-Type", assetContentType(name));
-    res.body = readAssetToArena(res.arena, uploads_dir, name) catch |err| switch (err) {
+    const path = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{ uploads_dir, name });
+    const file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| switch (err) {
         error.FileNotFound => {
             res.status = 404;
             res.body = "not found";
@@ -1126,6 +1167,44 @@ fn uploadFileHandler(_: *Repo, req: *httpz.Request, res: *httpz.Response) !void 
         },
         else => return err,
     };
+    defer file.close();
+
+    const size = try file.getEndPos();
+    res.header("Accept-Ranges", "bytes");
+    res.header("Content-Type", assetContentType(name));
+
+    if (req.header("range")) |range_header| {
+        const byte_range = parseRangeHeader(range_header, size) orelse {
+            try invalidRange(res, size);
+            return;
+        };
+
+        const len_u64 = (byte_range.end - byte_range.start) + 1;
+        const len = std.math.cast(usize, len_u64) orelse return error.FileTooBig;
+        const buffer = try res.arena.alloc(u8, len);
+
+        try file.seekTo(byte_range.start);
+        const read = try file.readAll(buffer);
+        if (read != len) return error.UnexpectedEndOfFile;
+
+        res.status = 206;
+        const content_range = try std.fmt.allocPrint(res.arena, "bytes {d}-{d}/{d}", .{
+            byte_range.start,
+            byte_range.end,
+            size,
+        });
+        res.header("Content-Range", content_range);
+        const content_len = try std.fmt.allocPrint(res.arena, "{d}", .{len});
+        res.header("Content-Length", content_len);
+        res.body = buffer;
+        return;
+    }
+
+    const full_len = std.math.cast(usize, size) orelse return error.FileTooBig;
+    const full = try res.arena.alloc(u8, full_len);
+    const read = try file.readAll(full);
+    if (read != full_len) return error.UnexpectedEndOfFile;
+    res.body = full;
 }
 
 fn processedFileHandler(repo: *Repo, req: *httpz.Request, res: *httpz.Response) !void {
