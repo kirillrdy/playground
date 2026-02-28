@@ -132,11 +132,45 @@ const FrameQueue = struct {
     }
 };
 
+const Profiler = struct {
+    open_ns: i128 = 0,
+    find_stream_ns: i128 = 0,
+    seek_ns: i128 = 0,
+    first_frame_ns: i128 = 0,
+    decode_total_ns: i128 = 0,
+    filter_init_ns: i128 = 0,
+
+    fn report(self: *const Profiler, wall_ns: i128) void {
+        const to_s = 1e9;
+        std.debug.print(
+            \\--- Profiler Report (Wall: {d:.3}s) ---
+            \\  avformat_open:      {d:.3}s
+            \\  find_stream_info:   {d:.3}s
+            \\  avformat_seek:      {d:.3}s
+            \\  filter_init:        {d:.3}s
+            \\  first_frame_out:    {d:.3}s
+            \\  decode_total:       {d:.3}s
+            \\---------------------------------------
+            \\
+        , .{
+            @as(f64, @floatFromInt(wall_ns)) / to_s,
+            @as(f64, @floatFromInt(self.open_ns)) / to_s,
+            @as(f64, @floatFromInt(self.find_stream_ns)) / to_s,
+            @as(f64, @floatFromInt(self.seek_ns)) / to_s,
+            @as(f64, @floatFromInt(self.filter_init_ns)) / to_s,
+            @as(f64, @floatFromInt(self.first_frame_ns)) / to_s,
+            @as(f64, @floatFromInt(self.decode_total_ns)) / to_s,
+        });
+    }
+};
+
 const DecoderCtx = struct {
     queue: *FrameQueue,
     wg: *std.Thread.WaitGroup,
     video_path_z: [:0]const u8,
     options: InferOptions,
+    shared: ?SharedInferenceResources,
+    profiler: *Profiler,
 };
 
 const Metrics = struct {
@@ -312,7 +346,17 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
     defer c.avcodec_free_context(&codec_ctx);
 
     try avCheck(c.avcodec_parameters_to_context(codec_ctx, codecpar));
-    codec_ctx.?.*.hw_device_ctx = c.av_buffer_ref(hw_device_ctx);
+
+    const hw_ctx = if (ctx.shared) |s| if (s.hw_device_ctx) |h| h else null else null;
+    if (hw_ctx) |h| {
+        codec_ctx.?.*.hw_device_ctx = c.av_buffer_ref(h);
+    } else {
+        var new_hw: ?*c.AVBufferRef = null;
+        try avCheck(c.av_hwdevice_ctx_create(&new_hw, c.AV_HWDEVICE_TYPE_CUDA, null, null, 0));
+        codec_ctx.?.*.hw_device_ctx = new_hw;
+    }
+    defer if (hw_ctx == null) c.av_buffer_unref(&codec_ctx.?.*.hw_device_ctx);
+
     codec_ctx.?.*.get_format = get_format;
     try avCheck(c.avcodec_open2(codec_ctx, decoder, null));
 
@@ -369,12 +413,13 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 var args_buf: [512]u8 = undefined;
                 const args = try std.fmt.bufPrintZ(
                     &args_buf,
-                    "video_size={d}x{d}:pix_fmt={d}:time_base={d}/{d}:pixel_aspect={d}/{d}",
+                    "video_size={d}x{d}:pix_fmt={d}:time_base={d}/{d}:pixel_aspect={d}/{d}:colorspace={d}:range={d}",
                     .{
                         frame.?.*.width,                       frame.?.*.height,
                         frame.?.*.format,                      stream.?.*.time_base.num,
                         stream.?.*.time_base.den,              codec_ctx.?.*.sample_aspect_ratio.num,
-                        codec_ctx.?.*.sample_aspect_ratio.den,
+                        codec_ctx.?.*.sample_aspect_ratio.den, frame.?.*.colorspace,
+                        frame.?.*.color_range,
                     },
                 );
 
@@ -457,15 +502,23 @@ fn decoderThreadMain(ctx: *DecoderCtx) void {
 }
 
 fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
-    var preprocess_stream_raw: c.cudaStream_t = null;
-    if (c.cudaStreamCreate(&preprocess_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
-    const preprocess_stream = preprocess_stream_raw.?;
-    defer _ = c.cudaStreamDestroy(preprocess_stream);
+    const preprocess_stream = if (ctx.shared) |s| s.preprocess_stream else blk: {
+        var preprocess_stream_raw: c.cudaStream_t = null;
+        if (c.cudaStreamCreate(&preprocess_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+        break :blk preprocess_stream_raw.?;
+    };
+    defer if (ctx.shared == null) {
+        _ = c.cudaStreamDestroy(preprocess_stream);
+    };
 
-    var inference_stream_raw: c.cudaStream_t = null;
-    if (c.cudaStreamCreate(&inference_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
-    const inference_stream = inference_stream_raw.?;
-    defer _ = c.cudaStreamDestroy(inference_stream);
+    const inference_stream = if (ctx.shared) |s| s.inference_stream else blk: {
+        var inference_stream_raw: c.cudaStream_t = null;
+        if (c.cudaStreamCreate(&inference_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+        break :blk inference_stream_raw.?;
+    };
+    defer if (ctx.shared == null) {
+        _ = c.cudaStreamDestroy(inference_stream);
+    };
 
     const env = if (ctx.shared) |s| s.env else blk: {
         var env_raw: ?*c.OrtEnv = null;
@@ -524,20 +577,32 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
     const output_boxes_shape = [_]i64{ 1, 300, 4 };
     const output_logits_shape = [_]i64{ 1, 300, 80 };
 
-    var input_tensor_ptr: ?*anyopaque = null;
-    if (c.cudaMalloc(&input_tensor_ptr, input_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-    defer _ = c.cudaFree(input_tensor_ptr);
-    const input_tensor_d: [*]f32 = @ptrCast(@alignCast(input_tensor_ptr));
+    const input_tensor_d = if (ctx.shared) |s| s.input_tensor_d else blk: {
+        var ptr: ?*anyopaque = null;
+        if (c.cudaMalloc(&ptr, input_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+        break :blk @as([*]f32, @ptrCast(@alignCast(ptr)));
+    };
+    defer if (ctx.shared == null) {
+        _ = c.cudaFree(input_tensor_d);
+    };
 
-    var output_boxes_ptr: ?*anyopaque = null;
-    if (c.cudaMalloc(&output_boxes_ptr, 300 * 4 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-    defer _ = c.cudaFree(output_boxes_ptr);
-    const output_boxes_d: [*]f32 = @ptrCast(@alignCast(output_boxes_ptr));
+    const output_boxes_d = if (ctx.shared) |s| s.output_boxes_d else blk: {
+        var ptr: ?*anyopaque = null;
+        if (c.cudaMalloc(&ptr, 300 * 4 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+        break :blk @as([*]f32, @ptrCast(@alignCast(ptr)));
+    };
+    defer if (ctx.shared == null) {
+        _ = c.cudaFree(output_boxes_d);
+    };
 
-    var output_logits_ptr: ?*anyopaque = null;
-    if (c.cudaMalloc(&output_logits_ptr, 300 * 80 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-    defer _ = c.cudaFree(output_logits_ptr);
-    const output_logits_d: [*]f32 = @ptrCast(@alignCast(output_logits_ptr));
+    const output_logits_d = if (ctx.shared) |s| s.output_logits_d else blk: {
+        var ptr: ?*anyopaque = null;
+        if (c.cudaMalloc(&ptr, 300 * 80 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+        break :blk @as([*]f32, @ptrCast(@alignCast(ptr)));
+    };
+    defer if (ctx.shared == null) {
+        _ = c.cudaFree(output_logits_d);
+    };
 
     var input_value: ?*c.OrtValue = null;
     try ortCheck(ctx.api, ctx.api.CreateTensorWithDataAsOrtValue.?(
@@ -659,9 +724,21 @@ pub const SharedInferenceResources = struct {
     api: *const c.OrtApi,
     env: *c.OrtEnv,
     session: *c.OrtSession,
+    hw_device_ctx: ?*c.AVBufferRef = null,
+    input_tensor_d: [*]f32,
+    output_boxes_d: [*]f32,
+    output_logits_d: [*]f32,
+    preprocess_stream: c.cudaStream_t,
+    inference_stream: c.cudaStream_t,
 };
 
-fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions, shared: ?SharedInferenceResources) !void {
+pub const VideoMetadata = struct {
+    time_base: c.AVRational,
+    fps: f64,
+    stream_idx: i32,
+};
+
+fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata_opt: ?VideoMetadata) !void {
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
     var queue = try FrameQueue.init(allocator, queue_capacity, &wg);
@@ -678,20 +755,27 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     const model_path_z = try allocator.dupeZ(u8, config.model_path);
     defer allocator.free(model_path_z);
 
-    // We still need FPS/TimeBase for the workers. Let's get them once, but faster.
-    var fmt_ctx: ?*c.AVFormatContext = null;
-    try avCheck(c.avformat_open_input(&fmt_ctx, video_path_z.ptr, null, null));
-    defer c.avformat_close_input(&fmt_ctx);
-    fmt_ctx.?.*.probesize = 500000;
-    fmt_ctx.?.*.max_analyze_duration = 1000000;
-    try avCheck(c.avformat_find_stream_info(fmt_ctx, null));
-    const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
-    if (stream_idx < 0) return error.NoVideoStream;
-    const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
-    const time_base = stream.?.*.time_base;
-    const fps = if (stream.?.*.avg_frame_rate.den > 0) 
-        @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
-        else 30.0;
+    var time_base: c.AVRational = .{ .num = 1, .den = 1 };
+    var fps: f64 = 30.0;
+    
+    if (metadata_opt) |m| {
+        time_base = m.time_base;
+        fps = m.fps;
+    } else {
+        var fmt_ctx: ?*c.AVFormatContext = null;
+        try avCheck(c.avformat_open_input(&fmt_ctx, video_path_z.ptr, null, null));
+        defer c.avformat_close_input(&fmt_ctx);
+        fmt_ctx.?.*.probesize = 500000;
+        fmt_ctx.?.*.max_analyze_duration = 1000000;
+        try avCheck(c.avformat_find_stream_info(fmt_ctx, null));
+        const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
+        if (stream_idx < 0) return error.NoVideoStream;
+        const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
+        time_base = stream.?.*.time_base;
+        fps = if (stream.?.*.avg_frame_rate.den > 0) 
+            @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
+            else 30.0;
+    }
 
     const decoder_ctxs = try allocator.alloc(DecoderCtx, producer_count);
     defer allocator.free(decoder_ctxs);
@@ -700,12 +784,16 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     @memset(decoder_threads, null);
     defer for (decoder_threads) |t| if (t) |thr| thr.join();
 
+    var profiler: Profiler = .{};
+
     for (0..producer_count) |i| {
         decoder_ctxs[i] = .{
             .queue = &queue,
             .wg = &wg,
             .video_path_z = video_path_z,
             .options = options,
+            .shared = shared,
+            .profiler = &profiler,
         };
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
     }
@@ -741,6 +829,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     const wall_end_ns = std.time.nanoTimestamp();
     const wall_ns = wall_end_ns - wall_start_ns;
 
+    profiler.report(wall_ns);
+
     if (metrics.frames == 0 or metrics.submit_ns <= 0 or wall_ns <= 0) {
         std.debug.print("submit_s=0.000 wall_s=0.000 queue_wait_s=0.000 workers={d} frames=0 submit_fps=0.00 wall_fps=0.00\n", .{inference_workers});
         return;
@@ -765,8 +855,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     });
 }
 
-pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions, shared: ?SharedInferenceResources) !void {
-    try runBenchmark(allocator, video_path, 1, detections_path, options, shared);
+pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata: ?VideoMetadata) !void {
+    try runBenchmark(allocator, video_path, 1, detections_path, options, shared, metadata);
 }
 
 pub fn main() !void {
@@ -783,5 +873,5 @@ pub fn main() !void {
     const producer_count = try std.fmt.parseInt(usize, args[2], 10);
     if (producer_count == 0) return error.InvalidArguments;
     const detections_path: ?[]const u8 = if (args.len == 4) args[3] else null;
-    try runBenchmark(allocator, args[1], producer_count, detections_path, .{}, null);
+    try runBenchmark(allocator, args[1], producer_count, detections_path, .{}, null, null);
 }
