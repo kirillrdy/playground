@@ -13,6 +13,7 @@ const print = std.log.info;
 const port = 3000;
 const uploads_dir = "uploads";
 const processed_dir = "processed";
+const max_range_response_bytes: u64 = 8 * 1024 * 1024;
 const coco_class_names = [_][]const u8{
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
     "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
@@ -1248,11 +1249,13 @@ fn uploadFileHandler(_: *Repo, req: *httpz.Request, res: *httpz.Response) !void 
     res.header("Content-Type", assetContentType(name));
 
     if (req.header("range")) |range_header| {
-        const byte_range = parseRangeHeader(range_header, size) orelse {
+        var byte_range = parseRangeHeader(range_header, size) orelse {
             try invalidRange(res, size);
             return;
         };
 
+        const max_end = byte_range.start +| (max_range_response_bytes - 1);
+        if (byte_range.end > max_end) byte_range.end = max_end;
         const len_u64 = (byte_range.end - byte_range.start) + 1;
         const len = std.math.cast(usize, len_u64) orelse return error.FileTooBig;
         const buffer = try res.arena.alloc(u8, len);
