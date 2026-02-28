@@ -33,6 +33,8 @@ const input_h: usize = 640;
 const input_len: usize = 1 * 3 * input_w * input_h;
 const queue_capacity: usize = 32;
 const inference_workers: usize = 1;
+const conf_threshold: f32 = 0.25;
+const max_detections_per_frame: usize = 32;
 
 const FrameQueue = struct {
     allocator: std.mem.Allocator,
@@ -164,7 +166,92 @@ const InferenceWorkerCtx = struct {
     api: *const c.OrtApi,
     model_path_z: [:0]const u8,
     metrics: *Metrics,
+    detections_file: ?*std.fs.File,
+    detections_mutex: ?*std.Thread.Mutex,
 };
+
+fn clamp01(v: f32) f32 {
+    if (v < 0.0) return 0.0;
+    if (v > 1.0) return 1.0;
+    return v;
+}
+
+fn normalizeBox(x1_in: f32, y1_in: f32, x2_in: f32, y2_in: f32) struct { x1: f32, y1: f32, x2: f32, y2: f32 } {
+    var x1 = x1_in;
+    var y1 = y1_in;
+    var x2 = x2_in;
+    var y2 = y2_in;
+
+    if (x2 <= x1 or y2 <= y1) {
+        const cx = x1;
+        const cy = y1;
+        const w = @abs(x2);
+        const h = @abs(y2);
+        x1 = cx - (w / 2.0);
+        y1 = cy - (h / 2.0);
+        x2 = cx + (w / 2.0);
+        y2 = cy + (h / 2.0);
+    }
+
+    if (x2 > 1.5 or y2 > 1.5 or x1 > 1.5 or y1 > 1.5) {
+        x1 /= @as(f32, @floatFromInt(input_w));
+        x2 /= @as(f32, @floatFromInt(input_w));
+        y1 /= @as(f32, @floatFromInt(input_h));
+        y2 /= @as(f32, @floatFromInt(input_h));
+    }
+
+    return .{
+        .x1 = clamp01(x1),
+        .y1 = clamp01(y1),
+        .x2 = clamp01(x2),
+        .y2 = clamp01(y2),
+    };
+}
+
+fn writeFrameDetections(ctx: *InferenceWorkerCtx, frame_index: usize, boxes: []const f32, logits: []const f32) !void {
+    if (ctx.detections_file == null or ctx.detections_mutex == null) return;
+    const file = ctx.detections_file.?;
+    const mutex = ctx.detections_mutex.?;
+    var line = std.ArrayList(u8).empty;
+    defer line.deinit(std.heap.c_allocator);
+    const writer = &line.writer(std.heap.c_allocator);
+
+    mutex.lock();
+    defer mutex.unlock();
+
+    try writer.print("{{\"frame\":{d},\"detections\":[", .{frame_index});
+    var written: usize = 0;
+    for (0..300) |box_idx| {
+        var best_class: usize = 0;
+        var best_score: f32 = 0.0;
+        for (0..80) |class_idx| {
+            const score = logits[box_idx * 80 + class_idx];
+            if (score > best_score) {
+                best_score = score;
+                best_class = class_idx;
+            }
+        }
+        if (best_score < conf_threshold) continue;
+        if (written >= max_detections_per_frame) break;
+
+        const box = normalizeBox(
+            boxes[box_idx * 4 + 0],
+            boxes[box_idx * 4 + 1],
+            boxes[box_idx * 4 + 2],
+            boxes[box_idx * 4 + 3],
+        );
+        if (box.x2 <= box.x1 or box.y2 <= box.y1) continue;
+
+        if (written > 0) try writer.writeAll(",");
+        try writer.print(
+            "{{\"class_id\":{d},\"score\":{d:.4},\"x1\":{d:.6},\"y1\":{d:.6},\"x2\":{d:.6},\"y2\":{d:.6}}}",
+            .{ best_class, best_score, box.x1, box.y1, box.x2, box.y2 },
+        );
+        written += 1;
+    }
+    try writer.writeAll("]}\n");
+    try file.writeAll(line.items);
+}
 
 fn get_format(ctx: ?*c.AVCodecContext, pix_fmts: ?[*]const c.enum_AVPixelFormat) callconv(.c) c.enum_AVPixelFormat {
     _ = ctx;
@@ -469,6 +556,12 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
     if (c.cudaEventCreateWithFlags(&preprocess_event, c.cudaEventDisableTiming) != c.cudaSuccess) return error.CudaEventCreateFailed;
     defer _ = c.cudaEventDestroy(preprocess_event);
 
+    const host_boxes = try std.heap.c_allocator.alloc(f32, 300 * 4);
+    defer std.heap.c_allocator.free(host_boxes);
+    const host_logits = try std.heap.c_allocator.alloc(f32, 300 * 80);
+    defer std.heap.c_allocator.free(host_logits);
+    var frame_index: usize = 0;
+
     while (true) {
         const wait_start_ns = std.time.nanoTimestamp();
         const maybe_slot_idx = ctx.queue.acquireReadSlot();
@@ -502,7 +595,22 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
 
         const start_ns = std.time.nanoTimestamp();
         try ortCheck(ctx.api, ctx.api.RunWithBinding.?(session, null, io_binding));
+        if (c.cudaStreamSynchronize(inference_stream) != c.cudaSuccess) return error.CudaStreamSyncFailed;
+        if (c.cudaMemcpy(
+            host_boxes.ptr,
+            output_boxes_d,
+            300 * 4 * @sizeOf(f32),
+            c.cudaMemcpyDeviceToHost,
+        ) != c.cudaSuccess) return error.CudaMemcpyFailed;
+        if (c.cudaMemcpy(
+            host_logits.ptr,
+            output_logits_d,
+            300 * 80 * @sizeOf(f32),
+            c.cudaMemcpyDeviceToHost,
+        ) != c.cudaSuccess) return error.CudaMemcpyFailed;
         const end_ns = std.time.nanoTimestamp();
+        frame_index += 1;
+        try writeFrameDetections(ctx, frame_index, host_boxes, host_logits);
         ctx.metrics.add(1, end_ns - start_ns, queue_wait_delta_ns);
     }
 }
@@ -513,7 +621,7 @@ fn inferenceWorkerMain(ctx: *InferenceWorkerCtx) void {
     };
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize) !void {
+fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8) !void {
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
     var queue = try FrameQueue.init(allocator, queue_capacity, &wg);
@@ -544,6 +652,12 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     const model_path_z = try allocator.dupeZ(u8, config.model_path);
     defer allocator.free(model_path_z);
     var metrics: Metrics = .{};
+    var detections_file: ?std.fs.File = null;
+    defer if (detections_file) |*f| f.close();
+    if (detections_path) |path| {
+        detections_file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    }
+    var detections_mutex: std.Thread.Mutex = .{};
     var worker_ctxs: [inference_workers]InferenceWorkerCtx = undefined;
     var worker_threads: [inference_workers]?std.Thread = .{null} ** inference_workers;
     const wall_start_ns = std.time.nanoTimestamp();
@@ -554,6 +668,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
             .api = api,
             .model_path_z = model_path_z,
             .metrics = &metrics,
+            .detections_file = if (detections_file) |*f| f else null,
+            .detections_mutex = if (detections_file != null) &detections_mutex else null,
         };
         worker_threads[i] = try std.Thread.spawn(.{}, inferenceWorkerMain, .{&worker_ctxs[i]});
     }
@@ -594,12 +710,12 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    if (args.len != 3) {
-        std.debug.print("usage: {s} <video> <producer_count>\n", .{args[0]});
+    if (args.len != 3 and args.len != 4) {
+        std.debug.print("usage: {s} <video> <producer_count> [detections.jsonl]\n", .{args[0]});
         return error.InvalidArguments;
     }
     const producer_count = try std.fmt.parseInt(usize, args[2], 10);
     if (producer_count == 0) return error.InvalidArguments;
-
-    try runBenchmark(allocator, args[1], producer_count);
+    const detections_path: ?[]const u8 = if (args.len == 4) args[3] else null;
+    try runBenchmark(allocator, args[1], producer_count, detections_path);
 }
