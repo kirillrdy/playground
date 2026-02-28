@@ -17,21 +17,40 @@ pub fn build(b: *std.Build) !void {
 
     const sqlite3 = b.dependency("sqlite3", .{ .target = target, .optimize = optimize });
     const zigimg = b.dependency("zigimg", .{ .target = target, .optimize = optimize });
+    const vy_opts = b.addOptions();
 
     const server_mod = b.createModule(.{
         .root_source_file = b.path("server.zig"),
         .target = target,
         .optimize = optimize,
     });
+    server_mod.addOptions("config", vy_opts);
     server_mod.addImport("zigimg", zigimg.module("zigimg"));
     server_mod.addImport("httpz", b.dependency("httpz", .{}).module("httpz"));
     server_mod.addIncludePath(sqlite3.path("."));
     server_mod.addIncludePath(onnx_dev.path(b, "include"));
+    server_mod.addIncludePath(ffmpeg_dev.path(b, "include"));
+    server_mod.addIncludePath(cuda.path(b, "include"));
+
+    const preprocess_obj = b.addSystemCommand(&.{ "sh", "-c", "$1 -arch=sm_89 -c $2 -o $3 -I$4", "--" });
+    preprocess_obj.addFileArg(nvcc_pkg.path(b, "bin/nvcc"));
+    preprocess_obj.addFileArg(b.path("preprocess.cu"));
+    const preprocess_o = preprocess_obj.addOutputFileArg("preprocess.o");
+    preprocess_obj.addDirectoryArg(cuda.path(b, "include"));
 
     const server = b.addExecutable(.{ .name = server_name, .root_module = server_mod });
+    server.linkLibC();
+    server.addObjectFile(preprocess_o);
     server.linkLibrary(sqlite3.artifact("sqlite3"));
     server.addLibraryPath(onnx_lib.path(b, "lib"));
+    server.addLibraryPath(ffmpeg_lib.path(b, "lib"));
+    server.addLibraryPath(cudart.path(b, "lib"));
     server.linkSystemLibrary("onnxruntime");
+    server.linkSystemLibrary("cudart");
+    server.linkSystemLibrary("avformat");
+    server.linkSystemLibrary("avcodec");
+    server.linkSystemLibrary("avutil");
+    server.linkSystemLibrary("avfilter");
     b.installArtifact(server);
 
     const video_yolo_mod = b.createModule(.{
@@ -39,17 +58,10 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    const vy_opts = b.addOptions();
     video_yolo_mod.addOptions("config", vy_opts);
     video_yolo_mod.addIncludePath(onnx_dev.path(b, "include"));
     video_yolo_mod.addIncludePath(ffmpeg_dev.path(b, "include"));
     video_yolo_mod.addIncludePath(cuda.path(b, "include"));
-
-    const preprocess_obj = b.addSystemCommand(&.{ "sh", "-c", "$1 -arch=sm_89 -c $2 -o $3 -I$4", "--" });
-    preprocess_obj.addFileArg(nvcc_pkg.path(b, "bin/nvcc"));
-    preprocess_obj.addFileArg(b.path("preprocess.cu"));
-    const preprocess_o = preprocess_obj.addOutputFileArg("preprocess.o");
-    preprocess_obj.addDirectoryArg(cuda.path(b, "include"));
 
     const video_yolo = b.addExecutable(.{ .name = "video_yolo", .root_module = video_yolo_mod });
     video_yolo.linkLibC();

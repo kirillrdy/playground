@@ -703,6 +703,10 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     });
 }
 
+pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8) !void {
+    try runBenchmark(allocator, video_path, 1, detections_path);
+}
+
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

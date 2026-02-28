@@ -2,6 +2,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const builtin = @import("builtin");
 const onnxruntime = @import("onnxruntime.zig");
+const video_yolo = @import("video_yolo.zig");
 const Allocator = std.mem.Allocator;
 const string = []const u8;
 const c = @cImport({
@@ -205,7 +206,7 @@ pub fn main() !void {
         .port = port,
         .request = .{
             .max_multiform_count = 8,
-            .max_body_size = 20 * 1024 * 1024,
+            .max_body_size = 1024 * 1024 * 1024,
         },
     }, &repo);
     defer {
@@ -590,9 +591,6 @@ const Repo = struct {
         }
 
         if (need_generate) {
-            const video_tool = try self.findVideoYoloBinary();
-            defer self.allocator.free(video_tool);
-
             const upload_rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ uploads_dir, stored_upload_name });
             defer self.allocator.free(upload_rel_path);
 
@@ -600,24 +598,10 @@ const Repo = struct {
             defer self.allocator.free(tmp_rel_path);
             std.fs.cwd().deleteFile(tmp_rel_path) catch {};
 
-            var child = std.process.Child.init(&.{ video_tool, upload_rel_path, "1", tmp_rel_path }, self.allocator);
-            child.stdin_behavior = .Ignore;
-            child.stdout_behavior = .Ignore;
-            child.stderr_behavior = .Inherit;
-            try child.spawn();
-            const term = try child.wait();
-            switch (term) {
-                .Exited => |code| {
-                    if (code != 0) {
-                        std.fs.cwd().deleteFile(tmp_rel_path) catch {};
-                        return error.VideoYoloFailed;
-                    }
-                },
-                else => {
-                    std.fs.cwd().deleteFile(tmp_rel_path) catch {};
-                    return error.VideoYoloFailed;
-                },
-            }
+            video_yolo.inferVideoToJsonl(self.allocator, upload_rel_path, tmp_rel_path) catch |err| {
+                std.fs.cwd().deleteFile(tmp_rel_path) catch {};
+                return err;
+            };
 
             std.fs.cwd().rename(tmp_rel_path, detections_rel_path) catch |err| switch (err) {
                 error.PathAlreadyExists => {
@@ -629,18 +613,6 @@ const Repo = struct {
 
         return detections_name;
     }
-
-    fn findVideoYoloBinary(self: *Repo) ![]u8 {
-        const exe_dir = try std.fs.selfExeDirPathAlloc(self.allocator);
-        defer self.allocator.free(exe_dir);
-        const local = try std.fmt.allocPrint(self.allocator, "{s}/video_yolo", .{exe_dir});
-        std.fs.cwd().access(local, .{}) catch {
-            self.allocator.free(local);
-            return try self.allocator.dupe(u8, "zig-out/bin/video_yolo");
-        };
-        return local;
-    }
-
     fn isLikelyValidDetectionsJsonl(self: *Repo, rel_path: []const u8) !bool {
         const data = std.fs.cwd().readFileAlloc(self.allocator, rel_path, 256 * 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => return false,
