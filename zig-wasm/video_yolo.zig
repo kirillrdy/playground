@@ -409,6 +409,8 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
         }
 
         codec_ctx.?.*.get_format = get_format;
+        codec_ctx.?.*.pkt_timebase = stream.?.*.time_base;
+        codec_ctx.?.*.flags |= c.AV_CODEC_FLAG_LOW_DELAY;
         
         try avCheck(c.avcodec_open2(codec_ctx, decoder, null));
         
@@ -427,8 +429,11 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
         
         var need_seek = true;
         if (ctx.persistent) |p| {
-            if (p.current_pts >= 0 and ts >= p.current_pts and ts - p.current_pts < 5 * @divTrunc(time_base.den, time_base.num)) {
-                if (p.current_pts == ts) need_seek = false;
+            // Allow a 2-second margin for contiguous playback or small jumps.
+            // NVDEC decoding is faster than seeking + flushing + keyframe recovery.
+            const no_seek_margin = 2 * @divTrunc(time_base.den, time_base.num);
+            if (p.current_pts >= 0 and ts >= p.current_pts and ts - p.current_pts <= no_seek_margin) {
+                need_seek = false;
             }
         }
 
@@ -436,18 +441,10 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
             const seek_start = std.time.nanoTimestamp();
             try avCheck(c.avformat_seek_file(fmt_ctx, stream_idx, std.math.minInt(i64), ts, ts, c.AVSEEK_FLAG_BACKWARD));
             c.avcodec_flush_buffers(codec_ctx);
-            if (filter_graph != null) {
-                if (ctx.persistent) |p| {
-                    var graph: ?*c.AVFilterGraph = p.filter_graph;
-                    c.avfilter_graph_free(&graph);
-                    p.filter_graph = null;
-                    filter_graph = null;
-                } else {
-                    c.avfilter_graph_free(&filter_graph);
-                    filter_graph = null;
-                }
-            }
+            // DO NOT free filter_graph here anymore. Reusing it is much faster.
             ctx.profiler.seek_ns.store(@intCast(std.time.nanoTimestamp() - seek_start), .monotonic);
+        } else {
+            ctx.profiler.seek_ns.store(0, .monotonic);
         }
     }
 
