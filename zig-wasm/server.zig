@@ -1043,66 +1043,17 @@ const Files = struct {
                     \\"></video>
                     \\  <canvas id="video-overlay" class="absolute left-0 top-0 pointer-events-none"></canvas>
                     \\</div>
+                    \\<script src="/wasm.js"></script>
                     \\<script>
                     \\(async function() {
                     \\  const video = document.getElementById('video-player');
                     \\  const canvas = document.getElementById('video-overlay');
-                    \\  const ctx = canvas.getContext('2d');
-                    \\  const classNames = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant","bed","dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"];
-                    \\  const raw = await fetch('/processed/
+                    \\  const detectionsUrl = '/processed/
                 );
                 try writer.print("{s}", .{detections_name});
                 try writer.writeAll(
-                    \\').then(r => r.text());
-                    \\  const frames = [];
-                    \\  for (const line of raw.split('\n')) {
-                    \\    const t = line.trim();
-                    \\    if (!t) continue;
-                    \\    try { frames.push(JSON.parse(t)); } catch (_) {}
-                    \\  }
-                    \\  function resizeOverlay() {
-                    \\    const w = video.clientWidth || video.videoWidth || 0;
-                    \\    const h = video.clientHeight || video.videoHeight || 0;
-                    \\    if (!w || !h) return;
-                    \\    canvas.width = w;
-                    \\    canvas.height = h;
-                    \\    canvas.style.width = w + 'px';
-                    \\    canvas.style.height = h + 'px';
-                    \\  }
-                    \\  function drawCurrentFrame() {
-                    \\    resizeOverlay();
-                    \\    if (frames.length === 0 || !video.duration || !canvas.width || !canvas.height) return;
-                    \\    const fps = frames.length / video.duration;
-                    \\    const frameIndex = Math.max(1, Math.floor(video.currentTime * fps));
-                    \\    const frame = frames[Math.min(frames.length - 1, frameIndex - 1)];
-                    \\    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    \\    ctx.lineWidth = 2;
-                    \\    ctx.strokeStyle = '#ef4444';
-                    \\    ctx.fillStyle = '#ef4444';
-                    \\    ctx.font = '12px sans-serif';
-                    \\    for (const det of frame.detections) {
-                    \\      const x = det.x1 * canvas.width;
-                    \\      const y = det.y1 * canvas.height;
-                    \\      const w = (det.x2 - det.x1) * canvas.width;
-                    \\      const h = (det.y2 - det.y1) * canvas.height;
-                    \\      if (w <= 0 || h <= 0) continue;
-                    \\      ctx.strokeRect(x, y, w, h);
-                    \\      const name = classNames[det.class_id] || ('class ' + det.class_id);
-                    \\      ctx.fillText(name + ' ' + det.score.toFixed(2), x + 2, Math.max(12, y - 4));
-                    \\    }
-                    \\  }
-                    \\  function tick() {
-                    \\    drawCurrentFrame();
-                    \\    requestAnimationFrame(tick);
-                    \\  }
-                    \\  video.addEventListener('loadedmetadata', resizeOverlay);
-                    \\  video.addEventListener('timeupdate', drawCurrentFrame);
-                    \\  video.addEventListener('seeked', drawCurrentFrame);
-                    \\  video.addEventListener('play', drawCurrentFrame);
-                    \\  video.addEventListener('pause', drawCurrentFrame);
-                    \\  window.addEventListener('resize', resizeOverlay);
-                    \\  resizeOverlay();
-                    \\  requestAnimationFrame(tick);
+                    \\';
+                    \\  await window.videoOverlayWasm.attachVideoOverlay(video, canvas, detectionsUrl);
                     \\})();
                     \\</script>
                 );

@@ -1,78 +1,100 @@
-let alloc, free, memory, callZig;
+let wasmExports = null;
+let wasmMemory = null;
+let activeCanvas = null;
+let activeCtx = null;
 
 function getView(ptr, len) {
-  return new Uint8Array(memory.buffer, ptr, len);
+  return new Uint8Array(wasmMemory.buffer, ptr, len);
 }
 
-// JS strings are UTF-16 and have to be encoded into an
-// UTF-8 typed byte array in WASM memory.
-function writeStrToWasm(str) {
-  const capacity = str.length * 2 + 5; // As per MDN
-  const ptr = alloc(capacity);
-  //TODO is this correct ?
-  if (ptr == null) {
-    console.error("failed to allocate memory")
-  }
-  const { written } = new TextEncoder().encodeInto(str, getView(ptr, capacity));
-  return [ptr, written, capacity];
-}
-
-// Decode UTF-8 typed byte array in WASM memory into
-// UTF-16 JS string.
 function readStrFromWasm(ptr, len) {
-  // TODO reuse decoder encoder
   return new TextDecoder().decode(getView(ptr, len));
 }
 
-let nextId = 1;
-let objectsMap = [];
-
-let putObject = (object) => {
-  objectsMap[nextId] = object
-  nextId++
-  return nextId - 1
+function writeBytesToWasm(bytes) {
+  const ptr = wasmExports.alloc(bytes.length);
+  if (!ptr) throw new Error("wasm alloc failed");
+  getView(ptr, bytes.length).set(bytes);
+  return ptr;
 }
 
-// The environment we export to WASM.
-let importObject = {
-  env: {
-    jsAddEventListener: (id, context, functionPointer) => {
-      objectsMap[id].addEventListener("click", function() {
-        callZig(context, functionPointer);
-      })
-    },
-    jsInvoke: (id, p1, l1, p2, l2) => {
-      const funcName = readStrFromWasm(p1, l1)
-      const arg1 = readStrFromWasm(p2, l2)
-      return putObject(objectsMap[id][funcName](arg1))
-    },
-    jsInvokeValue: (id, p1, l1, id2) => {
-      const funcName = readStrFromWasm(p1, l1)
-      const arg1 = objectsMap[id2]
-      return putObject(objectsMap[id][funcName](arg1))
-    },
+function jsCanvasClear() {
+  if (!activeCtx || !activeCanvas) return;
+  activeCtx.clearRect(0, 0, activeCanvas.width, activeCanvas.height);
+}
 
-    jsSet: (id, p1, l1, p2, l2) => {
-      const arg1 = readStrFromWasm(p1, l1)
-      const arg2 = readStrFromWasm(p2, l2)
-      objectsMap[id][arg1] = arg2
-    },
+function jsCanvasDraw(x, y, w, h, labelPtr, labelLen, score) {
+  if (!activeCtx) return;
+  const label = readStrFromWasm(labelPtr, labelLen);
+  activeCtx.lineWidth = 2;
+  activeCtx.strokeStyle = "#ef4444";
+  activeCtx.fillStyle = "#ef4444";
+  activeCtx.font = "12px sans-serif";
+  activeCtx.strokeRect(x, y, w, h);
+  activeCtx.fillText(`${label} ${Number(score).toFixed(2)}`, x + 2, Math.max(12, y - 4));
+}
 
-    jsGet: (id, ptr, len) => {
-      if (id == 0) {
-        return putObject(window[readStrFromWasm(ptr, len)])
-      }
-      return putObject(objectsMap[id][readStrFromWasm(ptr, len)])
-    }
+async function ensureWasm() {
+  if (wasmExports) return wasmExports;
+
+  const imports = {
+    env: {
+      jsCanvasClear,
+      jsCanvasDraw,
+    },
+  };
+
+  const instance = await WebAssembly.instantiateStreaming(fetch("/main.wasm"), imports);
+  wasmExports = instance.instance.exports;
+  wasmMemory = wasmExports.memory;
+  return wasmExports;
+}
+
+function fitCanvasToVideo(video, canvas) {
+  const w = video.clientWidth || video.videoWidth || 0;
+  const h = video.clientHeight || video.videoHeight || 0;
+  if (!w || !h) return;
+  canvas.width = w;
+  canvas.height = h;
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+}
+
+async function attachVideoOverlay(video, canvas, detectionsUrl) {
+  const wasm = await ensureWasm();
+  activeCanvas = canvas;
+  activeCtx = canvas.getContext("2d");
+
+  const raw = await fetch(detectionsUrl).then((r) => r.text());
+  const bytes = new TextEncoder().encode(raw);
+
+  wasm.clearDetections();
+  const ptr = writeBytesToWasm(bytes);
+  const ok = wasm.loadDetections(ptr, bytes.length);
+  wasm.free(ptr, bytes.length);
+  if (!ok) {
+    console.warn("failed to parse detections in wasm");
   }
+
+  const draw = () => {
+    fitCanvasToVideo(video, canvas);
+    wasm.renderAt(video.currentTime * 1000, video.duration * 1000, canvas.width, canvas.height);
+  };
+
+  video.addEventListener("loadedmetadata", draw);
+  video.addEventListener("timeupdate", draw);
+  video.addEventListener("seeked", draw);
+  video.addEventListener("play", draw);
+  video.addEventListener("pause", draw);
+  window.addEventListener("resize", draw);
+
+  const tick = () => {
+    draw();
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+window.videoOverlayWasm = {
+  attachVideoOverlay,
 };
-//TODO hardcoded path
-WebAssembly.instantiateStreaming(fetch('/main.wasm'), importObject)
-  .then((wasm_binary) => {
-    ({ alloc, free, memory, callZig } = wasm_binary.instance.exports);
-
-    const [ptr, len, capacity] = writeStrToWasm("Hello from Zig + JS + WASM 🦎⚡!");
-    free(ptr, capacity);
-    wasm_binary.instance.exports.main()
-  });
-
