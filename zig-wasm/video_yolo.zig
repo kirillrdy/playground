@@ -502,7 +502,9 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 try avCheck(c.avfilter_graph_create_filter(&buffer_ctx, buffer_filter, "in", args.ptr, null, filter_graph));
                 try avCheck(c.avfilter_graph_create_filter(&buffersink_ctx, buffersink_filter, "out", null, null, filter_graph));
                 
-                buffer_ctx.?.*.hw_device_ctx = c.av_buffer_ref(codec_ctx.?.*.hw_device_ctx);
+                if (codec_ctx.?.*.hw_device_ctx != null) {
+                    buffer_ctx.?.*.hw_device_ctx = c.av_buffer_ref(codec_ctx.?.*.hw_device_ctx);
+                }
                 if (frame.?.*.hw_frames_ctx != null) {
                     const src_params = c.av_buffersrc_parameters_alloc() orelse return error.OutOfMemory;
                     defer c.av_free(src_params);

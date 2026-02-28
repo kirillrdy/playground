@@ -1215,63 +1215,69 @@ fn processedFileHandler(app: *App, req: *httpz.Request, res: *httpz.Response) !v
             std.fs.cwd().access(segment_path, .{}) catch { need_gen = true; };
             
             if (need_gen) {
-                const upload_path = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{uploads_dir, upload_name});
-                
-                if (!app.metadata_cache.contains(upload_name)) {
-                    const upload_path_z = try res.arena.dupeZ(u8, upload_path);
-                    var fmt_ctx: ?*c.AVFormatContext = null;
-                    if (c.avformat_open_input(&fmt_ctx, upload_path_z.ptr, null, null) >= 0) {
-                        defer c.avformat_close_input(&fmt_ctx);
-                        fmt_ctx.?.*.probesize = 500000;
-                        fmt_ctx.?.*.max_analyze_duration = 1000000;
-                        if (c.avformat_find_stream_info(fmt_ctx, null) >= 0) {
-                            const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
-                            if (stream_idx >= 0) {
-                                const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
-                                const metadata = video_yolo.VideoMetadata{
-                                    .time_base = stream.?.*.time_base,
-                                    .fps = if (stream.?.*.avg_frame_rate.den > 0) 
-                                        @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
-                                        else 30.0,
-                                    .stream_idx = stream_idx,
-                                };
-                                app.metadata_cache.put(try app.allocator.dupe(u8, upload_name), metadata) catch {};
+                app.processing_mutex.lock();
+                defer app.processing_mutex.unlock();
+
+                // Re-check after acquiring lock
+                std.fs.cwd().access(segment_path, .{}) catch {
+                    const upload_path = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{uploads_dir, upload_name});
+                    
+                    if (!app.metadata_cache.contains(upload_name)) {
+                        const upload_path_z = try res.arena.dupeZ(u8, upload_path);
+                        var fmt_ctx: ?*c.AVFormatContext = null;
+                        if (c.avformat_open_input(&fmt_ctx, upload_path_z.ptr, null, null) >= 0) {
+                            defer c.avformat_close_input(&fmt_ctx);
+                            fmt_ctx.?.*.probesize = 500000;
+                            fmt_ctx.?.*.max_analyze_duration = 1000000;
+                            if (c.avformat_find_stream_info(fmt_ctx, null) >= 0) {
+                                const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
+                                if (stream_idx >= 0) {
+                                    const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
+                                    const metadata = video_yolo.VideoMetadata{
+                                        .time_base = stream.?.*.time_base,
+                                        .fps = if (stream.?.*.avg_frame_rate.den > 0) 
+                                            @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
+                                            else 30.0,
+                                        .stream_idx = stream_idx,
+                                    };
+                                    app.metadata_cache.put(try app.allocator.dupe(u8, upload_name), metadata) catch {};
+                                }
                             }
                         }
                     }
-                }
 
-                const tmp_path = try std.fmt.allocPrint(res.arena, "{s}.tmp", .{segment_path});
-                
-                const shared = if (app.detector) |d| video_yolo.SharedInferenceResources{
-                    .api = d.api,
-                    .env = d.env.?,
-                    .session = d.session.?,
-                    .hw_device_ctx = app.hw_device_ctx,
-                    .input_tensor_d = app.cuda_input,
-                    .output_boxes_d = app.cuda_boxes,
-                    .output_logits_d = app.cuda_logits,
-                    .preprocess_stream = app.preprocess_stream,
-                    .inference_stream = app.inference_stream,
-                } else null;
+                    const tmp_path = try std.fmt.allocPrint(res.arena, "{s}.tmp", .{segment_path});
+                    
+                    const shared = if (app.detector) |d| video_yolo.SharedInferenceResources{
+                        .api = d.api,
+                        .env = d.env.?,
+                        .session = d.session.?,
+                        .hw_device_ctx = app.hw_device_ctx,
+                        .input_tensor_d = app.cuda_input,
+                        .output_boxes_d = app.cuda_boxes,
+                        .output_logits_d = app.cuda_logits,
+                        .preprocess_stream = app.preprocess_stream,
+                        .inference_stream = app.inference_stream,
+                    } else null;
 
-                const metadata = app.metadata_cache.get(upload_name);
-                
-                if (!app.decoder_cache.contains(upload_name)) {
-                    app.decoder_cache.put(try app.allocator.dupe(u8, upload_name), .{}) catch {};
-                }
-                const persistent = app.decoder_cache.getPtr(upload_name);
+                    const metadata = app.metadata_cache.get(upload_name);
+                    
+                    if (!app.decoder_cache.contains(upload_name)) {
+                        app.decoder_cache.put(try app.allocator.dupe(u8, upload_name), .{}) catch {};
+                    }
+                    const persistent = app.decoder_cache.getPtr(upload_name);
 
-                video_yolo.inferVideoToJsonl(app.allocator, upload_path, tmp_path, .{
-                    .start_s = start,
-                    .duration_s = end - start,
-                }, shared, metadata, persistent) catch |err| {
-                    std.log.err("segment inference failed: {}", .{err});
-                    res.status = 500;
-                    res.body = "inference failed";
-                    return;
+                    video_yolo.inferVideoToJsonl(app.allocator, upload_path, tmp_path, .{
+                        .start_s = start,
+                        .duration_s = end - start,
+                    }, shared, metadata, persistent) catch |err| {
+                        std.log.err("segment inference failed: {}", .{err});
+                        res.status = 500;
+                        res.body = "inference failed";
+                        return;
+                    };
+                    try std.fs.cwd().rename(tmp_path, segment_path);
                 };
-                try std.fs.cwd().rename(tmp_path, segment_path);
             }
             
             res.header("Content-Type", "application/json");
