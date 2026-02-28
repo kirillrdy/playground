@@ -65,25 +65,55 @@ async function attachVideoOverlay(video, canvas, detectionsUrl) {
   activeCanvas = canvas;
   activeCtx = canvas.getContext("2d");
 
-  const raw = await fetch(detectionsUrl).then((r) => r.text());
-  const bytes = new TextEncoder().encode(raw);
-
   wasm.clearDetections();
-  const ptr = writeBytesToWasm(bytes);
-  const ok = wasm.loadDetections(ptr, bytes.length);
-  wasm.free(ptr, bytes.length);
-  if (!ok) {
-    console.warn("failed to parse detections in wasm");
+
+  const loadedSegments = new Set();
+  const fetchingSegments = new Set();
+  const SEGMENT_DURATION = 2.0;
+
+  async function fetchSegment(startTime) {
+    const segmentId = Math.floor(startTime / SEGMENT_DURATION);
+    if (loadedSegments.has(segmentId) || fetchingSegments.has(segmentId)) return;
+
+    fetchingSegments.add(segmentId);
+    try {
+      const start = segmentId * SEGMENT_DURATION;
+      const end = start + SEGMENT_DURATION;
+      const url = `${detectionsUrl}?start=${start.toFixed(2)}&end=${end.toFixed(2)}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`failed to fetch segment ${segmentId}`);
+      
+      const raw = await response.text();
+      const bytes = new TextEncoder().encode(raw);
+      const ptr = writeBytesToWasm(bytes);
+      wasm.loadDetections(ptr, bytes.length);
+      wasm.free(ptr, bytes.length);
+      
+      loadedSegments.add(segmentId);
+    } catch (err) {
+      console.warn("failed to fetch detections segment:", err);
+    } finally {
+      fetchingSegments.delete(segmentId);
+    }
   }
 
   const draw = () => {
     fitCanvasToVideo(video, canvas);
-    wasm.renderAt(video.currentTime * 1000, video.duration * 1000, canvas.width, canvas.height);
+    const currentTime = video.currentTime;
+    
+    // Fetch current and next segment
+    fetchSegment(currentTime);
+    fetchSegment(currentTime + SEGMENT_DURATION);
+
+    wasm.renderAt(currentTime * 1000, video.duration * 1000, canvas.width, canvas.height);
   };
 
   video.addEventListener("loadedmetadata", draw);
   video.addEventListener("timeupdate", draw);
-  video.addEventListener("seeked", draw);
+  video.addEventListener("seeked", () => {
+    // On seek, we might want to clear or just let it fetch new segments
+    draw();
+  });
   video.addEventListener("play", draw);
   video.addEventListener("pause", draw);
   window.addEventListener("resize", draw);

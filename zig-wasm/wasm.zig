@@ -24,11 +24,13 @@ const Detection = struct {
 
 const Frame = struct {
     frame: usize,
+    time: f64,
     detections: []Detection,
 };
 
 const ParsedFrame = struct {
     frame: usize,
+    time: f64,
     detections: []Detection,
 };
 
@@ -54,8 +56,7 @@ fn className(class_id: i32) []const u8 {
 
 fn freeFrames() void {
     for (frames.items) |f| allocator.free(f.detections);
-    frames.deinit(allocator);
-    frames = .empty;
+    frames.clearAndFree(allocator);
 }
 
 export fn alloc(len: usize) ?[*]u8 {
@@ -72,14 +73,6 @@ export fn clearDetections() void {
 }
 
 export fn loadDetections(ptr: [*]const u8, len: usize) bool {
-    freeFrames();
-
-    var parsed_frames: std.ArrayList(Frame) = .empty;
-    errdefer {
-        for (parsed_frames.items) |f| allocator.free(f.detections);
-        parsed_frames.deinit(allocator);
-    }
-
     const raw = ptr[0..len];
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line_raw| {
@@ -89,16 +82,33 @@ export fn loadDetections(ptr: [*]const u8, len: usize) bool {
         var parsed = std.json.parseFromSlice(ParsedFrame, allocator, line, .{}) catch return false;
         defer parsed.deinit();
 
+        // Check if we already have this time to avoid duplicates
+        var exists = false;
+        for (frames.items) |f| {
+            if (@abs(f.time - parsed.value.time) < 0.001) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) continue;
+
         const dets = allocator.alloc(Detection, parsed.value.detections.len) catch return false;
         @memcpy(dets, parsed.value.detections);
 
-        parsed_frames.append(allocator, .{
+        frames.append(allocator, .{
             .frame = parsed.value.frame,
+            .time = parsed.value.time,
             .detections = dets,
         }) catch return false;
     }
 
-    frames = parsed_frames;
+    // Keep frames sorted by time
+    std.sort.pdq(Frame, frames.items, {}, struct {
+        fn lessThan(_: void, a: Frame, b: Frame) bool {
+            return a.time < b.time;
+        }
+    }.lessThan);
+
     return true;
 }
 
@@ -106,22 +116,35 @@ export fn renderAt(current_time_ms: f64, duration_ms: f64, width: f64, height: f
     jsCanvasClear();
     if (frames.items.len == 0 or duration_ms <= 0 or width <= 0 or height <= 0) return;
 
-    const duration_s = duration_ms / 1000.0;
     const current_s = current_time_ms / 1000.0;
-    const fps = @as(f64, @floatFromInt(frames.items.len)) / duration_s;
-    var frame_idx = @as(usize, @intFromFloat(@floor(current_s * fps)));
-    if (frame_idx >= frames.items.len) frame_idx = frames.items.len - 1;
+    
+    // Find the frame closest to current_s
+    var best_frame: ?Frame = null;
+    var min_diff: f64 = 1e18;
 
-    const frame = frames.items[frame_idx];
-    _ = frame.frame;
-    for (frame.detections) |det| {
-        const x = @as(f64, det.x1) * width;
-        const y = @as(f64, det.y1) * height;
-        const w = (@as(f64, det.x2) - @as(f64, det.x1)) * width;
-        const h = (@as(f64, det.y2) - @as(f64, det.y1)) * height;
-        if (w <= 0 or h <= 0) continue;
-        const label = className(det.class_id);
-        jsCanvasDraw(x, y, w, h, label.ptr, label.len, det.score);
+    for (frames.items) |f| {
+        const diff = @abs(f.time - current_s);
+        if (diff < min_diff) {
+            min_diff = diff;
+            best_frame = f;
+        }
+        // Since it's sorted, we can stop if it starts getting further away
+        if (f.time > current_s and diff > min_diff) break;
+    }
+
+    if (best_frame) |frame| {
+        // Only render if we are reasonably close (e.g. within 166ms)
+        if (min_diff > 0.166) return;
+
+        for (frame.detections) |det| {
+            const x = @as(f64, det.x1) * width;
+            const y = @as(f64, det.y1) * height;
+            const w = (@as(f64, det.x2) - @as(f64, det.x1)) * width;
+            const h = (@as(f64, det.y2) - @as(f64, det.y1)) * height;
+            if (w <= 0 or h <= 0) continue;
+            const label = className(det.class_id);
+            jsCanvasDraw(x, y, w, h, label.ptr, label.len, det.score);
+        }
     }
 }
 

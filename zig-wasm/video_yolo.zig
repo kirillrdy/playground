@@ -36,6 +36,11 @@ const inference_workers: usize = 1;
 const conf_threshold: f32 = 0.25;
 const max_detections_per_frame: usize = 32;
 
+pub const InferOptions = struct {
+    start_s: f64 = 0,
+    duration_s: f64 = 0,
+};
+
 const FrameQueue = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
@@ -144,6 +149,7 @@ const DecoderCtx = struct {
     queue: *FrameQueue,
     wg: *std.Thread.WaitGroup,
     video_path_z: [:0]const u8,
+    options: InferOptions,
 };
 
 const Metrics = struct {
@@ -168,6 +174,8 @@ const InferenceWorkerCtx = struct {
     metrics: *Metrics,
     detections_file: ?*std.fs.File,
     detections_mutex: ?*std.Thread.Mutex,
+    time_base: c.AVRational,
+    fps: f64,
 };
 
 fn clamp01(v: f32) f32 {
@@ -217,7 +225,7 @@ fn normalizeBox(x1_in: f32, y1_in: f32, x2_in: f32, y2_in: f32) struct { x1: f32
     };
 }
 
-fn writeFrameDetections(ctx: *InferenceWorkerCtx, frame_index: usize, boxes: []const f32, logits: []const f32) !void {
+fn writeFrameDetections(ctx: *InferenceWorkerCtx, frame_index: usize, frame_time: f64, boxes: []const f32, logits: []const f32) !void {
     if (ctx.detections_file == null or ctx.detections_mutex == null) return;
     const file = ctx.detections_file.?;
     const mutex = ctx.detections_mutex.?;
@@ -228,7 +236,7 @@ fn writeFrameDetections(ctx: *InferenceWorkerCtx, frame_index: usize, boxes: []c
     mutex.lock();
     defer mutex.unlock();
 
-    try writer.print("{{\"frame\":{d},\"detections\":[", .{frame_index});
+    try writer.print("{{\"frame\":{d},\"time\":{d:.4},\"detections\":[", .{frame_index, frame_time});
     var written: usize = 0;
     for (0..300) |box_idx| {
         var best_class: usize = 0;
@@ -317,6 +325,13 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
     codec_ctx.?.*.hw_device_ctx = c.av_buffer_ref(hw_device_ctx);
     codec_ctx.?.*.get_format = get_format;
     try avCheck(c.avcodec_open2(codec_ctx, decoder, null));
+
+    if (ctx.options.start_s > 0) {
+        const time_base = stream.?.*.time_base;
+        const ts = @as(i64, @intFromFloat(ctx.options.start_s * @as(f64, @floatFromInt(time_base.den)) / @as(f64, @floatFromInt(time_base.num))));
+        try avCheck(c.avformat_seek_file(fmt_ctx, stream_idx, std.math.minInt(i64), ts, ts, c.AVSEEK_FLAG_BACKWARD));
+        c.avcodec_flush_buffers(codec_ctx);
+    }
 
     // Filter graph is initialized lazily from the first decoded frame so
     // pix_fmt / hw_frames_ctx match the actual decoder output.
@@ -415,6 +430,20 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 const filt_ret = c.av_buffersink_get_frame(buffersink_ctx, filt_frame);
                 if (filt_ret == c.AVERROR(c.EAGAIN) or filt_ret == c.AVERROR_EOF) break;
                 try avCheck(filt_ret);
+
+                const time_base = stream.?.*.time_base;
+                const frame_time = @as(f64, @floatFromInt(filt_frame.?.*.pts)) * @as(f64, @floatFromInt(time_base.num)) / @as(f64, @floatFromInt(time_base.den));
+
+                if (ctx.options.duration_s > 0 and frame_time >= ctx.options.start_s + ctx.options.duration_s) {
+                    done = true;
+                    c.av_frame_unref(filt_frame);
+                    break;
+                }
+
+                if (frame_time < ctx.options.start_s) {
+                    c.av_frame_unref(filt_frame);
+                    continue;
+                }
 
                 const slot_idx = ctx.queue.acquireWriteSlot();
                 const owned_frame = c.av_frame_clone(filt_frame) orelse {
@@ -569,7 +598,6 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
     defer std.heap.c_allocator.free(host_boxes);
     const host_logits = try std.heap.c_allocator.alloc(f32, 300 * 80);
     defer std.heap.c_allocator.free(host_logits);
-    var frame_index: usize = 0;
 
     while (true) {
         const wait_start_ns = std.time.nanoTimestamp();
@@ -586,6 +614,9 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
         }
         if (frame.*.data[0] == null or frame.*.data[1] == null) return error.InvalidFrameData;
         if (frame.*.width <= 0 or frame.*.height <= 0) return error.InvalidFrameData;
+
+        const frame_time = @as(f64, @floatFromInt(frame.*.pts)) * @as(f64, @floatFromInt(ctx.time_base.num)) / @as(f64, @floatFromInt(ctx.time_base.den));
+        const frame_index = @as(usize, @intFromFloat(@floor(frame_time * ctx.fps + 0.5)));
 
         launch_nv12_resize_to_rgb_nchw(
             frame.*.data[0],
@@ -618,8 +649,7 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
             c.cudaMemcpyDeviceToHost,
         ) != c.cudaSuccess) return error.CudaMemcpyFailed;
         const end_ns = std.time.nanoTimestamp();
-        frame_index += 1;
-        try writeFrameDetections(ctx, frame_index, host_boxes, host_logits);
+        try writeFrameDetections(ctx, frame_index, frame_time, host_boxes, host_logits);
         ctx.metrics.add(1, end_ns - start_ns, queue_wait_delta_ns);
     }
 }
@@ -630,7 +660,7 @@ fn inferenceWorkerMain(ctx: *InferenceWorkerCtx) void {
     };
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8) !void {
+fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions) !void {
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
     var queue = try FrameQueue.init(allocator, queue_capacity, &wg);
@@ -638,6 +668,20 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
 
     const video_path_z = try allocator.dupeZ(u8, video_path);
     defer allocator.free(video_path_z);
+
+    // We need stream metadata before starting workers. 
+    // Let's open the file briefly to get time_base and fps.
+    var fmt_ctx: ?*c.AVFormatContext = null;
+    try avCheck(c.avformat_open_input(&fmt_ctx, video_path_z.ptr, null, null));
+    defer c.avformat_close_input(&fmt_ctx);
+    try avCheck(c.avformat_find_stream_info(fmt_ctx, null));
+    const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
+    if (stream_idx < 0) return error.NoVideoStream;
+    const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
+    const time_base = stream.?.*.time_base;
+    const fps = if (stream.?.*.avg_frame_rate.den > 0) 
+        @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
+        else 30.0;
 
     const decoder_ctxs = try allocator.alloc(DecoderCtx, producer_count);
     defer allocator.free(decoder_ctxs);
@@ -651,6 +695,7 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
             .queue = &queue,
             .wg = &wg,
             .video_path_z = video_path_z,
+            .options = options,
         };
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
     }
@@ -679,6 +724,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
             .metrics = &metrics,
             .detections_file = if (detections_file) |*f| f else null,
             .detections_mutex = if (detections_file != null) &detections_mutex else null,
+            .time_base = time_base,
+            .fps = fps,
         };
         worker_threads[i] = try std.Thread.spawn(.{}, inferenceWorkerMain, .{&worker_ctxs[i]});
     }
@@ -712,8 +759,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     });
 }
 
-pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8) !void {
-    try runBenchmark(allocator, video_path, 1, detections_path);
+pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions) !void {
+    try runBenchmark(allocator, video_path, 1, detections_path, options);
 }
 
 pub fn main() !void {
@@ -730,5 +777,5 @@ pub fn main() !void {
     const producer_count = try std.fmt.parseInt(usize, args[2], 10);
     if (producer_count == 0) return error.InvalidArguments;
     const detections_path: ?[]const u8 = if (args.len == 4) args[3] else null;
-    try runBenchmark(allocator, args[1], producer_count, detections_path);
+    try runBenchmark(allocator, args[1], producer_count, detections_path, .{});
 }

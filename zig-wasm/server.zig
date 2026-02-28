@@ -865,7 +865,7 @@ fn ensureVideoDetections(app: *App, stored_upload_name: []const u8) ![]u8 {
         defer app.allocator.free(tmp_rel_path);
         std.fs.cwd().deleteFile(tmp_rel_path) catch {};
 
-        video_yolo.inferVideoToJsonl(app.allocator, upload_rel_path, tmp_rel_path) catch |err| {
+        video_yolo.inferVideoToJsonl(app.allocator, upload_rel_path, tmp_rel_path, .{}) catch |err| {
             std.fs.cwd().deleteFile(tmp_rel_path) catch {};
             return err;
         };
@@ -1092,12 +1092,53 @@ fn processedFileHandler(app: *App, req: *httpz.Request, res: *httpz.Response) !v
         res.body = "invalid file name";
         return;
     }
+
     if (std.ascii.endsWithIgnoreCase(name, ".jsonl")) {
         const upload_name = parseDetectionsSourceName(name) orelse {
             res.status = 400;
             res.body = "invalid detections file name";
             return;
         };
+
+        const q_params = try req.query();
+        const start_param = q_params.get("start");
+        const end_param = q_params.get("end");
+
+        if (start_param != null and end_param != null) {
+            const start = std.fmt.parseFloat(f64, start_param.?) catch 0.0;
+            const end = std.fmt.parseFloat(f64, end_param.?) catch (start + 2.0);
+            
+            const segment_name = try std.fmt.allocPrint(res.arena, "{s}.{d:.2}-{d:.2}.jsonl", .{upload_name, start, end});
+            const segment_path = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{processed_dir, segment_name});
+            
+            var need_gen = false;
+            std.fs.cwd().access(segment_path, .{}) catch { need_gen = true; };
+            
+            if (need_gen) {
+                const upload_path = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{uploads_dir, upload_name});
+                const tmp_path = try std.fmt.allocPrint(res.arena, "{s}.tmp", .{segment_path});
+                
+                video_yolo.inferVideoToJsonl(app.allocator, upload_path, tmp_path, .{
+                    .start_s = start,
+                    .duration_s = end - start,
+                }) catch |err| {
+                    std.log.err("segment inference failed: {}", .{err});
+                    res.status = 500;
+                    res.body = "inference failed";
+                    return;
+                };
+                try std.fs.cwd().rename(tmp_path, segment_path);
+            }
+            
+            res.header("Content-Type", "application/json");
+            res.body = readAssetToArena(res.arena, processed_dir, segment_name) catch |err| {
+                std.log.err("failed to read segment: {}", .{err});
+                res.status = 404;
+                return;
+            };
+            return;
+        }
+
         if (!isSafeAssetName(upload_name)) {
             res.status = 400;
             res.body = "invalid detections file name";
