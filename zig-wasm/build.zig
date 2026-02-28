@@ -15,7 +15,6 @@ pub fn build(b: *std.Build) !void {
     const cudart = nixPkg(b, "cudart", "pkgs.cudaPackages.cuda_cudart");
     const nvcc_pkg = nixPkg(b, "nvcc_pkg", "pkgs.cudaPackages.cuda_nvcc");
 
-    const sqlite3 = b.dependency("sqlite3", .{ .target = target, .optimize = optimize });
     const zigimg = b.dependency("zigimg", .{ .target = target, .optimize = optimize });
     const vy_opts = b.addOptions();
 
@@ -27,7 +26,6 @@ pub fn build(b: *std.Build) !void {
     server_mod.addOptions("config", vy_opts);
     server_mod.addImport("zigimg", zigimg.module("zigimg"));
     server_mod.addImport("httpz", b.dependency("httpz", .{}).module("httpz"));
-    server_mod.addIncludePath(sqlite3.path("."));
     server_mod.addIncludePath(onnx_dev.path(b, "include"));
     server_mod.addIncludePath(ffmpeg_dev.path(b, "include"));
     server_mod.addIncludePath(cuda.path(b, "include"));
@@ -41,7 +39,6 @@ pub fn build(b: *std.Build) !void {
     const server = b.addExecutable(.{ .name = server_name, .root_module = server_mod });
     server.linkLibC();
     server.addObjectFile(preprocess_o);
-    server.linkLibrary(sqlite3.artifact("sqlite3"));
     server.addLibraryPath(onnx_lib.path(b, "lib"));
     server.addLibraryPath(ffmpeg_lib.path(b, "lib"));
     server.addLibraryPath(cudart.path(b, "lib"));
@@ -97,7 +94,6 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         }),
     });
-    dev_server.linkLibrary(sqlite3.artifact("sqlite3"));
     b.installArtifact(dev_server);
 
     // Model presets
@@ -122,8 +118,6 @@ pub fn build(b: *std.Build) !void {
     run_vy.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_vy.addArgs(args);
     b.step("run-video", "Run video_yolo").dependOn(&run_vy.step);
-
-    b.step("db", "Run sqlite3 shell").dependOn(&b.addRunArtifact(sqlite3.artifact("shell")).step);
 
     const test_step = b.step("test", "Run tests");
     const tests = [_][]const u8{ "yolo.zig", "image_preprocess.zig", "image_decode.zig" };
