@@ -335,6 +335,121 @@ test "tolower" {
     _ = lowerString("somethingverylong");
     try std.testing.expectEqualStrings("kirill", &output);
 }
+
+test "http handlers smoke" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    errdefer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var repo = try Repo.init(allocator);
+    defer repo.deinit();
+    try schemaPlusSeeds(&repo);
+
+    const test_upload_name = "__test_handler_file.txt";
+    const upload_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ uploads_dir, test_upload_name });
+    defer allocator.free(upload_path);
+    {
+        var f = try std.fs.cwd().createFile(upload_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("0123456789");
+    }
+    defer std.fs.cwd().deleteFile(upload_path) catch {};
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        const handler = makeHandlerWithOptions("Files/index", .{ .default_template = false });
+        try handler(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+        const body = try ht.getBody();
+        try std.testing.expect(std.mem.indexOf(u8, body, test_upload_name) != null);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        const handler = makeHandler("Files/new");
+        try handler(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("id", test_upload_name);
+        try Files.show(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+        const body = try ht.getBody();
+        try std.testing.expect(std.mem.indexOf(u8, body, "No stored detections for this file.") != null);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("name", test_upload_name);
+        try uploadFileHandler(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+        try ht.expectBody("0123456789");
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("name", test_upload_name);
+        ht.header("Range", "bytes=2-5");
+        try uploadFileHandler(&repo, ht.req, ht.res);
+        try ht.expectStatus(206);
+        try ht.expectBody("2345");
+        try ht.expectHeader("Content-Range", "bytes 2-5/10");
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("name", "__missing__.jsonl");
+        try processedFileHandler(&repo, ht.req, ht.res);
+        try ht.expectStatus(404);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        const handler = makeHandler("handlers/home");
+        try handler(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        const handler = makeHandler("handlers/wasm");
+        try handler(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        try wasmJsFile(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        try faviconHandler(&repo, ht.req, ht.res);
+        try ht.expectStatus(200);
+    }
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        try Files.create(&repo, ht.req, ht.res);
+        try ht.expectStatus(400);
+    }
+
+    try std.testing.expect(gpa.deinit() == .ok);
+}
 const Repo = struct {
     allocator: Allocator,
     db: *c.sqlite3,
