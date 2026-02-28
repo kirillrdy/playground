@@ -133,14 +133,14 @@ const FrameQueue = struct {
 };
 
 const Profiler = struct {
-    open_ns: i128 = 0,
-    find_stream_ns: i128 = 0,
-    seek_ns: i128 = 0,
-    first_frame_ns: i128 = 0,
-    decode_total_ns: i128 = 0,
-    filter_init_ns: i128 = 0,
+    open_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    find_stream_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    seek_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    first_frame_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    decode_total_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    filter_init_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
-    fn report(self: *const Profiler, wall_ns: i128) void {
+    fn report(self: *Profiler, wall_ns: i128) void {
         const to_s = 1e9;
         std.debug.print(
             \\--- Profiler Report (Wall: {d:.3}s) ---
@@ -154,12 +154,12 @@ const Profiler = struct {
             \\
         , .{
             @as(f64, @floatFromInt(wall_ns)) / to_s,
-            @as(f64, @floatFromInt(self.open_ns)) / to_s,
-            @as(f64, @floatFromInt(self.find_stream_ns)) / to_s,
-            @as(f64, @floatFromInt(self.seek_ns)) / to_s,
-            @as(f64, @floatFromInt(self.filter_init_ns)) / to_s,
-            @as(f64, @floatFromInt(self.first_frame_ns)) / to_s,
-            @as(f64, @floatFromInt(self.decode_total_ns)) / to_s,
+            @as(f64, @floatFromInt(self.open_ns.load(.monotonic))) / to_s,
+            @as(f64, @floatFromInt(self.find_stream_ns.load(.monotonic))) / to_s,
+            @as(f64, @floatFromInt(self.seek_ns.load(.monotonic))) / to_s,
+            @as(f64, @floatFromInt(self.filter_init_ns.load(.monotonic))) / to_s,
+            @as(f64, @floatFromInt(self.first_frame_ns.load(.monotonic))) / to_s,
+            @as(f64, @floatFromInt(self.decode_total_ns.load(.monotonic))) / to_s,
         });
     }
 };
@@ -171,6 +171,7 @@ const DecoderCtx = struct {
     options: InferOptions,
     shared: ?SharedInferenceResources,
     profiler: *Profiler,
+    persistent: ?*PersistentDecoder = null,
 };
 
 const Metrics = struct {
@@ -323,56 +324,133 @@ fn avCheck(code: c_int) !void {
 }
 
 fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
+    const total_start = std.time.nanoTimestamp();
+    
     var fmt_ctx: ?*c.AVFormatContext = null;
-    try avCheck(c.avformat_open_input(&fmt_ctx, ctx.video_path_z.ptr, null, null));
-    defer c.avformat_close_input(&fmt_ctx);
-    fmt_ctx.?.*.probesize = 500000;
-    fmt_ctx.?.*.max_analyze_duration = 1000000;
-    try avCheck(c.avformat_find_stream_info(fmt_ctx, null));
-
-    const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
-    if (stream_idx < 0) return error.NoVideoStream;
-    const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
-    const codecpar = stream.?.*.codecpar;
-    const decoder = c.avcodec_find_decoder(codecpar.?.*.codec_id) orelse return error.UnsupportedCodec;
-
-    // HW Context
-    var hw_device_ctx: ?*c.AVBufferRef = null;
-    try avCheck(c.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_CUDA, null, null, 0));
-    defer c.av_buffer_unref(&hw_device_ctx);
-
-    var codec_ctx = c.avcodec_alloc_context3(decoder);
-    if (codec_ctx == null) return error.OutOfMemory;
-    defer c.avcodec_free_context(&codec_ctx);
-
-    try avCheck(c.avcodec_parameters_to_context(codec_ctx, codecpar));
-
-    const hw_ctx = if (ctx.shared) |s| if (s.hw_device_ctx) |h| h else null else null;
-    if (hw_ctx) |h| {
-        codec_ctx.?.*.hw_device_ctx = c.av_buffer_ref(h);
-    } else {
-        var new_hw: ?*c.AVBufferRef = null;
-        try avCheck(c.av_hwdevice_ctx_create(&new_hw, c.AV_HWDEVICE_TYPE_CUDA, null, null, 0));
-        codec_ctx.?.*.hw_device_ctx = new_hw;
-    }
-    defer if (hw_ctx == null) c.av_buffer_unref(&codec_ctx.?.*.hw_device_ctx);
-
-    codec_ctx.?.*.get_format = get_format;
-    try avCheck(c.avcodec_open2(codec_ctx, decoder, null));
-
-    if (ctx.options.start_s > 0) {
-        const time_base = stream.?.*.time_base;
-        const ts = @as(i64, @intFromFloat(ctx.options.start_s * @as(f64, @floatFromInt(time_base.den)) / @as(f64, @floatFromInt(time_base.num))));
-        try avCheck(c.avformat_seek_file(fmt_ctx, stream_idx, std.math.minInt(i64), ts, ts, c.AVSEEK_FLAG_BACKWARD));
-        c.avcodec_flush_buffers(codec_ctx);
-    }
-
-    // Filter graph is initialized lazily from the first decoded frame so
-    // pix_fmt / hw_frames_ctx match the actual decoder output.
+    var codec_ctx: ?*c.AVCodecContext = null;
     var filter_graph: ?*c.AVFilterGraph = null;
-    defer if (filter_graph != null) c.avfilter_graph_free(&filter_graph);
     var buffer_ctx: ?*c.AVFilterContext = null;
     var buffersink_ctx: ?*c.AVFilterContext = null;
+    var stream_idx: i32 = -1;
+
+    const is_warm = if (ctx.persistent) |p| p.fmt_ctx != null else false;
+
+    if (is_warm) {
+        const p = ctx.persistent.?;
+        fmt_ctx = p.fmt_ctx;
+        codec_ctx = p.codec_ctx;
+        filter_graph = p.filter_graph;
+        buffer_ctx = p.buffer_ctx;
+        buffersink_ctx = p.buffersink_ctx;
+        stream_idx = p.stream_idx;
+    } else {
+        const open_start = std.time.nanoTimestamp();
+        try avCheck(c.avformat_open_input(&fmt_ctx, ctx.video_path_z.ptr, null, null));
+        ctx.profiler.open_ns.store(@intCast(std.time.nanoTimestamp() - open_start), .monotonic);
+
+        fmt_ctx.?.*.probesize = 500000;
+        fmt_ctx.?.*.max_analyze_duration = 1000000;
+        const find_start = std.time.nanoTimestamp();
+        try avCheck(c.avformat_find_stream_info(fmt_ctx, null));
+        ctx.profiler.find_stream_ns.store(@intCast(std.time.nanoTimestamp() - find_start), .monotonic);
+
+        stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
+        if (stream_idx < 0) return error.NoVideoStream;
+        
+        if (ctx.persistent) |p| {
+            p.fmt_ctx = fmt_ctx;
+            p.stream_idx = stream_idx;
+        }
+    }
+    defer if (ctx.persistent == null) c.avformat_close_input(&fmt_ctx);
+
+    const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
+    const codecpar = stream.?.*.codecpar;
+
+    if (!is_warm) {
+        // Try to find a hardware-accelerated decoder first
+        const hw_decoder_name = switch (codecpar.?.*.codec_id) {
+            c.AV_CODEC_ID_H264 => "h264_cuvid",
+            c.AV_CODEC_ID_HEVC => "hevc_cuvid",
+            c.AV_CODEC_ID_VP9 => "vp9_cuvid",
+            c.AV_CODEC_ID_AV1 => "av1_cuvid",
+            else => null,
+        };
+
+        var decoder: ?*const c.AVCodec = null;
+        if (hw_decoder_name) |name| {
+            decoder = c.avcodec_find_decoder_by_name(name.ptr);
+            if (decoder != null) {
+                std.log.info("using hardware decoder: {s}", .{name});
+            }
+        }
+        
+        if (decoder == null) {
+            decoder = c.avcodec_find_decoder(codecpar.?.*.codec_id);
+            if (decoder != null) {
+                std.log.info("using fallback decoder: {s}", .{std.mem.span(decoder.?.*.name)});
+            }
+        }
+
+        if (decoder == null) return error.UnsupportedCodec;
+
+        codec_ctx = c.avcodec_alloc_context3(decoder);
+        if (codec_ctx == null) return error.OutOfMemory;
+
+        try avCheck(c.avcodec_parameters_to_context(codec_ctx, codecpar));
+
+        const hw_ctx = if (ctx.shared) |s| if (s.hw_device_ctx) |h| h else null else null;
+        if (hw_ctx) |h| {
+            codec_ctx.?.*.hw_device_ctx = c.av_buffer_ref(h);
+        } else {
+            var new_hw: ?*c.AVBufferRef = null;
+            try avCheck(c.av_hwdevice_ctx_create(&new_hw, c.AV_HWDEVICE_TYPE_CUDA, null, null, 0));
+            codec_ctx.?.*.hw_device_ctx = new_hw;
+        }
+
+        codec_ctx.?.*.get_format = get_format;
+        
+        try avCheck(c.avcodec_open2(codec_ctx, decoder, null));
+        
+        if (ctx.persistent) |p| {
+            p.codec_ctx = codec_ctx;
+        }
+    }
+    defer if (ctx.persistent == null) {
+        var mutable_c_ctx: ?*c.AVCodecContext = codec_ctx;
+        c.avcodec_free_context(&mutable_c_ctx);
+    };
+
+    if (ctx.options.start_s > 0 or is_warm) {
+        const time_base = stream.?.*.time_base;
+        const ts = @as(i64, @intFromFloat(ctx.options.start_s * @as(f64, @floatFromInt(time_base.den)) / @as(f64, @floatFromInt(time_base.num))));
+        
+        var need_seek = true;
+        if (ctx.persistent) |p| {
+            if (p.current_pts >= 0 and ts >= p.current_pts and ts - p.current_pts < 5 * @divTrunc(time_base.den, time_base.num)) {
+                if (p.current_pts == ts) need_seek = false;
+            }
+        }
+
+        if (need_seek) {
+            const seek_start = std.time.nanoTimestamp();
+            try avCheck(c.avformat_seek_file(fmt_ctx, stream_idx, std.math.minInt(i64), ts, ts, c.AVSEEK_FLAG_BACKWARD));
+            c.avcodec_flush_buffers(codec_ctx);
+            if (filter_graph != null) {
+                if (ctx.persistent) |p| {
+                    var graph: ?*c.AVFilterGraph = p.filter_graph;
+                    c.avfilter_graph_free(&graph);
+                    p.filter_graph = null;
+                    filter_graph = null;
+                } else {
+                    c.avfilter_graph_free(&filter_graph);
+                    filter_graph = null;
+                }
+            }
+            ctx.profiler.seek_ns.store(@intCast(std.time.nanoTimestamp() - seek_start), .monotonic);
+        }
+    }
+
 
     var frame = c.av_frame_alloc();
     defer c.av_frame_free(&frame);
@@ -381,6 +459,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
     var packet = c.av_packet_alloc();
     defer c.av_packet_free(&packet);
     var done = false;
+    var first_frame = true;
     while (!done) {
         const read_ret = c.av_read_frame(fmt_ctx, packet);
         if (read_ret < 0) {
@@ -397,16 +476,13 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
             const recv_ret = c.avcodec_receive_frame(codec_ctx, frame);
             if (recv_ret == c.AVERROR(c.EAGAIN)) break;
             if (recv_ret == c.AVERROR_EOF) {
-                // Flush filter
-                if (buffer_ctx != null and c.av_buffersrc_add_frame_flags(buffer_ctx, null, 0) >= 0) {
-                    // Could pull remaining frames here if loop continued
-                }
                 done = true;
                 break;
             }
             try avCheck(recv_ret);
 
             if (filter_graph == null) {
+                const filt_start = std.time.nanoTimestamp();
                 filter_graph = c.avfilter_graph_alloc();
                 if (filter_graph == null) return error.OutOfMemory;
 
@@ -428,7 +504,8 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
 
                 try avCheck(c.avfilter_graph_create_filter(&buffer_ctx, buffer_filter, "in", args.ptr, null, filter_graph));
                 try avCheck(c.avfilter_graph_create_filter(&buffersink_ctx, buffersink_filter, "out", null, null, filter_graph));
-                buffer_ctx.?.*.hw_device_ctx = c.av_buffer_ref(hw_device_ctx);
+                
+                buffer_ctx.?.*.hw_device_ctx = c.av_buffer_ref(codec_ctx.?.*.hw_device_ctx);
                 if (frame.?.*.hw_frames_ctx != null) {
                     const src_params = c.av_buffersrc_parameters_alloc() orelse return error.OutOfMemory;
                     defer c.av_free(src_params);
@@ -451,11 +528,18 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 inputs.?.*.pad_idx = 0;
                 inputs.?.*.next = null;
 
-                const hw_filter_spec = "scale_cuda=format=nv12";
-                const sw_filter_spec = "format=nv12,hwupload_cuda,scale_cuda=format=nv12";
+                const hw_filter_spec = "scale_cuda=640:640:format=nv12";
+                const sw_filter_spec = "format=nv12,hwupload_cuda,scale_cuda=640:640:format=nv12";
                 const filter_spec = if (frame.?.*.hw_frames_ctx != null) hw_filter_spec else sw_filter_spec;
                 try avCheck(c.avfilter_graph_parse_ptr(filter_graph, filter_spec, &inputs, &outputs, null));
                 try avCheck(c.avfilter_graph_config(filter_graph, null));
+                ctx.profiler.filter_init_ns.store(@intCast(std.time.nanoTimestamp() - filt_start), .monotonic);
+                
+                if (ctx.persistent) |p| {
+                    p.filter_graph = filter_graph.?;
+                    p.buffer_ctx = buffer_ctx.?;
+                    p.buffersink_ctx = buffersink_ctx.?;
+                }
             }
 
             try avCheck(c.av_buffersrc_add_frame_flags(buffer_ctx, frame, c.AV_BUFFERSRC_FLAG_KEEP_REF));
@@ -466,8 +550,15 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 if (filt_ret == c.AVERROR(c.EAGAIN) or filt_ret == c.AVERROR_EOF) break;
                 try avCheck(filt_ret);
 
+                if (first_frame) {
+                    ctx.profiler.first_frame_ns.store(@intCast(std.time.nanoTimestamp() - total_start), .monotonic);
+                    first_frame = false;
+                }
+
                 const time_base = stream.?.*.time_base;
-                const frame_time = @as(f64, @floatFromInt(filt_frame.?.*.pts)) * @as(f64, @floatFromInt(time_base.num)) / @as(f64, @floatFromInt(time_base.den));
+                const frame_time = @as(f64, @floatFromInt(filt_frame.*.pts)) * @as(f64, @floatFromInt(time_base.num)) / @as(f64, @floatFromInt(time_base.den));
+
+                if (ctx.persistent) |p| p.current_pts = filt_frame.*.pts;
 
                 if (ctx.options.duration_s > 0 and frame_time >= ctx.options.start_s + ctx.options.duration_s) {
                     done = true;
@@ -491,6 +582,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
             }
         }
     }
+    ctx.profiler.decode_total_ns.store(@intCast(std.time.nanoTimestamp() - total_start), .monotonic);
 }
 
 fn decoderThreadMain(ctx: *DecoderCtx) void {
@@ -732,13 +824,39 @@ pub const SharedInferenceResources = struct {
     inference_stream: c.cudaStream_t,
 };
 
+pub const PersistentDecoder = struct {
+    fmt_ctx: ?*c.AVFormatContext = null,
+    codec_ctx: ?*c.AVCodecContext = null,
+    filter_graph: ?*c.AVFilterGraph = null,
+    buffer_ctx: ?*c.AVFilterContext = null,
+    buffersink_ctx: ?*c.AVFilterContext = null,
+    stream_idx: i32 = -1,
+    current_pts: i64 = -1,
+
+    pub fn deinit(self: *PersistentDecoder) void {
+        if (self.fmt_ctx) |f| {
+            var f_ptr: ?*c.AVFormatContext = f;
+            c.avformat_close_input(&f_ptr);
+        }
+        if (self.codec_ctx) |cc| {
+            var cc_ptr: ?*c.AVCodecContext = cc;
+            c.avcodec_free_context(&cc_ptr);
+        }
+        if (self.filter_graph) |fg| {
+            var fg_ptr: ?*c.AVFilterGraph = fg;
+            c.avfilter_graph_free(&fg_ptr);
+        }
+        self.* = .{};
+    }
+};
+
 pub const VideoMetadata = struct {
     time_base: c.AVRational,
     fps: f64,
     stream_idx: i32,
 };
 
-fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata_opt: ?VideoMetadata) !void {
+fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata_opt: ?VideoMetadata, persistent: ?*PersistentDecoder) !void {
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
     var queue = try FrameQueue.init(allocator, queue_capacity, &wg);
@@ -794,6 +912,7 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
             .options = options,
             .shared = shared,
             .profiler = &profiler,
+            .persistent = persistent,
         };
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
     }
@@ -855,8 +974,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     });
 }
 
-pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata: ?VideoMetadata) !void {
-    try runBenchmark(allocator, video_path, 1, detections_path, options, shared, metadata);
+pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata: ?VideoMetadata, persistent: ?*PersistentDecoder) !void {
+    try runBenchmark(allocator, video_path, 1, detections_path, options, shared, metadata, persistent);
 }
 
 pub fn main() !void {
@@ -873,5 +992,5 @@ pub fn main() !void {
     const producer_count = try std.fmt.parseInt(usize, args[2], 10);
     if (producer_count == 0) return error.InvalidArguments;
     const detections_path: ?[]const u8 = if (args.len == 4) args[3] else null;
-    try runBenchmark(allocator, args[1], producer_count, detections_path, .{}, null, null);
+    try runBenchmark(allocator, args[1], producer_count, detections_path, .{}, null, null, null);
 }

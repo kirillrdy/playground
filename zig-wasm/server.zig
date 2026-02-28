@@ -32,6 +32,17 @@ const App = struct {
     allocator: Allocator,
     detector: ?onnxruntime.Runtime,
     processing_mutex: std.Thread.Mutex,
+    hw_device_ctx: ?*c.AVBufferRef,
+    
+    // Shared CUDA resources
+    cuda_input: [*]f32,
+    cuda_boxes: [*]f32,
+    cuda_logits: [*]f32,
+    preprocess_stream: c.cudaStream_t,
+    inference_stream: c.cudaStream_t,
+
+    metadata_cache: std.StringHashMap(video_yolo.VideoMetadata),
+    decoder_cache: std.StringHashMap(video_yolo.PersistentDecoder),
 
     fn init(allocator: Allocator) !App {
         std.fs.cwd().makePath(uploads_dir) catch |err| switch (err) {
@@ -56,15 +67,60 @@ const App = struct {
             std.log.err("failed to initialize onnxruntime session with default model path {s}: {}", .{ model_path, err });
         }
 
+        var hw_device_ctx: ?*c.AVBufferRef = null;
+        if (c.av_hwdevice_ctx_create(&hw_device_ctx, c.AV_HWDEVICE_TYPE_CUDA, null, null, 0) < 0) {
+            std.log.err("failed to initialize FFmpeg CUDA hwdevice context", .{});
+        }
+
+        var cuda_input: ?*anyopaque = null;
+        if (c.cudaMalloc(&cuda_input, 1 * 3 * 640 * 640 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+        var cuda_boxes: ?*anyopaque = null;
+        if (c.cudaMalloc(&cuda_boxes, 300 * 4 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+        var cuda_logits: ?*anyopaque = null;
+        if (c.cudaMalloc(&cuda_logits, 300 * 80 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+
+        var preprocess_stream: c.cudaStream_t = null;
+        if (c.cudaStreamCreate(&preprocess_stream) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+        var inference_stream: c.cudaStream_t = null;
+        if (c.cudaStreamCreate(&inference_stream) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+
         return .{
             .allocator = allocator,
             .detector = detector,
             .processing_mutex = .{},
+            .hw_device_ctx = hw_device_ctx,
+            .cuda_input = @ptrCast(@alignCast(cuda_input)),
+            .cuda_boxes = @ptrCast(@alignCast(cuda_boxes)),
+            .cuda_logits = @ptrCast(@alignCast(cuda_logits)),
+            .preprocess_stream = preprocess_stream.?,
+            .inference_stream = inference_stream.?,
+            .metadata_cache = std.StringHashMap(video_yolo.VideoMetadata).init(allocator),
+            .decoder_cache = std.StringHashMap(video_yolo.PersistentDecoder).init(allocator),
         };
     }
 
     fn deinit(self: *App) void {
         if (self.detector) |*detector| detector.deinit();
+        if (self.hw_device_ctx) |ctx| {
+            var mutable_ctx: ?*c.AVBufferRef = ctx;
+            c.av_buffer_unref(&mutable_ctx);
+        }
+        _ = c.cudaFree(self.cuda_input);
+        _ = c.cudaFree(self.cuda_boxes);
+        _ = c.cudaFree(self.cuda_logits);
+        _ = c.cudaStreamDestroy(self.preprocess_stream);
+        _ = c.cudaStreamDestroy(self.inference_stream);
+        
+        var meta_it = self.metadata_cache.iterator();
+        while (meta_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.metadata_cache.deinit();
+
+        var dec_it = self.decoder_cache.iterator();
+        while (dec_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.decoder_cache.deinit();
     }
 };
 
@@ -861,6 +917,31 @@ fn ensureVideoDetections(app: *App, stored_upload_name: []const u8) ![]u8 {
         const upload_rel_path = try std.fmt.allocPrint(app.allocator, "{s}/{s}", .{ uploads_dir, stored_upload_name });
         defer app.allocator.free(upload_rel_path);
 
+        if (!app.metadata_cache.contains(stored_upload_name)) {
+            const upload_path_z = try app.allocator.dupeZ(u8, upload_rel_path);
+            defer app.allocator.free(upload_path_z);
+            var fmt_ctx: ?*c.AVFormatContext = null;
+            if (c.avformat_open_input(&fmt_ctx, upload_path_z.ptr, null, null) >= 0) {
+                defer c.avformat_close_input(&fmt_ctx);
+                fmt_ctx.?.*.probesize = 500000;
+                fmt_ctx.?.*.max_analyze_duration = 1000000;
+                if (c.avformat_find_stream_info(fmt_ctx, null) >= 0) {
+                    const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
+                    if (stream_idx >= 0) {
+                        const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
+                        const metadata = video_yolo.VideoMetadata{
+                            .time_base = stream.?.*.time_base,
+                            .fps = if (stream.?.*.avg_frame_rate.den > 0) 
+                                @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
+                                else 30.0,
+                            .stream_idx = stream_idx,
+                        };
+                        app.metadata_cache.put(try app.allocator.dupe(u8, stored_upload_name), metadata) catch {};
+                    }
+                }
+            }
+        }
+
         const tmp_rel_path = try std.fmt.allocPrint(app.allocator, "{s}/{s}.tmp", .{ processed_dir, detections_name });
         defer app.allocator.free(tmp_rel_path);
         std.fs.cwd().deleteFile(tmp_rel_path) catch {};
@@ -869,9 +950,22 @@ fn ensureVideoDetections(app: *App, stored_upload_name: []const u8) ![]u8 {
             .api = d.api,
             .env = d.env.?,
             .session = d.session.?,
+            .hw_device_ctx = app.hw_device_ctx,
+            .input_tensor_d = app.cuda_input,
+            .output_boxes_d = app.cuda_boxes,
+            .output_logits_d = app.cuda_logits,
+            .preprocess_stream = app.preprocess_stream,
+            .inference_stream = app.inference_stream,
         } else null;
 
-        video_yolo.inferVideoToJsonl(app.allocator, upload_rel_path, tmp_rel_path, .{}, shared) catch |err| {
+        const metadata = app.metadata_cache.get(stored_upload_name);
+        
+        if (!app.decoder_cache.contains(stored_upload_name)) {
+            app.decoder_cache.put(try app.allocator.dupe(u8, stored_upload_name), .{}) catch {};
+        }
+        const persistent = app.decoder_cache.getPtr(stored_upload_name);
+
+        video_yolo.inferVideoToJsonl(app.allocator, upload_rel_path, tmp_rel_path, .{}, shared, metadata, persistent) catch |err| {
             std.fs.cwd().deleteFile(tmp_rel_path) catch {};
             return err;
         };
@@ -1122,18 +1216,56 @@ fn processedFileHandler(app: *App, req: *httpz.Request, res: *httpz.Response) !v
             
             if (need_gen) {
                 const upload_path = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{uploads_dir, upload_name});
+                
+                if (!app.metadata_cache.contains(upload_name)) {
+                    const upload_path_z = try res.arena.dupeZ(u8, upload_path);
+                    var fmt_ctx: ?*c.AVFormatContext = null;
+                    if (c.avformat_open_input(&fmt_ctx, upload_path_z.ptr, null, null) >= 0) {
+                        defer c.avformat_close_input(&fmt_ctx);
+                        fmt_ctx.?.*.probesize = 500000;
+                        fmt_ctx.?.*.max_analyze_duration = 1000000;
+                        if (c.avformat_find_stream_info(fmt_ctx, null) >= 0) {
+                            const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
+                            if (stream_idx >= 0) {
+                                const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
+                                const metadata = video_yolo.VideoMetadata{
+                                    .time_base = stream.?.*.time_base,
+                                    .fps = if (stream.?.*.avg_frame_rate.den > 0) 
+                                        @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
+                                        else 30.0,
+                                    .stream_idx = stream_idx,
+                                };
+                                app.metadata_cache.put(try app.allocator.dupe(u8, upload_name), metadata) catch {};
+                            }
+                        }
+                    }
+                }
+
                 const tmp_path = try std.fmt.allocPrint(res.arena, "{s}.tmp", .{segment_path});
                 
                 const shared = if (app.detector) |d| video_yolo.SharedInferenceResources{
                     .api = d.api,
                     .env = d.env.?,
                     .session = d.session.?,
+                    .hw_device_ctx = app.hw_device_ctx,
+                    .input_tensor_d = app.cuda_input,
+                    .output_boxes_d = app.cuda_boxes,
+                    .output_logits_d = app.cuda_logits,
+                    .preprocess_stream = app.preprocess_stream,
+                    .inference_stream = app.inference_stream,
                 } else null;
+
+                const metadata = app.metadata_cache.get(upload_name);
+                
+                if (!app.decoder_cache.contains(upload_name)) {
+                    app.decoder_cache.put(try app.allocator.dupe(u8, upload_name), .{}) catch {};
+                }
+                const persistent = app.decoder_cache.getPtr(upload_name);
 
                 video_yolo.inferVideoToJsonl(app.allocator, upload_path, tmp_path, .{
                     .start_s = start,
                     .duration_s = end - start,
-                }, shared) catch |err| {
+                }, shared, metadata, persistent) catch |err| {
                     std.log.err("segment inference failed: {}", .{err});
                     res.status = 500;
                     res.body = "inference failed";
