@@ -13,6 +13,23 @@ const print = std.log.info;
 const port = 3000;
 const uploads_dir = "uploads";
 const processed_dir = "processed";
+const coco_class_names = [_][]const u8{
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+    "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+};
+
+fn detectionClassName(class_id: i32) []const u8 {
+    if (class_id < 0) return "unknown";
+    const idx: usize = @intCast(class_id);
+    if (idx >= coco_class_names.len) return "unknown";
+    return coco_class_names[idx];
+}
 
 const templates = struct {
     const Error = error{
@@ -752,7 +769,17 @@ fn table(writer: *std.io.Writer, title: string, records: anytype) !void {
                 const value = @field(file, field.name);
 
                 switch (@TypeOf(value)) {
-                    i32 => try templates.print(template, "td-number", .{ .value = value }, writer),
+                    i32 => {
+                        if (comptime std.mem.eql(u8, field.name, "class_id")) {
+                            if (std.mem.eql(u8, title, "Detections")) {
+                                try templates.print(template, "td-string", .{ .value = detectionClassName(value) }, writer);
+                            } else {
+                                try templates.print(template, "td-number", .{ .value = value }, writer);
+                            }
+                        } else {
+                            try templates.print(template, "td-number", .{ .value = value }, writer);
+                        }
+                    },
                     i64 => try templates.print(template, "td-number", .{ .value = value }, writer),
                     f32 => try templates.print(template, "td", .{ .value = value }, writer),
                     string => {
@@ -849,6 +876,7 @@ const Files = struct {
                     \\  const video = document.getElementById('video-player');
                     \\  const canvas = document.getElementById('video-overlay');
                     \\  const ctx = canvas.getContext('2d');
+                    \\  const classNames = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant","bed","dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"];
                     \\  const raw = await fetch('/processed/
                 );
                 try writer.print("{s}", .{detections_name});
@@ -887,7 +915,8 @@ const Files = struct {
                     \\      const h = (det.y2 - det.y1) * canvas.height;
                     \\      if (w <= 0 || h <= 0) continue;
                     \\      ctx.strokeRect(x, y, w, h);
-                    \\      ctx.fillText('c' + det.class_id + ' ' + det.score.toFixed(2), x + 2, Math.max(12, y - 4));
+                    \\      const name = classNames[det.class_id] || ('class ' + det.class_id);
+                    \\      ctx.fillText(name + ' ' + det.score.toFixed(2), x + 2, Math.max(12, y - 4));
                     \\    }
                     \\  }
                     \\  function tick() {
