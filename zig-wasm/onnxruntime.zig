@@ -11,9 +11,7 @@ pub const DetectProfile = struct {
     decode_ns: i128 = 0,
 };
 
-const c = @cImport({
-    @cInclude("onnxruntime_c_api.h");
-});
+const c = @import("c.zig").c;
 
 const OutputSpec = struct {
     boxes: usize,

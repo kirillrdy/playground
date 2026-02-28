@@ -1,19 +1,6 @@
 const std = @import("std");
 const config = @import("config");
-
-const c = @cImport({
-    @cInclude("onnxruntime_c_api.h");
-    @cInclude("libavformat/avformat.h");
-    @cInclude("libavcodec/avcodec.h");
-    @cInclude("libavutil/avutil.h");
-    @cInclude("libavutil/hwcontext.h");
-    @cInclude("libavutil/hwcontext_cuda.h");
-    @cInclude("libavutil/pixdesc.h");
-    @cInclude("libavfilter/avfilter.h");
-    @cInclude("libavfilter/buffersink.h");
-    @cInclude("libavfilter/buffersrc.h");
-    @cInclude("cuda_runtime.h");
-});
+const c = @import("c.zig").c;
 
 extern fn launch_nv12_resize_to_rgb_nchw(
     src_y: [*]const u8,
@@ -176,6 +163,7 @@ const InferenceWorkerCtx = struct {
     detections_mutex: ?*std.Thread.Mutex,
     time_base: c.AVRational,
     fps: f64,
+    shared: ?SharedInferenceResources,
 };
 
 fn clamp01(v: f32) f32 {
@@ -304,6 +292,8 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
     var fmt_ctx: ?*c.AVFormatContext = null;
     try avCheck(c.avformat_open_input(&fmt_ctx, ctx.video_path_z.ptr, null, null));
     defer c.avformat_close_input(&fmt_ctx);
+    fmt_ctx.?.*.probesize = 500000;
+    fmt_ctx.?.*.max_analyze_duration = 1000000;
     try avCheck(c.avformat_find_stream_info(fmt_ctx, null));
 
     const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
@@ -477,37 +467,42 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
     const inference_stream = inference_stream_raw.?;
     defer _ = c.cudaStreamDestroy(inference_stream);
 
-    var env_raw: ?*c.OrtEnv = null;
-    try ortCheck(ctx.api, ctx.api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "video-yolo-zig-worker", &env_raw));
-    const env = env_raw orelse return error.OnnxRuntimeError;
-    defer ctx.api.ReleaseEnv.?(env);
+    const env = if (ctx.shared) |s| s.env else blk: {
+        var env_raw: ?*c.OrtEnv = null;
+        try ortCheck(ctx.api, ctx.api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "video-yolo-zig-worker", &env_raw));
+        break :blk env_raw orelse return error.OnnxRuntimeError;
+    };
+    defer if (ctx.shared == null) ctx.api.ReleaseEnv.?(env);
 
-    var session_options_raw: ?*c.OrtSessionOptions = null;
-    try ortCheck(ctx.api, ctx.api.CreateSessionOptions.?(&session_options_raw));
-    const session_options = session_options_raw orelse return error.OnnxRuntimeError;
-    defer ctx.api.ReleaseSessionOptions.?(session_options);
-    try ortCheck(ctx.api, ctx.api.SetInterOpNumThreads.?(session_options, 1));
-    try ortCheck(ctx.api, ctx.api.SetIntraOpNumThreads.?(session_options, 1));
+    const session = if (ctx.shared) |s| s.session else blk: {
+        var session_options_raw: ?*c.OrtSessionOptions = null;
+        try ortCheck(ctx.api, ctx.api.CreateSessionOptions.?(&session_options_raw));
+        const session_options = session_options_raw orelse return error.OnnxRuntimeError;
+        defer ctx.api.ReleaseSessionOptions.?(session_options);
+        try ortCheck(ctx.api, ctx.api.SetInterOpNumThreads.?(session_options, 1));
+        try ortCheck(ctx.api, ctx.api.SetIntraOpNumThreads.?(session_options, 1));
 
-    const create_cuda = ctx.api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-    const update_cuda = ctx.api.UpdateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-    const append_cuda = ctx.api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
-    const release_cuda = ctx.api.ReleaseCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-    var cuda_options_raw: ?*c.OrtCUDAProviderOptionsV2 = null;
-    try ortCheck(ctx.api, create_cuda(&cuda_options_raw));
-    const cuda_options = cuda_options_raw orelse return error.OnnxRuntimeError;
-    defer release_cuda(cuda_options);
+        const create_cuda = ctx.api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+        const update_cuda = ctx.api.UpdateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+        const append_cuda = ctx.api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
+        const release_cuda = ctx.api.ReleaseCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
+        var cuda_options_raw: ?*c.OrtCUDAProviderOptionsV2 = null;
+        try ortCheck(ctx.api, create_cuda(&cuda_options_raw));
+        const cuda_options = cuda_options_raw orelse return error.OnnxRuntimeError;
+        defer release_cuda(cuda_options);
 
-    var stream_buf: [32]u8 = undefined;
-    const stream_str = try std.fmt.bufPrintZ(&stream_buf, "{d}", .{@intFromPtr(inference_stream)});
-    const cuda_keys = [_][*c]const u8{"user_compute_stream"};
-    const cuda_values = [_][*c]const u8{stream_str.ptr};
-    try ortCheck(ctx.api, update_cuda(cuda_options, &cuda_keys, &cuda_values, cuda_keys.len));
-    try ortCheck(ctx.api, append_cuda(session_options, cuda_options));
+        var stream_buf: [32]u8 = undefined;
+        const stream_str = try std.fmt.bufPrintZ(&stream_buf, "{d}", .{@intFromPtr(inference_stream)});
+        const cuda_keys = [_][*c]const u8{"user_compute_stream"};
+        const cuda_values = [_][*c]const u8{stream_str.ptr};
+        try ortCheck(ctx.api, update_cuda(cuda_options, &cuda_keys, &cuda_values, cuda_keys.len));
+        try ortCheck(ctx.api, append_cuda(session_options, cuda_options));
 
-    var session: ?*c.OrtSession = null;
-    try ortCheck(ctx.api, ctx.api.CreateSession.?(env, ctx.model_path_z.ptr, session_options, &session));
-    defer if (session) |s| ctx.api.ReleaseSession.?(s);
+        var session_raw: ?*c.OrtSession = null;
+        try ortCheck(ctx.api, ctx.api.CreateSession.?(env, ctx.model_path_z.ptr, session_options, &session_raw));
+        break :blk session_raw orelse return error.OnnxRuntimeError;
+    };
+    defer if (ctx.shared == null) ctx.api.ReleaseSession.?(session);
 
     var memory_info: ?*c.OrtMemoryInfo = null;
     try ortCheck(ctx.api, ctx.api.CreateMemoryInfo.?("Cuda", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
@@ -660,7 +655,13 @@ fn inferenceWorkerMain(ctx: *InferenceWorkerCtx) void {
     };
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions) !void {
+pub const SharedInferenceResources = struct {
+    api: *const c.OrtApi,
+    env: *c.OrtEnv,
+    session: *c.OrtSession,
+};
+
+fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions, shared: ?SharedInferenceResources) !void {
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
     var queue = try FrameQueue.init(allocator, queue_capacity, &wg);
@@ -669,11 +670,20 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     const video_path_z = try allocator.dupeZ(u8, video_path);
     defer allocator.free(video_path_z);
 
-    // We need stream metadata before starting workers. 
-    // Let's open the file briefly to get time_base and fps.
+    const api = if (shared) |s| s.api else blk: {
+        const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
+        const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
+        break :blk @as(*const c.OrtApi, @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable));
+    };
+    const model_path_z = try allocator.dupeZ(u8, config.model_path);
+    defer allocator.free(model_path_z);
+
+    // We still need FPS/TimeBase for the workers. Let's get them once, but faster.
     var fmt_ctx: ?*c.AVFormatContext = null;
     try avCheck(c.avformat_open_input(&fmt_ctx, video_path_z.ptr, null, null));
     defer c.avformat_close_input(&fmt_ctx);
+    fmt_ctx.?.*.probesize = 500000;
+    fmt_ctx.?.*.max_analyze_duration = 1000000;
     try avCheck(c.avformat_find_stream_info(fmt_ctx, null));
     const stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
     if (stream_idx < 0) return error.NoVideoStream;
@@ -700,11 +710,6 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
         decoder_threads[i] = try std.Thread.spawn(.{}, decoderThreadMain, .{&decoder_ctxs[i]});
     }
 
-    const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
-    const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
-    const api: *const c.OrtApi = @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable);
-    const model_path_z = try allocator.dupeZ(u8, config.model_path);
-    defer allocator.free(model_path_z);
     var metrics: Metrics = .{};
     var detections_file: ?std.fs.File = null;
     defer if (detections_file) |*f| f.close();
@@ -726,6 +731,7 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
             .detections_mutex = if (detections_file != null) &detections_mutex else null,
             .time_base = time_base,
             .fps = fps,
+            .shared = shared,
         };
         worker_threads[i] = try std.Thread.spawn(.{}, inferenceWorkerMain, .{&worker_ctxs[i]});
     }
@@ -759,8 +765,8 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     });
 }
 
-pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions) !void {
-    try runBenchmark(allocator, video_path, 1, detections_path, options);
+pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions, shared: ?SharedInferenceResources) !void {
+    try runBenchmark(allocator, video_path, 1, detections_path, options, shared);
 }
 
 pub fn main() !void {
@@ -777,5 +783,5 @@ pub fn main() !void {
     const producer_count = try std.fmt.parseInt(usize, args[2], 10);
     if (producer_count == 0) return error.InvalidArguments;
     const detections_path: ?[]const u8 = if (args.len == 4) args[3] else null;
-    try runBenchmark(allocator, args[1], producer_count, detections_path, .{});
+    try runBenchmark(allocator, args[1], producer_count, detections_path, .{}, null);
 }

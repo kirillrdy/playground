@@ -5,7 +5,7 @@ const onnxruntime = @import("onnxruntime.zig");
 const video_yolo = @import("video_yolo.zig");
 const Allocator = std.mem.Allocator;
 const string = []const u8;
-const c = @cImport({});
+const c = @import("c.zig").c;
 
 const print = std.log.info;
 const port = 3000;
@@ -865,7 +865,13 @@ fn ensureVideoDetections(app: *App, stored_upload_name: []const u8) ![]u8 {
         defer app.allocator.free(tmp_rel_path);
         std.fs.cwd().deleteFile(tmp_rel_path) catch {};
 
-        video_yolo.inferVideoToJsonl(app.allocator, upload_rel_path, tmp_rel_path, .{}) catch |err| {
+        const shared = if (app.detector) |d| video_yolo.SharedInferenceResources{
+            .api = d.api,
+            .env = d.env.?,
+            .session = d.session.?,
+        } else null;
+
+        video_yolo.inferVideoToJsonl(app.allocator, upload_rel_path, tmp_rel_path, .{}, shared) catch |err| {
             std.fs.cwd().deleteFile(tmp_rel_path) catch {};
             return err;
         };
@@ -1118,10 +1124,16 @@ fn processedFileHandler(app: *App, req: *httpz.Request, res: *httpz.Response) !v
                 const upload_path = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{uploads_dir, upload_name});
                 const tmp_path = try std.fmt.allocPrint(res.arena, "{s}.tmp", .{segment_path});
                 
+                const shared = if (app.detector) |d| video_yolo.SharedInferenceResources{
+                    .api = d.api,
+                    .env = d.env.?,
+                    .session = d.session.?,
+                } else null;
+
                 video_yolo.inferVideoToJsonl(app.allocator, upload_path, tmp_path, .{
                     .start_s = start,
                     .duration_s = end - start,
-                }) catch |err| {
+                }, shared) catch |err| {
                     std.log.err("segment inference failed: {}", .{err});
                     res.status = 500;
                     res.body = "inference failed";
