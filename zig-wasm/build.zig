@@ -129,14 +129,17 @@ pub fn build(b: *std.Build) !void {
 }
 
 fn nixPkg(b: *std.Build, name: []const u8, pkg_expr: []const u8) std.Build.LazyPath {
-    const run = b.addSystemCommand(&.{ "sh", "-c",
+    const run = b.addSystemCommand(&.{
+        "sh", "-c",
         \\set -euo pipefail
         \\out="$1"
         \\expr="$2"
-        \\full_expr="let pkgs = import (builtins.getFlake \"nixpkgs\").outPath { system = \"$(nix eval --raw --impure --expr builtins.currentSystem)\"; config.allowUnfree = true; }; in $expr"
+        \\full_expr="let pkgs = import (builtins.getFlake \"github:nixos/nixpkgs/5f9f834d6a9d47adfe7cfbddb86ce406a5d9ea75\").outPath { system = \"$(nix eval --raw --impure --expr builtins.currentSystem)\"; config.allowUnfree = true; }; in $expr"
         \\path="$(nix build --impure --no-link --print-out-paths --expr "$full_expr")"
         \\ln -s "$path" "$out"
-        , "--" });
+        ,
+        "--",
+    });
     const out = run.addOutputFileArg(name);
     run.addArg(pkg_expr);
     return out;
