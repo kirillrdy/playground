@@ -1,7 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const yolo = @import("yolo.zig");
-const image_decode = @import("image_decode.zig");
 const image_preprocess = @import("image_preprocess.zig");
 
 pub const Detection = yolo.Detection;
@@ -244,13 +243,6 @@ pub const Runtime = struct {
 
     pub fn freeDetections(_: *@This(), allocator: Allocator, detections: []Detection) void {
         allocator.free(detections);
-    }
-
-    pub fn detectFromImageBytes(self: *@This(), allocator: Allocator, image_bytes: []const u8) ![]Detection {
-        const image = try image_decode.decodeRgb(allocator, image_bytes);
-        defer allocator.free(image.rgb);
-
-        return self.detectFromRgb(allocator, image.rgb, image.size);
     }
 
     pub fn detectFromRgb(

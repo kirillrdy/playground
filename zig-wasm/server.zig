@@ -760,24 +760,6 @@ const Files = struct {
                 defer file.close();
                 try file.writeAll(kv.value.value);
                 print("saved upload to {s}", .{rel_path});
-
-                if (app.detector != null and !isVideoFileName(safe_name)) {
-                    var detector = &app.detector.?;
-                    const detections = detector.detectFromImageBytes(app.allocator, kv.value.value) catch |err| {
-                        print("detection failed for {s}: {}", .{ safe_name, err });
-                        continue;
-                    };
-                    defer detector.freeDetections(app.allocator, detections);
-
-                    const detections_name = try std.fmt.allocPrint(app.allocator, "{s}.jsonl", .{safe_name});
-                    defer app.allocator.free(detections_name);
-                    const detections_rel_path = try std.fmt.allocPrint(app.allocator, "{s}/{s}", .{ processed_dir, detections_name });
-                    defer app.allocator.free(detections_rel_path);
-
-                    writeDetectionsJsonl(detections_rel_path, detections) catch |err| {
-                        print("failed to persist detections for {s}: {}", .{ safe_name, err });
-                    };
-                }
             }
         }
         if (has_file) {
