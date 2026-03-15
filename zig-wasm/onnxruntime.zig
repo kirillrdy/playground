@@ -148,7 +148,7 @@ pub const Runtime = struct {
         self.output_name = try self.allocator.dupeZ(u8, std.mem.span(output_name_alloc));
     }
 
-    fn check(self: *@This(), status: ?*c.OrtStatus) !void {
+    pub fn check(self: *@This(), status: ?*c.OrtStatus) !void {
         if (status == null) return;
         defer self.api.ReleaseStatus.?(status);
         const message = self.api.GetErrorMessage.?(status);

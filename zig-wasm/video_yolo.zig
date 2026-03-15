@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config");
+const onnxruntime = @import("onnxruntime.zig");
 const c = @import("c.zig").c;
 
 extern fn launch_nv12_resize_to_rgb_nchw(
@@ -169,7 +170,7 @@ const DecoderCtx = struct {
     wg: *std.Thread.WaitGroup,
     video_path_z: [:0]const u8,
     options: InferOptions,
-    shared: ?SharedInferenceResources,
+    shared: ?*const SharedInferenceResources,
     profiler: *Profiler,
     persistent: ?*PersistentDecoder = null,
 };
@@ -192,13 +193,12 @@ const Metrics = struct {
 const InferenceWorkerCtx = struct {
     queue: *FrameQueue,
     api: *const c.OrtApi,
-    model_path_z: [:0]const u8,
     metrics: *Metrics,
     detections_file: ?*std.fs.File,
     detections_mutex: ?*std.Thread.Mutex,
     time_base: c.AVRational,
     fps: f64,
-    shared: ?SharedInferenceResources,
+    shared: *const SharedInferenceResources,
 };
 
 fn clamp01(v: f32) f32 {
@@ -259,7 +259,7 @@ fn writeFrameDetections(ctx: *InferenceWorkerCtx, frame_index: usize, frame_time
     mutex.lock();
     defer mutex.unlock();
 
-    try writer.print("{{\"frame\":{d},\"time\":{d:.4},\"detections\":[", .{frame_index, frame_time});
+    try writer.print("{{\"frame\":{d},\"time\":{d:.4},\"detections\":[", .{ frame_index, frame_time });
     var written: usize = 0;
     for (0..300) |box_idx| {
         var best_class: usize = 0;
@@ -325,7 +325,7 @@ fn avCheck(code: c_int) !void {
 
 fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
     const total_start = std.time.nanoTimestamp();
-    
+
     var fmt_ctx: ?*c.AVFormatContext = null;
     var codec_ctx: ?*c.AVCodecContext = null;
     var filter_graph: ?*c.AVFilterGraph = null;
@@ -356,7 +356,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
 
         stream_idx = c.av_find_best_stream(fmt_ctx, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
         if (stream_idx < 0) return error.NoVideoStream;
-        
+
         if (ctx.persistent) |p| {
             p.fmt_ctx = fmt_ctx;
             p.stream_idx = stream_idx;
@@ -384,7 +384,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 std.log.info("using hardware decoder: {s}", .{name});
             }
         }
-        
+
         if (decoder == null) {
             decoder = c.avcodec_find_decoder(codecpar.?.*.codec_id);
             if (decoder != null) {
@@ -411,9 +411,9 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
         codec_ctx.?.*.get_format = get_format;
         codec_ctx.?.*.pkt_timebase = stream.?.*.time_base;
         codec_ctx.?.*.flags |= c.AV_CODEC_FLAG_LOW_DELAY;
-        
+
         try avCheck(c.avcodec_open2(codec_ctx, decoder, null));
-        
+
         if (ctx.persistent) |p| {
             p.codec_ctx = codec_ctx;
         }
@@ -426,7 +426,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
     if (ctx.options.start_s > 0 or is_warm) {
         const time_base = stream.?.*.time_base;
         const ts = @as(i64, @intFromFloat(ctx.options.start_s * @as(f64, @floatFromInt(time_base.den)) / @as(f64, @floatFromInt(time_base.num))));
-        
+
         var need_seek = true;
         if (ctx.persistent) |p| {
             // Allow a 2-second margin for contiguous playback or small jumps.
@@ -447,7 +447,6 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
             ctx.profiler.seek_ns.store(0, .monotonic);
         }
     }
-
 
     var frame = c.av_frame_alloc();
     defer c.av_frame_free(&frame);
@@ -501,7 +500,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
 
                 try avCheck(c.avfilter_graph_create_filter(&buffer_ctx, buffer_filter, "in", args.ptr, null, filter_graph));
                 try avCheck(c.avfilter_graph_create_filter(&buffersink_ctx, buffersink_filter, "out", null, null, filter_graph));
-                
+
                 if (codec_ctx.?.*.hw_device_ctx != null) {
                     buffer_ctx.?.*.hw_device_ctx = c.av_buffer_ref(codec_ctx.?.*.hw_device_ctx);
                 }
@@ -533,7 +532,7 @@ fn decodeVideoIntoQueue(ctx: *DecoderCtx) !void {
                 try avCheck(c.avfilter_graph_parse_ptr(filter_graph, filter_spec, &inputs, &outputs, null));
                 try avCheck(c.avfilter_graph_config(filter_graph, null));
                 ctx.profiler.filter_init_ns.store(@intCast(std.time.nanoTimestamp() - filt_start), .monotonic);
-                
+
                 if (ctx.persistent) |p| {
                     p.filter_graph = filter_graph.?;
                     p.buffer_ctx = buffer_ctx.?;
@@ -593,60 +592,12 @@ fn decoderThreadMain(ctx: *DecoderCtx) void {
 }
 
 fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
-    const preprocess_stream = if (ctx.shared) |s| s.preprocess_stream else blk: {
-        var preprocess_stream_raw: c.cudaStream_t = null;
-        if (c.cudaStreamCreate(&preprocess_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
-        break :blk preprocess_stream_raw.?;
-    };
-    defer if (ctx.shared == null) {
-        _ = c.cudaStreamDestroy(preprocess_stream);
-    };
-
-    const inference_stream = if (ctx.shared) |s| s.inference_stream else blk: {
-        var inference_stream_raw: c.cudaStream_t = null;
-        if (c.cudaStreamCreate(&inference_stream_raw) != c.cudaSuccess) return error.CudaStreamCreateFailed;
-        break :blk inference_stream_raw.?;
-    };
-    defer if (ctx.shared == null) {
-        _ = c.cudaStreamDestroy(inference_stream);
-    };
-
-    const env = if (ctx.shared) |s| s.env else blk: {
-        var env_raw: ?*c.OrtEnv = null;
-        try ortCheck(ctx.api, ctx.api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "video-yolo-zig-worker", &env_raw));
-        break :blk env_raw orelse return error.OnnxRuntimeError;
-    };
-    defer if (ctx.shared == null) ctx.api.ReleaseEnv.?(env);
-
-    const session = if (ctx.shared) |s| s.session else blk: {
-        var session_options_raw: ?*c.OrtSessionOptions = null;
-        try ortCheck(ctx.api, ctx.api.CreateSessionOptions.?(&session_options_raw));
-        const session_options = session_options_raw orelse return error.OnnxRuntimeError;
-        defer ctx.api.ReleaseSessionOptions.?(session_options);
-        try ortCheck(ctx.api, ctx.api.SetInterOpNumThreads.?(session_options, 1));
-        try ortCheck(ctx.api, ctx.api.SetIntraOpNumThreads.?(session_options, 1));
-
-        const create_cuda = ctx.api.CreateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-        const update_cuda = ctx.api.UpdateCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-        const append_cuda = ctx.api.SessionOptionsAppendExecutionProvider_CUDA_V2 orelse return error.CudaExecutionProviderUnavailable;
-        const release_cuda = ctx.api.ReleaseCUDAProviderOptions orelse return error.CudaExecutionProviderUnavailable;
-        var cuda_options_raw: ?*c.OrtCUDAProviderOptionsV2 = null;
-        try ortCheck(ctx.api, create_cuda(&cuda_options_raw));
-        const cuda_options = cuda_options_raw orelse return error.OnnxRuntimeError;
-        defer release_cuda(cuda_options);
-
-        var stream_buf: [32]u8 = undefined;
-        const stream_str = try std.fmt.bufPrintZ(&stream_buf, "{d}", .{@intFromPtr(inference_stream)});
-        const cuda_keys = [_][*c]const u8{"user_compute_stream"};
-        const cuda_values = [_][*c]const u8{stream_str.ptr};
-        try ortCheck(ctx.api, update_cuda(cuda_options, &cuda_keys, &cuda_values, cuda_keys.len));
-        try ortCheck(ctx.api, append_cuda(session_options, cuda_options));
-
-        var session_raw: ?*c.OrtSession = null;
-        try ortCheck(ctx.api, ctx.api.CreateSession.?(env, ctx.model_path_z.ptr, session_options, &session_raw));
-        break :blk session_raw orelse return error.OnnxRuntimeError;
-    };
-    defer if (ctx.shared == null) ctx.api.ReleaseSession.?(session);
+    const preprocess_stream = ctx.shared.preprocess_stream;
+    const inference_stream = ctx.shared.inference_stream;
+    const session = ctx.shared.session;
+    const input_tensor_d = ctx.shared.input_tensor_d;
+    const output_boxes_d = ctx.shared.output_boxes_d;
+    const output_logits_d = ctx.shared.output_logits_d;
 
     var memory_info: ?*c.OrtMemoryInfo = null;
     try ortCheck(ctx.api, ctx.api.CreateMemoryInfo.?("Cuda", c.OrtArenaAllocator, 0, c.OrtMemTypeDefault, &memory_info));
@@ -667,33 +618,6 @@ fn runInferenceWorker(ctx: *InferenceWorkerCtx) !void {
     const input_shape = [_]i64{ 1, 3, @intCast(input_h), @intCast(input_w) };
     const output_boxes_shape = [_]i64{ 1, 300, 4 };
     const output_logits_shape = [_]i64{ 1, 300, 80 };
-
-    const input_tensor_d = if (ctx.shared) |s| s.input_tensor_d else blk: {
-        var ptr: ?*anyopaque = null;
-        if (c.cudaMalloc(&ptr, input_len * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-        break :blk @as([*]f32, @ptrCast(@alignCast(ptr)));
-    };
-    defer if (ctx.shared == null) {
-        _ = c.cudaFree(input_tensor_d);
-    };
-
-    const output_boxes_d = if (ctx.shared) |s| s.output_boxes_d else blk: {
-        var ptr: ?*anyopaque = null;
-        if (c.cudaMalloc(&ptr, 300 * 4 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-        break :blk @as([*]f32, @ptrCast(@alignCast(ptr)));
-    };
-    defer if (ctx.shared == null) {
-        _ = c.cudaFree(output_boxes_d);
-    };
-
-    const output_logits_d = if (ctx.shared) |s| s.output_logits_d else blk: {
-        var ptr: ?*anyopaque = null;
-        if (c.cudaMalloc(&ptr, 300 * 80 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
-        break :blk @as([*]f32, @ptrCast(@alignCast(ptr)));
-    };
-    defer if (ctx.shared == null) {
-        _ = c.cudaFree(output_logits_d);
-    };
 
     var input_value: ?*c.OrtValue = null;
     try ortCheck(ctx.api, ctx.api.CreateTensorWithDataAsOrtValue.?(
@@ -855,7 +779,8 @@ pub const VideoMetadata = struct {
     stream_idx: i32,
 };
 
-fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata_opt: ?VideoMetadata, persistent: ?*PersistentDecoder) !void {
+fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_count: usize, detections_path: ?[]const u8, options: InferOptions, shared: ?*const SharedInferenceResources, metadata_opt: ?VideoMetadata, persistent: ?*PersistentDecoder) !void {
+    const shared_ptr = shared orelse return error.SharedResourcesRequired;
     var wg: std.Thread.WaitGroup = .{};
     wg.startMany(producer_count);
     var queue = try FrameQueue.init(allocator, queue_capacity, &wg);
@@ -864,17 +789,11 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     const video_path_z = try allocator.dupeZ(u8, video_path);
     defer allocator.free(video_path_z);
 
-    const api = if (shared) |s| s.api else blk: {
-        const base = c.OrtGetApiBase() orelse return error.OnnxRuntimeUnavailable;
-        const get_api = base.*.GetApi orelse return error.OnnxRuntimeUnavailable;
-        break :blk @as(*const c.OrtApi, @ptrCast(get_api(c.ORT_API_VERSION) orelse return error.OnnxRuntimeUnavailable));
-    };
-    const model_path_z = try allocator.dupeZ(u8, config.model_path);
-    defer allocator.free(model_path_z);
+    const api = shared_ptr.api;
 
     var time_base: c.AVRational = .{ .num = 1, .den = 1 };
     var fps: f64 = 30.0;
-    
+
     if (metadata_opt) |m| {
         time_base = m.time_base;
         fps = m.fps;
@@ -889,9 +808,10 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
         if (stream_idx < 0) return error.NoVideoStream;
         const stream = fmt_ctx.?.*.streams[@intCast(stream_idx)];
         time_base = stream.?.*.time_base;
-        fps = if (stream.?.*.avg_frame_rate.den > 0) 
+        fps = if (stream.?.*.avg_frame_rate.den > 0)
             @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.num)) / @as(f64, @floatFromInt(stream.?.*.avg_frame_rate.den))
-            else 30.0;
+        else
+            30.0;
     }
 
     const decoder_ctxs = try allocator.alloc(DecoderCtx, producer_count);
@@ -931,13 +851,12 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
         worker_ctxs[i] = .{
             .queue = &queue,
             .api = api,
-            .model_path_z = model_path_z,
             .metrics = &metrics,
             .detections_file = if (detections_file) |*f| f else null,
             .detections_mutex = if (detections_file != null) &detections_mutex else null,
             .time_base = time_base,
             .fps = fps,
-            .shared = shared,
+            .shared = shared_ptr,
         };
         worker_threads[i] = try std.Thread.spawn(.{}, inferenceWorkerMain, .{&worker_ctxs[i]});
     }
@@ -973,7 +892,7 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     });
 }
 
-pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions, shared: ?SharedInferenceResources, metadata: ?VideoMetadata, persistent: ?*PersistentDecoder) !void {
+pub fn inferVideoToJsonl(allocator: std.mem.Allocator, video_path: []const u8, detections_path: []const u8, options: InferOptions, shared: ?*const SharedInferenceResources, metadata: ?VideoMetadata, persistent: ?*PersistentDecoder) !void {
     try runBenchmark(allocator, video_path, 1, detections_path, options, shared, metadata, persistent);
 }
 
@@ -991,5 +910,37 @@ pub fn main() !void {
     const producer_count = try std.fmt.parseInt(usize, args[2], 10);
     if (producer_count == 0) return error.InvalidArguments;
     const detections_path: ?[]const u8 = if (args.len == 4) args[3] else null;
-    try runBenchmark(allocator, args[1], producer_count, detections_path, .{}, null, null, null);
+
+    var runtime = try onnxruntime.Runtime.init(allocator, config.model_path);
+    defer runtime.deinit();
+
+    var cuda_input: ?*anyopaque = null;
+    if (c.cudaMalloc(&cuda_input, 1 * 3 * 640 * 640 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+    defer _ = c.cudaFree(cuda_input);
+    var cuda_boxes: ?*anyopaque = null;
+    if (c.cudaMalloc(&cuda_boxes, 300 * 4 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+    defer _ = c.cudaFree(cuda_boxes);
+    var cuda_logits: ?*anyopaque = null;
+    if (c.cudaMalloc(&cuda_logits, 300 * 80 * @sizeOf(f32)) != c.cudaSuccess) return error.OutOfMemory;
+    defer _ = c.cudaFree(cuda_logits);
+
+    var preprocess_stream: c.cudaStream_t = null;
+    if (c.cudaStreamCreate(&preprocess_stream) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+    defer _ = c.cudaStreamDestroy(preprocess_stream);
+    var inference_stream: c.cudaStream_t = null;
+    if (c.cudaStreamCreate(&inference_stream) != c.cudaSuccess) return error.CudaStreamCreateFailed;
+    defer _ = c.cudaStreamDestroy(inference_stream);
+
+    const shared = SharedInferenceResources{
+        .api = runtime.api,
+        .env = runtime.env.?,
+        .session = runtime.session.?,
+        .input_tensor_d = @ptrCast(@alignCast(cuda_input)),
+        .output_boxes_d = @ptrCast(@alignCast(cuda_boxes)),
+        .output_logits_d = @ptrCast(@alignCast(cuda_logits)),
+        .preprocess_stream = preprocess_stream,
+        .inference_stream = inference_stream,
+    };
+
+    try runBenchmark(allocator, args[1], producer_count, detections_path, .{}, &shared, null, null);
 }
