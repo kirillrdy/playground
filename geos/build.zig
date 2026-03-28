@@ -599,8 +599,6 @@ pub fn build(b: *std.Build) !void {
     });
 
     geos_c_lib.addIncludePath(geos_source.path("include"));
-    geos_c_lib.addIncludePath(b.path(".zig-cache"));
-    geos_c_lib.addIncludePath(b.path(".zig-cache/include"));
     geos_c_lib.addIncludePath(geos_source.path("src/deps"));
     geos_c_lib.addIncludePath(geos_c_h_step.getOutputDir());
     geos_c_lib.addIncludePath(version_h_step.getOutputDir());
@@ -618,7 +616,6 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
-    exe.addIncludePath(b.path(".zig-cache"));
     exe.addIncludePath(geos_c_h_step.getOutputDir());
     exe.addIncludePath(geos_source.path("include"));
     exe.linkLibrary(geos_c_lib);
