@@ -24,33 +24,25 @@ pub fn build(b: *std.Build) !void {
     const capi_minor = version_info.capi_age;
     const capi_patch = version_info.capi_revision;
 
-    // Build version strings
+    // Build version strings (b.allocator is an arena, no need to free)
     const geos_version = if (version_info.patch_word.len > 0)
-        try std.fmt.allocPrint(b.allocator, "{s}.{s}.{s}{s}", .{
+        b.fmt("{s}.{s}.{s}{s}", .{
             version_info.geos_major,
             version_info.geos_minor,
             version_info.geos_patch,
             version_info.patch_word,
         })
     else
-        try std.fmt.allocPrint(b.allocator, "{s}.{s}.{s}", .{
+        b.fmt("{s}.{s}.{s}", .{
             version_info.geos_major,
             version_info.geos_minor,
             version_info.geos_patch,
         });
-    defer b.allocator.free(geos_version);
 
-    const capi_version = try std.fmt.allocPrint(b.allocator, "{d}.{d}.{d}", .{ capi_major, capi_minor, capi_patch });
-    defer b.allocator.free(capi_version);
-
-    const capi_major_str = try std.fmt.allocPrint(b.allocator, "{d}", .{capi_major});
-    defer b.allocator.free(capi_major_str);
-
-    const capi_minor_str = try std.fmt.allocPrint(b.allocator, "{d}", .{capi_minor});
-    defer b.allocator.free(capi_minor_str);
-
-    const capi_patch_str = try std.fmt.allocPrint(b.allocator, "{d}", .{capi_patch});
-    defer b.allocator.free(capi_patch_str);
+    const capi_version = b.fmt("{d}.{d}.{d}", .{ capi_major, capi_minor, capi_patch });
+    const capi_major_str = b.fmt("{d}", .{capi_major});
+    const capi_minor_str = b.fmt("{d}", .{capi_minor});
+    const capi_patch_str = b.fmt("{d}", .{capi_patch});
 
     // Generate geos_c.h from template
     const geos_c_h_step = b.addConfigHeader(
@@ -559,12 +551,11 @@ pub fn build(b: *std.Build) !void {
         "src/index/intervalrtree/SortedPackedIntervalRTree.cpp",
     };
 
-    for (geos_cpp_files) |file_path| {
-        geos_lib.addCSourceFile(.{
-            .file = geos_source.path(file_path),
-            .flags = cpp_flags,
-        });
-    }
+    geos_lib.addCSourceFiles(.{
+        .root = geos_source.path(""),
+        .files = &geos_cpp_files,
+        .flags = cpp_flags,
+    });
 
     // Add ryu source
     geos_lib.addCSourceFile(.{
@@ -589,12 +580,12 @@ pub fn build(b: *std.Build) !void {
         .linkage = .static,
     });
 
-    geos_c_lib.addCSourceFile(.{
-        .file = geos_source.path("capi/geos_c.cpp"),
-        .flags = cpp_flags,
-    });
-    geos_c_lib.addCSourceFile(.{
-        .file = geos_source.path("capi/geos_ts_c.cpp"),
+    geos_c_lib.addCSourceFiles(.{
+        .root = geos_source.path(""),
+        .files = &.{
+            "capi/geos_c.cpp",
+            "capi/geos_ts_c.cpp",
+        },
         .flags = cpp_flags,
     });
 
