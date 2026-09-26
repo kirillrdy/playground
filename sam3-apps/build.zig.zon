@@ -1,0 +1,18 @@
+.{
+    .name = .sam3_apps,
+    .version = "0.0.0",
+    .fingerprint = 0xd0f2eae198a013cf,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sam3 = .{ .path = "../../sam3" },
+        .zigimg = .{
+            .url = "git+https://github.com/nothke/zigimg#581795265e1caee099baae32883c0f9d4f28f81a",
+            .hash = "zigimg-0.1.0-8_eo2jPCFwDJF89NMU5gJjpTRoFdda26viRcdxyJP0Ks",
+        },
+        .onnx = .{
+            .url = "git+https://github.com/kirillrdy/onnx#bb219804f5f9f077d9b3c5ba8e4947de5819824f",
+            .hash = "onnx-0.0.0-S9CpBdaICACbLqNhZzK-IQHBxGwe-YibEOmgmSrNitzG",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "native_main.zig", "macos", "linux", "README.md" },
+}
