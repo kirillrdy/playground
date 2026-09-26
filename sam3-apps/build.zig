@@ -1,14 +1,13 @@
 const std = @import("std");
-const onnx_build = @import("onnx");
+const Backend = enum { cuda, opencl, metal };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const default_backend: onnx_build.Backend = if (target.result.os.tag.isDarwin()) .metal else .opencl;
-    const backend = b.option(onnx_build.Backend, "backend", "ONNX execution backend: OpenCL, Metal, or CUDA") orelse default_backend;
-    const cuda_arch = b.option([]const u8, "sm", "CUDA compute capability") orelse onnx_build.default_cuda_arch;
-    const half = b.option(bool, "half", "Store float tensors on the device as halves") orelse (backend != .cuda);
+    const backend = b.option(Backend, "backend", "Inference backend: OpenCL, Metal, or CUDA");
+    const cuda_arch = b.option([]const u8, "sm", "CUDA compute capability");
+    const half = b.option(bool, "half", "Store float tensors on the device as halves");
 
     const sam3 = b.dependency("sam3", .{
         .target = target,
@@ -21,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zimo = b.dependency("zimo", .{});
 
     const native_main = b.createModule(.{
         .root_source_file = b.path("native_main.zig"),
@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "sam3", .module = sam3.module("sam3") },
                 .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+                .{ .name = "zimo", .module = zimo.module("zimo") },
                 .{ .name = "native_main", .module = native_main },
             },
         });

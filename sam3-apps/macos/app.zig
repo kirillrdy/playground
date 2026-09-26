@@ -2,6 +2,10 @@ const std = @import("std");
 const sam3 = @import("sam3");
 const render = sam3.render;
 const zigimg = @import("zigimg");
+const zimo = @import("zimo");
+const here = zimo.bind(@This(), @embedFile("app.zig"));
+threadlocal var active_model: ?*sam3.Model = null;
+threadlocal var query_computed = false;
 
 const SamCallbacks = extern struct {
     on_open_file: ?*const fn (path: [*:0]const u8) callconv(.c) void,
@@ -194,8 +198,8 @@ pub const App = struct {
             sam_macos_set_busy(0);
             return;
         };
-        const decode_elapsed = secondsSince(self.io, decode_started);
-        std.debug.print("  {d} point(s) -> {d} masks in {d:.2} s\n", .{
+        const decode_elapsed = decode_started.untilNow(self.io, .awake);
+        std.debug.print("  {d} point(s) -> {d} masks in {f}\n", .{
             self.points_len,
             masks.count,
             decode_elapsed,
@@ -227,9 +231,9 @@ pub const App = struct {
         }
         sam_macos_set_masks(@intCast(count), &mask_infos, self.best_mask_idx, self.selected_mask);
 
-        const elapsed = secondsSince(self.io, started);
+        const elapsed = started.untilNow(self.io, .awake);
         var status_buf: [128]u8 = undefined;
-        const status = std.fmt.bufPrintZ(&status_buf, "{d} point(s) -> {d} masks in {d:.2} s", .{
+        const status = std.fmt.bufPrintZ(&status_buf, "{d} point(s) -> {d} masks in {f}", .{
             self.points_len,
             masks.count,
             elapsed,
@@ -249,7 +253,7 @@ pub const App = struct {
         sam_macos_set_busy(1);
 
         var status_buf: [256]u8 = undefined;
-        const status = std.fmt.bufPrintZ(&status_buf, "Looking for “{s}”… the first lookup also runs vision encoder.", .{phrase}) catch "Searching…";
+        const status = std.fmt.bufPrintZ(&status_buf, "Looking for “{s}”…", .{phrase}) catch "Searching…";
         sam_macos_set_status(status);
 
         const PhraseContext = struct {
@@ -288,28 +292,43 @@ pub const App = struct {
         const phrase = ctx.phrase;
         const started = std.Io.Timestamp.now(self.io, .awake);
 
-        var concept_embedding = self.ensureEmbedding(true) catch |err| {
-            std.debug.print("Concept vision encoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
-            sam_macos_set_status("Concept vision encoder failed");
-            self.is_busy = false;
-            sam_macos_set_busy(0);
-            return;
-        };
-        defer concept_embedding.deinit();
-
         const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-        const masks = self.model.find(&concept_embedding, phrase, .{ .min_score = 0.5 }) catch |err| {
+        active_model = self.model;
+        defer active_model = null;
+        query_computed = false;
+        const values = here.call(.computeQuery, .{
+            self.allocator,
+            [_][]const u8{
+                sam3.assets.concept_vision_encoder.sha256,
+                sam3.assets.concept_text_encoder.sha256,
+                sam3.assets.concept_decoder.sha256,
+                sam3.assets.concept_tokenizer_json.sha256,
+            },
+            sam3.RgbImage.fromImage(self.image.?),
+            phrase,
+            @as(f32, 0.5),
+        }) catch |err| {
             std.debug.print("Text lookup failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Text lookup failed");
             self.is_busy = false;
             sam_macos_set_busy(0);
             return;
         };
-        const lookup_elapsed = secondsSince(self.io, lookup_started);
-        std.debug.print("  \"{s}\" -> {d} object(s) in {d:.2} s\n", .{
+        defer self.allocator.free(values);
+        const cache_hit = !query_computed;
+        const masks = unpackMasks(self.allocator, values) catch |err| {
+            std.debug.print("Cached text lookup failed: {t}\n", .{err});
+            sam_macos_set_status("Text lookup failed");
+            self.is_busy = false;
+            sam_macos_set_busy(0);
+            return;
+        };
+        const lookup_elapsed = lookup_started.untilNow(self.io, .awake);
+        std.debug.print("  \"{s}\" -> {d} object(s) in {f} ({s})\n", .{
             phrase,
             masks.count,
             lookup_elapsed,
+            if (cache_hit) "cache hit" else "computed",
         });
 
         self.mutex.lock(self.io) catch return;
@@ -349,9 +368,9 @@ pub const App = struct {
             }
             sam_macos_set_masks(@intCast(count), &mask_infos, self.best_mask_idx, self.selected_mask);
 
-            const elapsed = secondsSince(self.io, started);
+            const elapsed = started.untilNow(self.io, .awake);
             var status_buf: [256]u8 = undefined;
-            const status = std.fmt.bufPrintZ(&status_buf, "{d} object(s) matched “{s}” in {d:.2} s", .{
+            const status = std.fmt.bufPrintZ(&status_buf, "{d} object(s) matched “{s}” in {f}", .{
                 masks.count,
                 phrase,
                 elapsed,
@@ -396,11 +415,11 @@ pub const App = struct {
         const started = std.Io.Timestamp.now(self.io, .awake);
         const rgb = sam3.RgbImage.fromImage(img);
         const embedding = if (concept) try self.model.encodeForText(rgb) else try self.model.encodePoints(rgb);
-        std.debug.print("  {s}encoded {d}x{d} in {d:.2} s\n", .{
+        std.debug.print("  {s}encoded {d}x{d} in {f}\n", .{
             if (concept) "concept-" else "",
             img.width,
             img.height,
-            secondsSince(self.io, started),
+            started.untilNow(self.io, .awake),
         });
         return embedding;
     }
@@ -423,9 +442,57 @@ pub const App = struct {
     }
 };
 
-fn secondsSince(io: std.Io, started: std.Io.Timestamp) f64 {
-    const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake));
-    return @as(f64, @floatFromInt(elapsed.nanoseconds)) / 1e9;
+pub fn computeQuery(
+    allocator: std.mem.Allocator,
+    model_ids: [4][]const u8,
+    image: sam3.RgbImage,
+    phrase: []const u8,
+    min_score: f32,
+) ![]f32 {
+    _ = model_ids;
+    query_computed = true;
+    const model = active_model orelse return error.NoActiveModel;
+    var embedding = try model.encodeForText(image);
+    defer embedding.deinit();
+    var masks = try model.find(&embedding, phrase, .{ .min_score = min_score });
+    defer masks.deinit();
+
+    const header_and_scores = try std.math.add(usize, 4, masks.scores.len);
+    const len = try std.math.add(usize, header_and_scores, masks.logits.len);
+    const values = try allocator.alloc(f32, len);
+    values[0] = @bitCast(@as(u32, @intCast(masks.count)));
+    values[1] = @bitCast(@as(u32, @intCast(masks.width)));
+    values[2] = @bitCast(@as(u32, @intCast(masks.height)));
+    values[3] = masks.object_score;
+    @memcpy(values[4..][0..masks.scores.len], masks.scores);
+    @memcpy(values[header_and_scores..], masks.logits);
+    return values;
+}
+
+fn unpackMasks(allocator: std.mem.Allocator, values: []const f32) !sam3.Masks {
+    if (values.len < 4) return error.InvalidCachedQuery;
+    const count: usize = @as(u32, @bitCast(values[0]));
+    const width: usize = @as(u32, @bitCast(values[1]));
+    const height: usize = @as(u32, @bitCast(values[2]));
+    if (width == 0 or height == 0) return error.InvalidCachedQuery;
+    const pixels = std.math.mul(usize, width, height) catch return error.InvalidCachedQuery;
+    const logits_len = std.math.mul(usize, count, pixels) catch return error.InvalidCachedQuery;
+    const header_and_scores = std.math.add(usize, 4, count) catch return error.InvalidCachedQuery;
+    const expected = std.math.add(usize, header_and_scores, logits_len) catch return error.InvalidCachedQuery;
+    if (values.len != expected) return error.InvalidCachedQuery;
+
+    const scores = try allocator.dupe(f32, values[4..header_and_scores]);
+    errdefer allocator.free(scores);
+    const logits = try allocator.dupe(f32, values[header_and_scores..]);
+    return .{
+        .allocator = allocator,
+        .scores = scores,
+        .logits = logits,
+        .count = count,
+        .width = width,
+        .height = height,
+        .object_score = values[3],
+    };
 }
 
 var g_app: ?*App = null;
