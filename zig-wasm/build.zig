@@ -37,17 +37,17 @@ pub fn build(b: *std.Build) !void {
     preprocess_obj.addDirectoryArg(cuda.path(b, "include"));
 
     const server = b.addExecutable(.{ .name = server_name, .root_module = server_mod });
-    server.linkLibC();
-    server.addObjectFile(preprocess_o);
-    server.addLibraryPath(onnx_lib.path(b, "lib"));
-    server.addLibraryPath(ffmpeg_lib.path(b, "lib"));
-    server.addLibraryPath(cudart.path(b, "lib"));
-    server.linkSystemLibrary("onnxruntime");
-    server.linkSystemLibrary("cudart");
-    server.linkSystemLibrary("avformat");
-    server.linkSystemLibrary("avcodec");
-    server.linkSystemLibrary("avutil");
-    server.linkSystemLibrary("avfilter");
+    server.root_module.link_libc = true;
+    server.root_module.addObjectFile(preprocess_o);
+    server.root_module.addLibraryPath(onnx_lib.path(b, "lib"));
+    server.root_module.addLibraryPath(ffmpeg_lib.path(b, "lib"));
+    server.root_module.addLibraryPath(cudart.path(b, "lib"));
+    server.root_module.linkSystemLibrary("onnxruntime", .{});
+    server.root_module.linkSystemLibrary("cudart", .{});
+    server.root_module.linkSystemLibrary("avformat", .{});
+    server.root_module.linkSystemLibrary("avcodec", .{});
+    server.root_module.linkSystemLibrary("avutil", .{});
+    server.root_module.linkSystemLibrary("avfilter", .{});
     b.installArtifact(server);
 
     const video_yolo_mod = b.createModule(.{
@@ -61,17 +61,17 @@ pub fn build(b: *std.Build) !void {
     video_yolo_mod.addIncludePath(cuda.path(b, "include"));
 
     const video_yolo = b.addExecutable(.{ .name = "video_yolo", .root_module = video_yolo_mod });
-    video_yolo.linkLibC();
-    video_yolo.addObjectFile(preprocess_o);
-    video_yolo.addLibraryPath(onnx_lib.path(b, "lib"));
-    video_yolo.addLibraryPath(ffmpeg_lib.path(b, "lib"));
-    video_yolo.addLibraryPath(cudart.path(b, "lib"));
-    video_yolo.linkSystemLibrary("onnxruntime");
-    video_yolo.linkSystemLibrary("cudart");
-    video_yolo.linkSystemLibrary("avformat");
-    video_yolo.linkSystemLibrary("avcodec");
-    video_yolo.linkSystemLibrary("avutil");
-    video_yolo.linkSystemLibrary("avfilter");
+    video_yolo.root_module.link_libc = true;
+    video_yolo.root_module.addObjectFile(preprocess_o);
+    video_yolo.root_module.addLibraryPath(onnx_lib.path(b, "lib"));
+    video_yolo.root_module.addLibraryPath(ffmpeg_lib.path(b, "lib"));
+    video_yolo.root_module.addLibraryPath(cudart.path(b, "lib"));
+    video_yolo.root_module.linkSystemLibrary("onnxruntime", .{});
+    video_yolo.root_module.linkSystemLibrary("cudart", .{});
+    video_yolo.root_module.linkSystemLibrary("avformat", .{});
+    video_yolo.root_module.linkSystemLibrary("avcodec", .{});
+    video_yolo.root_module.linkSystemLibrary("avutil", .{});
+    video_yolo.root_module.linkSystemLibrary("avfilter", .{});
     b.installArtifact(video_yolo);
 
     const wasm_app = b.addExecutable(.{
@@ -134,7 +134,7 @@ fn nixPkg(b: *std.Build, name: []const u8, pkg_expr: []const u8) std.Build.LazyP
         \\set -euo pipefail
         \\out="$1"
         \\expr="$2"
-        \\full_expr="let pkgs = import (builtins.getFlake \"github:nixos/nixpkgs/5f9f834d6a9d47adfe7cfbddb86ce406a5d9ea75\").outPath { system = \"$(nix eval --raw --impure --expr builtins.currentSystem)\"; config.allowUnfree = true; }; in $expr"
+        \\full_expr="let pkgs = import (builtins.getFlake \"github:nixos/nixpkgs/5f9f834d6a9d47adfe7cfbddb86ce406a5d9ea75\").outPath { system = \"$(nix eval --raw --impure --expr builtins.currentSystem)\"; config.allowUnfree = true; config.allowUnsupportedSystem = true; }; in $expr"
         \\path="$(nix build --impure --no-link --print-out-paths --expr "$full_expr")"
         \\ln -s "$path" "$out"
         ,

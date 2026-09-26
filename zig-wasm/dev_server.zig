@@ -1,45 +1,42 @@
 const std = @import("std");
-const ChildProcess = std.process.Child;
-const fs = std.fs;
-var gpa: std.heap.DebugAllocator(.{}) = .init;
-const Allocator = std.mem.Allocator;
+const Child = std.process.Child;
 const print = std.log.info;
 
 const server_name = @import("server.zig").server_name;
 
-pub fn main() !void {
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.arena.allocator();
 
-    const dir = try std.fs.selfExeDirPathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(io, allocator);
+    const dir = std.Io.Dir.path.dirname(exe_path) orelse ".";
     const server_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, server_name });
 
-    var last_mod_time: i128 = 0;
+    var last_mod_time: i96 = 0;
 
-    const initial_file_info = try fs.cwd().statFile(server_path);
-    last_mod_time = initial_file_info.mtime;
-    var current_child_process = try startBinary(server_path, allocator);
+    const cwd: std.Io.Dir = .cwd();
+    const initial_file_info = try cwd.statFile(io, server_path, .{});
+    last_mod_time = initial_file_info.mtime.nanoseconds;
+    var current_child_process = try startBinary(io, server_path);
 
     //TODO replace with inotify
     while (true) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        try io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake);
 
-        const stat_result = try fs.cwd().statFile(server_path);
+        const stat_result = try cwd.statFile(io, server_path, .{});
 
-        if (stat_result.mtime != last_mod_time) {
+        if (stat_result.mtime.nanoseconds != last_mod_time) {
             print("Detected change in '{s}'!\n", .{server_path});
 
-            const result = current_child_process.kill();
-            print("kill change in '{any}'!\n", .{result});
-            last_mod_time = stat_result.mtime;
+            current_child_process.kill(io);
+            last_mod_time = stat_result.mtime.nanoseconds;
 
-            current_child_process = try startBinary(server_path, allocator);
+            current_child_process = try startBinary(io, server_path);
             print("Started new process\n", .{});
         }
     }
 }
 
-fn startBinary(binary_path: []const u8, allocator: Allocator) !ChildProcess {
-    var child_process = ChildProcess.init(&.{binary_path}, allocator);
-    try child_process.spawn();
-    return child_process;
+fn startBinary(io: std.Io, binary_path: []const u8) !Child {
+    return std.process.spawn(io, .{ .argv = &.{binary_path} });
 }
