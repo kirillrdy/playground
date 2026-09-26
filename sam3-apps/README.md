@@ -21,9 +21,14 @@ under `zig-out/bin`. `zig build test` runs the Linux font tests on Linux.
 
 The macOS app caches image-and-text query results in `.sam3-zimo` under the
 working directory. Repeating a query for the same image skips vision encoding
-and text lookup. Open a video, enter a word, and press **Find by Word** to play
-with inference on every frame. Playback follows the video's timestamps when
+and text lookup. Open a video, enter a word, and press **Find by Word** to
+process the current frame, then press **Play** to advance with inference on
+each frame. Playback follows the video's timestamps when
 inference is fast enough; otherwise it advances as frames finish. **Play** and
 **Pause** control playback, and Play after the end restarts it. Replaying the
 same video with the same word reuses cached frame results. Linux runs text
 queries directly.
+
+The macOS video controls also include a timeline for seeking, **Restart**, and
+**Next Frame** for stepping while paused. Opening or seeking a video shows the
+decoded frame immediately; when a word is set, its mask appears after inference.

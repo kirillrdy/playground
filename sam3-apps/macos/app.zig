@@ -11,6 +11,8 @@ const SamCallbacks = extern struct {
     on_open_file: ?*const fn (path: [*:0]const u8) callconv(.c) void,
     on_open_video: ?*const fn (path: [*:0]const u8) callconv(.c) void,
     on_video_play_pause: ?*const fn () callconv(.c) void,
+    on_video_seek: ?*const fn (seconds: f64) callconv(.c) void,
+    on_video_step: ?*const fn () callconv(.c) void,
     on_sample_click: ?*const fn () callconv(.c) void,
     on_mode_change: ?*const fn (mode: c_int) callconv(.c) void,
     on_clear_points: ?*const fn () callconv(.c) void,
@@ -38,7 +40,9 @@ extern fn sam_macos_set_image(rgba_pixels: ?[*]const u8, width: c_int, height: c
 extern fn sam_macos_set_masks(count: c_int, masks: ?[*]const SamMaskInfo, best_index: c_int, selected_index: c_int) void;
 extern fn sam_macos_set_busy(is_busy: c_int) void;
 extern fn sam_macos_set_video_mode(active: c_int, playing: c_int) void;
-extern fn sam_macos_video_open(path: [*:0]const u8) ?*anyopaque;
+extern fn sam_macos_set_video_timeline(duration: f64, position: f64) void;
+extern fn sam_macos_video_open(path: [*:0]const u8, start_seconds: f64) ?*anyopaque;
+extern fn sam_macos_video_duration(reader: *anyopaque) f64;
 extern fn sam_macos_video_next(reader: *anyopaque, frame: *VideoFrame) c_int;
 extern fn sam_macos_video_free_frame(frame: *VideoFrame) void;
 extern fn sam_macos_video_close(reader: *anyopaque) void;
@@ -74,6 +78,11 @@ pub const App = struct {
     video_playing: std.atomic.Value(bool) = .init(false),
     video_phrase: [256]u8 = undefined,
     video_phrase_len: usize = 0,
+    video_duration: f64 = 0,
+    video_position: f64 = 0,
+    video_previewed: bool = false,
+    video_seek_target: ?f64 = null,
+    video_step_requested: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model, example_path: []const u8) App {
         return .{
@@ -102,6 +111,8 @@ pub const App = struct {
             .on_open_file = &cOpenFile,
             .on_open_video = &cOpenVideo,
             .on_video_play_pause = &cVideoPlayPause,
+            .on_video_seek = &cVideoSeek,
+            .on_video_step = &cVideoStep,
             .on_sample_click = &cSampleClick,
             .on_mode_change = &cModeChange,
             .on_clear_points = &cClearPoints,
@@ -186,7 +197,13 @@ pub const App = struct {
         self.video_active = false;
         self.video_phrase_len = 0;
         self.video_playing.store(false, .release);
+        self.video_duration = 0;
+        self.video_position = 0;
+        self.video_previewed = false;
+        self.video_seek_target = null;
+        self.video_step_requested = false;
         sam_macos_set_video_mode(0, 0);
+        sam_macos_set_video_timeline(0, 0);
     }
 
     fn openVideoFromPath(self: *App, path: []const u8) void {
@@ -199,6 +216,7 @@ pub const App = struct {
         self.video_stop.store(false, .release);
         self.video_active = true;
         self.mutex.lock(self.io) catch return;
+        self.video_seek_target = 0;
         if (self.image) |*old| old.deinit(self.allocator);
         self.image = null;
         self.allocator.free(self.frame);
@@ -211,15 +229,16 @@ pub const App = struct {
         self.mutex.unlock(self.io);
         sam_macos_set_image(null, 0, 0);
         sam_macos_set_masks(0, null, 0, -1);
+        sam_macos_set_video_mode(1, 0);
+        sam_macos_set_status("Video opened. Enter a word and press Find to process this frame.");
         self.video_thread = std.Thread.spawn(.{}, runVideoWorker, .{self}) catch {
             self.allocator.free(self.video_path.?);
             self.video_path = null;
             self.video_active = false;
+            sam_macos_set_video_mode(0, 0);
             sam_macos_set_status("Could not start video playback.");
             return;
         };
-        sam_macos_set_video_mode(1, 0);
-        sam_macos_set_status("Video opened. Enter a word and press Find to process every frame.");
     }
 
     fn handleVideoPlayPause(self: *App) void {
@@ -237,6 +256,31 @@ pub const App = struct {
         if (!playing) sam_macos_set_status("Video paused.");
     }
 
+    fn handleVideoSeek(self: *App, seconds: f64) void {
+        if (!self.video_active or !std.math.isFinite(seconds)) return;
+        self.mutex.lock(self.io) catch return;
+        const target = std.math.clamp(seconds, 0, self.video_duration);
+        const duration = self.video_duration;
+        self.video_seek_target = target;
+        self.video_step_requested = self.video_phrase_len > 0;
+        self.mutex.unlock(self.io);
+        sam_macos_set_video_timeline(duration, target);
+    }
+
+    fn handleVideoStep(self: *App) void {
+        if (!self.video_active or self.video_playing.load(.acquire)) return;
+        self.mutex.lock(self.io) catch return;
+        const has_phrase = self.video_phrase_len > 0;
+        if (has_phrase) self.video_step_requested = true;
+        self.mutex.unlock(self.io);
+        if (!has_phrase) {
+            sam_macos_set_status("Enter a word and press Find before stepping video.");
+            return;
+        }
+        self.video_playing.store(false, .release);
+        sam_macos_set_video_mode(1, 0);
+    }
+
     fn runVideoWorker(self: *App) void {
         active_model = self.model;
         defer active_model = null;
@@ -246,18 +290,39 @@ pub const App = struct {
         var previous_pts: ?f64 = null;
         var previous_display: ?std.Io.Timestamp = null;
         var retry_required = false;
+        var open_at: f64 = 0;
 
         while (!self.video_stop.load(.acquire)) {
-            if (reader == null and (!retry_required or self.video_playing.load(.acquire))) {
-                reader = sam_macos_video_open(self.video_path.?.ptr);
+            self.mutex.lock(self.io) catch return;
+            const seek = self.video_seek_target;
+            self.video_seek_target = null;
+            const step = self.video_step_requested;
+            self.video_step_requested = false;
+            self.mutex.unlock(self.io);
+            if (seek) |target| {
+                if (reader) |handle| sam_macos_video_close(handle);
+                reader = null;
+                open_at = target;
+                previous_pts = null;
+                previous_display = null;
+                frame_number = 0;
+            }
+            if (reader == null and (!retry_required or self.video_playing.load(.acquire) or step or seek != null)) {
+                reader = sam_macos_video_open(self.video_path.?.ptr, open_at);
                 retry_required = true;
                 if (reader == null) {
                     self.video_playing.store(false, .release);
                     sam_macos_set_video_mode(1, 0);
                     sam_macos_set_status("Could not decode this video.");
+                } else {
+                    const duration = sam_macos_video_duration(reader.?);
+                    self.mutex.lock(self.io) catch return;
+                    self.video_duration = duration;
+                    self.mutex.unlock(self.io);
+                    sam_macos_set_video_timeline(duration, open_at);
                 }
             }
-            if (!self.video_playing.load(.acquire) or reader == null) {
+            if ((!self.video_playing.load(.acquire) and !step and seek == null) or reader == null) {
                 std.Io.sleep(self.io, .fromMilliseconds(20), .awake) catch {};
                 continue;
             }
@@ -274,6 +339,7 @@ pub const App = struct {
                 frame_number = 0;
                 previous_pts = null;
                 previous_display = null;
+                open_at = 0;
                 continue;
             }
             defer sam_macos_video_free_frame(&video_frame);
@@ -281,6 +347,25 @@ pub const App = struct {
             const height: usize = @intCast(video_frame.height);
             const pixels_len = std.math.mul(usize, width, height) catch continue;
             const rgb_len = std.math.mul(usize, pixels_len, 3) catch continue;
+            if (seek != null) {
+                const preview = self.allocator.alloc(u8, std.math.mul(usize, pixels_len, 4) catch continue) catch continue;
+                defer self.allocator.free(preview);
+                const rgb = video_frame.rgb.?;
+                for (0..pixels_len) |i| {
+                    preview[i * 4] = rgb[i * 3];
+                    preview[i * 4 + 1] = rgb[i * 3 + 1];
+                    preview[i * 4 + 2] = rgb[i * 3 + 2];
+                    preview[i * 4 + 3] = 255;
+                }
+                sam_macos_set_image(preview.ptr, @intCast(width), @intCast(height));
+                sam_macos_set_masks(0, null, 0, -1);
+                self.mutex.lock(self.io) catch return;
+                self.video_position = video_frame.pts_seconds;
+                self.video_previewed = true;
+                const duration = self.video_duration;
+                self.mutex.unlock(self.io);
+                sam_macos_set_video_timeline(duration, video_frame.pts_seconds);
+            }
             const pixels = self.allocator.dupe(u8, video_frame.rgb.?[0..rgb_len]) catch continue;
             var decoded = zigimg.Image.fromRawPixelsOwned(width, height, pixels, .rgb24) catch {
                 self.allocator.free(pixels);
@@ -327,18 +412,23 @@ pub const App = struct {
             defer if (masks_owned) masks.deinit();
             const lookup_elapsed = started.untilNow(self.io, .awake);
 
-            if (previous_pts) |pts| {
-                const interval = video_frame.pts_seconds - pts;
-                if (interval > 0 and interval < 1 and std.math.isFinite(interval)) {
-                    const target_ns: i96 = @intFromFloat(interval * 1e9);
-                    const elapsed_ns = previous_display.?.untilNow(self.io, .awake).nanoseconds;
-                    if (target_ns > elapsed_ns) {
-                        std.Io.sleep(self.io, .fromNanoseconds(target_ns - elapsed_ns), .awake) catch {};
+            if (!step) {
+                if (previous_pts) |pts| {
+                    const interval = video_frame.pts_seconds - pts;
+                    if (interval > 0 and interval < 1 and std.math.isFinite(interval)) {
+                        const target_ns: i96 = @intFromFloat(interval * 1e9);
+                        const elapsed_ns = previous_display.?.untilNow(self.io, .awake).nanoseconds;
+                        if (target_ns > elapsed_ns) {
+                            std.Io.sleep(self.io, .fromNanoseconds(target_ns - elapsed_ns), .awake) catch {};
+                        }
                     }
                 }
             }
             if (self.video_stop.load(.acquire)) break;
-            if (!self.video_playing.load(.acquire)) continue;
+            self.mutex.lock(self.io) catch return;
+            const stale = self.video_seek_target != null;
+            self.mutex.unlock(self.io);
+            if (stale or (!self.video_playing.load(.acquire) and !step)) continue;
 
             const rgba_len = std.math.mul(usize, pixels_len, 4) catch continue;
             const next_frame = self.allocator.alloc(u8, rgba_len) catch continue;
@@ -361,6 +451,7 @@ pub const App = struct {
             }
             self.best_mask_idx = if (masks.count == 0) -1 else @intCast(render.scoreMasks(masks.logits, masks.scores, masks.count, masks.width, masks.height, self.coverages));
             self.selected_mask = self.best_mask_idx;
+            self.video_position = video_frame.pts_seconds;
             self.renderComposite(self.selected_mask);
             sam_macos_set_image(self.frame.ptr, @intCast(width), @intCast(height));
             var mask_infos: [64]SamMaskInfo = undefined;
@@ -370,7 +461,9 @@ pub const App = struct {
                 .coverage = if (self.coverages.len > i) self.coverages[i] else 0,
             };
             sam_macos_set_masks(@intCast(count), &mask_infos, self.best_mask_idx, self.selected_mask);
+            const duration = self.video_duration;
             self.mutex.unlock(self.io);
+            sam_macos_set_video_timeline(duration, video_frame.pts_seconds);
 
             frame_number += 1;
             previous_pts = video_frame.pts_seconds;
@@ -486,12 +579,15 @@ pub const App = struct {
         if (phrase.len == 0) return;
         if (self.video_active) {
             self.mutex.lock(self.io) catch return;
+            if (self.video_previewed and self.video_seek_target == null) {
+                self.video_seek_target = self.video_position;
+            }
             self.video_phrase_len = @min(phrase.len, self.video_phrase.len);
             @memcpy(self.video_phrase[0..self.video_phrase_len], phrase[0..self.video_phrase_len]);
+            const playing = self.video_playing.load(.acquire);
+            self.video_step_requested = !playing;
             self.mutex.unlock(self.io);
-            self.video_playing.store(true, .release);
-            sam_macos_set_video_mode(1, 1);
-            sam_macos_set_status("Playing video with text inference on every frame.");
+            sam_macos_set_status(if (playing) "Updating the video prompt…" else "Processing the current video frame…");
             return;
         }
         if (self.is_busy or self.image == null) return;
@@ -756,6 +852,14 @@ fn cOpenVideo(path: [*:0]const u8) callconv(.c) void {
 
 fn cVideoPlayPause() callconv(.c) void {
     if (g_app) |app| app.handleVideoPlayPause();
+}
+
+fn cVideoSeek(seconds: f64) callconv(.c) void {
+    if (g_app) |app| app.handleVideoSeek(seconds);
+}
+
+fn cVideoStep() callconv(.c) void {
+    if (g_app) |app| app.handleVideoStep();
 }
 
 fn cSampleClick() callconv(.c) void {
