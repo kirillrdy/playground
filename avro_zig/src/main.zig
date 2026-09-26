@@ -55,21 +55,22 @@ const Entity = struct {
     embeddings: [][]i32,
 };
 
-pub fn main() !void {
-    var timer = try std.time.Timer.start();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const start_time = std.Io.Clock.Timestamp.now(io, .awake);
     var debug: std.heap.DebugAllocator(.{}) = .init;
     // We use an arena for all parsed data to make cleanup easy
     var arena = std.heap.ArenaAllocator.init(debug.allocator());
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
+    const args = try init.minimal.args.toSlice(allocator);
     // We don't need to free args explicitly as they are in the arena,
     // but typically argsAlloc uses the passed allocator.
     // Arena deinit will handle it.
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_fw = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_fw = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const stdout = &stdout_fw.interface;
 
     if (args.len < 2) {
@@ -79,11 +80,12 @@ pub fn main() !void {
     }
 
     const file_path = args[1];
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
+    const cwd: std.Io.Dir = .cwd();
+    const file = try cwd.openFile(io, file_path, .{});
+    defer file.close(io);
 
     var file_buf: [4096]u8 = undefined;
-    var raw_reader = file.reader(&file_buf);
+    var raw_reader = file.reader(io, &file_buf);
     const reader = &raw_reader.interface;
 
     // 1. Read Magic "Obj\x01"
@@ -141,7 +143,7 @@ pub fn main() !void {
     }
     // Arena will free window_buffer
 
-    var entities: std.ArrayList(Entity) = .{};
+    var entities: std.ArrayList(Entity) = .empty;
 
     var limit_buf: [4096]u8 = undefined;
 
@@ -207,8 +209,8 @@ pub fn main() !void {
         try stdout.print("First Entity Track Count: {d}\n", .{entities.items[0].tracks.len});
     }
 
-    const elapsed = timer.read();
-    try stdout.print("Execution took: {d:.3}ms\n", .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms});
+    const elapsed = start_time.untilNow(io);
+    try stdout.print("Execution took: {d:.3}ms\n", .{@as(f64, @floatFromInt(elapsed.raw.nanoseconds)) / std.time.ns_per_ms});
 
     try stdout.flush();
 }
@@ -329,7 +331,7 @@ fn readIntWrapper(allocator: std.mem.Allocator, reader: anytype) !i32 {
 // --- Generic Array Reader ---
 
 fn readArrayAlloc(comptime T: type, allocator: std.mem.Allocator, reader: anytype, readFn: fn (std.mem.Allocator, anytype) anyerror!T) ![]T {
-    var list: std.ArrayListUnmanaged(T) = .{};
+    var list: std.ArrayList(T) = .empty;
     // Avro arrays are blocks
     var block_count = try readLong(reader);
     while (block_count != 0) {
