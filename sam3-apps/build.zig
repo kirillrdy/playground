@@ -50,6 +50,9 @@ pub fn build(b: *std.Build) void {
         macos_mod.linkFramework("AppKit", .{});
         macos_mod.linkFramework("QuartzCore", .{});
         macos_mod.linkFramework("UniformTypeIdentifiers", .{});
+        macos_mod.linkFramework("AVFoundation", .{});
+        macos_mod.linkFramework("CoreMedia", .{});
+        macos_mod.linkFramework("CoreVideo", .{});
 
         const exe = b.addExecutable(.{ .name = "sam3-macos", .root_module = macos_mod });
         b.installArtifact(exe);

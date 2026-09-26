@@ -1,6 +1,16 @@
 #import <Cocoa/Cocoa.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreVideo/CoreVideo.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "bridge.h"
+
+@interface SamVideoReader : NSObject
+@property (nonatomic, strong) AVAssetReader *reader;
+@property (nonatomic, strong) AVAssetReaderOutput *output;
+@end
+
+@implementation SamVideoReader
+@end
 
 @interface SamCanvasView : NSView
 @property (nonatomic, assign) CGImageRef currentImage;
@@ -104,7 +114,7 @@
         CGContextRestoreGState(ctx);
     } else {
         _imageRect = NSZeroRect;
-        NSString *placeholder = @"Click “Open Image…” or “Sample Image”, or drag an image file here.";
+        NSString *placeholder = @"Open an image or video, or drag a file here.";
         NSDictionary *attrs = @{
             NSFontAttributeName: [NSFont systemFontOfSize:14],
             NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.59 green:0.61 blue:0.65 alpha:1.0]
@@ -165,8 +175,13 @@
     NSPasteboard *pboard = [sender draggingPasteboard];
     if ([[pboard types] containsObject:NSPasteboardTypeFileURL]) {
         NSURL *fileURL = [NSURL URLFromPasteboard:pboard];
-        if (fileURL && _callbacks && _callbacks->on_open_file) {
-            _callbacks->on_open_file([fileURL.path UTF8String]);
+        if (fileURL && _callbacks) {
+            UTType *type = [UTType typeWithFilenameExtension:fileURL.pathExtension];
+            if ([type conformsToType:UTTypeMovie] || [type conformsToType:UTTypeVideo]) {
+                if (_callbacks->on_open_video) _callbacks->on_open_video([fileURL.path UTF8String]);
+            } else if (_callbacks->on_open_file) {
+                _callbacks->on_open_file([fileURL.path UTF8String]);
+            }
             return YES;
         }
     }
@@ -181,6 +196,8 @@
 @property (nonatomic, strong) NSTextField *statusLabel;
 @property (nonatomic, strong) NSTextField *conceptField;
 @property (nonatomic, strong) NSButton *openBtn;
+@property (nonatomic, strong) NSButton *openVideoBtn;
+@property (nonatomic, strong) NSButton *playBtn;
 @property (nonatomic, strong) NSButton *sampleBtn;
 @property (nonatomic, strong) NSSegmentedControl *modeSeg;
 @property (nonatomic, strong) NSButton *clearBtn;
@@ -190,11 +207,13 @@
 @property (nonatomic, strong) NSScrollView *masksScrollView;
 @property (nonatomic, strong) NSMutableArray<NSButton *> *maskButtons;
 @property (nonatomic, assign) const SamCallbacks *callbacks;
+@property (nonatomic, assign) BOOL videoMode;
 
 - (instancetype)initWithCallbacks:(const SamCallbacks *)callbacks;
 - (void)createWindow;
 - (void)updateMasks:(NSArray<NSDictionary *> *)masks bestIndex:(int)bestIndex selectedIndex:(int)selectedIndex;
 - (void)setBusy:(BOOL)busy;
+- (void)setVideoMode:(BOOL)active playing:(BOOL)playing;
 @end
 
 static SamAppDelegate *g_delegate = nil;
@@ -235,6 +254,9 @@ static SamAppDelegate *g_delegate = nil;
 
     // Row 1
     _openBtn = [NSButton buttonWithTitle:@"Open Image…" target:self action:@selector(openFile:)];
+    _openVideoBtn = [NSButton buttonWithTitle:@"Open Video…" target:self action:@selector(openVideo:)];
+    _playBtn = [NSButton buttonWithTitle:@"Play" target:self action:@selector(playPause:)];
+    _playBtn.enabled = NO;
     _sampleBtn = [NSButton buttonWithTitle:@"Sample Image" target:self action:@selector(sampleClick:)];
 
     _modeSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Clicks add to mask", @"Clicks cut from mask"]
@@ -249,6 +271,10 @@ static SamAppDelegate *g_delegate = nil;
     row1.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     row1.spacing = 8.0;
     row1.alignment = NSLayoutAttributeCenterY;
+
+    NSStackView *videoRow = [NSStackView stackViewWithViews:@[_openVideoBtn, _playBtn]];
+    videoRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    videoRow.spacing = 8.0;
 
     // Row 2
     _conceptField = [[NSTextField alloc] init];
@@ -293,7 +319,7 @@ static SamAppDelegate *g_delegate = nil;
     _masksScrollView.documentView = _masksStackView;
 
     // Layout
-    for (NSView *v in @[row1, row2, _statusLabel, _canvasView, _masksScrollView]) {
+    for (NSView *v in @[row1, videoRow, row2, _statusLabel, _canvasView, _masksScrollView]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [contentView addSubview:v];
     }
@@ -305,7 +331,10 @@ static SamAppDelegate *g_delegate = nil;
         [row1.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
 
         // Row 2
-        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:10.0],
+        [videoRow.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:8.0],
+        [videoRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+
+        [row2.topAnchor constraintEqualToAnchor:videoRow.bottomAnchor constant:8.0],
         [row2.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [row2.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_conceptField.widthAnchor constraintGreaterThanOrEqualToConstant:280.0],
@@ -357,6 +386,24 @@ static SamAppDelegate *g_delegate = nil;
             _callbacks->on_open_file([url.path UTF8String]);
         }
     }
+}
+
+- (void)openVideo:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.allowedContentTypes = @[UTTypeMovie, UTTypeVideo];
+    if ([panel runModal] == NSModalResponseOK) {
+        NSURL *url = panel.URLs.firstObject;
+        if (url && _callbacks && _callbacks->on_open_video) {
+            _callbacks->on_open_video([url.path UTF8String]);
+        }
+    }
+}
+
+- (void)playPause:(id)sender {
+    if (_callbacks && _callbacks->on_video_play_pause) _callbacks->on_video_play_pause();
 }
 
 - (void)sampleClick:(id)sender {
@@ -423,6 +470,8 @@ static SamAppDelegate *g_delegate = nil;
 - (void)setBusy:(BOOL)busy {
     _canvasView.isBusy = busy;
     _openBtn.enabled = !busy;
+    _openVideoBtn.enabled = !busy;
+    _playBtn.enabled = !busy && _videoMode;
     _sampleBtn.enabled = !busy;
     _clearBtn.enabled = !busy;
     _findBtn.enabled = !busy;
@@ -433,6 +482,14 @@ static SamAppDelegate *g_delegate = nil;
     } else {
         [_spinner stopAnimation:nil];
     }
+}
+
+- (void)setVideoMode:(BOOL)active playing:(BOOL)playing {
+    _videoMode = active;
+    _playBtn.enabled = active && !_canvasView.isBusy;
+    _playBtn.title = playing ? @"Pause" : @"Play";
+    _clearBtn.enabled = !active && !_canvasView.isBusy;
+    _modeSeg.enabled = !active;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -474,6 +531,7 @@ int sam_macos_init(const SamCallbacks *callbacks) {
         [menubar addItem:fileMenuItem];
         NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
         [fileMenu addItemWithTitle:@"Open Image…" action:@selector(openFile:) keyEquivalent:@"o"];
+        [fileMenu addItemWithTitle:@"Open Video…" action:@selector(openVideo:) keyEquivalent:@"O"];
         [fileMenu addItem:[NSMenuItem separatorItem]];
         [fileMenu addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
         [fileMenuItem setSubmenu:fileMenu];
@@ -505,12 +563,14 @@ void sam_macos_run(void) {
 }
 
 void sam_macos_set_status(const char *text) {
-    NSString *str = text ? [NSString stringWithUTF8String:text] : @"";
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_delegate && g_delegate.statusLabel) {
-            [g_delegate.statusLabel setStringValue:str];
-        }
-    });
+    @autoreleasepool {
+        NSString *str = text ? [NSString stringWithUTF8String:text] : @"";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_delegate && g_delegate.statusLabel) {
+                [g_delegate.statusLabel setStringValue:str];
+            }
+        });
+    }
 }
 
 void sam_macos_set_image(const uint8_t *rgba_pixels, int width, int height) {
@@ -523,6 +583,7 @@ void sam_macos_set_image(const uint8_t *rgba_pixels, int width, int height) {
         return;
     }
 
+    @autoreleasepool {
     NSData *data = [NSData dataWithBytes:rgba_pixels length:(NSUInteger)(width * height * 4)];
     CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
@@ -548,9 +609,11 @@ void sam_macos_set_image(const uint8_t *rgba_pixels, int width, int height) {
         }
         CGImageRelease(cgImage);
     });
+    }
 }
 
 void sam_macos_set_masks(int count, const SamMaskInfo *masks, int best_index, int selected_index) {
+    @autoreleasepool {
     NSMutableArray *list = [NSMutableArray arrayWithCapacity:count];
     for (int i = 0; i < count; i++) {
         [list addObject:@{
@@ -563,6 +626,7 @@ void sam_macos_set_masks(int count, const SamMaskInfo *masks, int best_index, in
             [g_delegate updateMasks:list bestIndex:best_index selectedIndex:selected_index];
         }
     });
+    }
 }
 
 void sam_macos_set_busy(int is_busy) {
@@ -571,6 +635,101 @@ void sam_macos_set_busy(int is_busy) {
             [g_delegate setBusy:(is_busy != 0)];
         }
     });
+}
+
+void sam_macos_set_video_mode(int active, int playing) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_delegate setVideoMode:active != 0 playing:playing != 0];
+    });
+}
+
+void *sam_macos_video_open(const char *path) {
+    @autoreleasepool {
+        NSString *name = [NSString stringWithUTF8String:path];
+        if (!name) return NULL;
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:name] options:nil];
+        NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+        if (tracks.count == 0) return NULL;
+
+        NSError *error = nil;
+        AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&error];
+        if (!reader) {
+            NSLog(@"Video reader failed: %@", error);
+            return NULL;
+        }
+
+        NSDictionary *settings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
+        AVAssetReaderVideoCompositionOutput *output =
+            [AVAssetReaderVideoCompositionOutput assetReaderVideoCompositionOutputWithVideoTracks:tracks
+                                                                           videoSettings:settings];
+        output.videoComposition = [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:asset];
+        if (![reader canAddOutput:output]) return NULL;
+        [reader addOutput:output];
+        if (![reader startReading]) {
+            NSLog(@"Video decoding failed: %@", reader.error);
+            return NULL;
+        }
+
+        SamVideoReader *handle = [[SamVideoReader alloc] init];
+        handle.reader = reader;
+        handle.output = output;
+        return (void *)CFBridgingRetain(handle);
+    }
+}
+
+int sam_macos_video_next(void *opaque, SamVideoFrame *frame) {
+    @autoreleasepool {
+        if (!opaque || !frame) return -1;
+        SamVideoReader *handle = (__bridge SamVideoReader *)opaque;
+        CMSampleBufferRef sample = [handle.output copyNextSampleBuffer];
+        if (!sample) return handle.reader.status == AVAssetReaderStatusCompleted ? 0 : -1;
+        CVPixelBufferRef pixel = CMSampleBufferGetImageBuffer(sample);
+        if (!pixel || CVPixelBufferLockBaseAddress(pixel, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+            CFRelease(sample);
+            return -1;
+        }
+
+        const size_t width = CVPixelBufferGetWidth(pixel);
+        const size_t height = CVPixelBufferGetHeight(pixel);
+        const size_t stride = CVPixelBufferGetBytesPerRow(pixel);
+        uint8_t *rgb = NULL;
+        if (width > 0 && height > 0 && width <= 16384 && height <= 16384 &&
+            width * height <= SIZE_MAX / 3) {
+            rgb = malloc(width * height * 3);
+        }
+        if (rgb) {
+            const uint8_t *base = CVPixelBufferGetBaseAddress(pixel);
+            for (size_t y = 0; y < height; ++y) {
+                const uint8_t *src = base + y * stride;
+                uint8_t *dst = rgb + y * width * 3;
+                for (size_t x = 0; x < width; ++x) {
+                    dst[x * 3] = src[x * 4 + 2];
+                    dst[x * 3 + 1] = src[x * 4 + 1];
+                    dst[x * 3 + 2] = src[x * 4];
+                }
+            }
+            frame->rgb = rgb;
+            frame->width = (int)width;
+            frame->height = (int)height;
+            frame->pts_seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample));
+        }
+        CVPixelBufferUnlockBaseAddress(pixel, kCVPixelBufferLock_ReadOnly);
+        CFRelease(sample);
+        return rgb ? 1 : -1;
+    }
+}
+
+void sam_macos_video_free_frame(SamVideoFrame *frame) {
+    if (frame) {
+        free(frame->rgb);
+        frame->rgb = NULL;
+    }
+}
+
+void sam_macos_video_close(void *opaque) {
+    if (!opaque) return;
+    SamVideoReader *handle = CFBridgingRelease(opaque);
+    [handle.reader cancelReading];
 }
 
 void sam_macos_dispatch_main(void (*fn)(void *ctx), void *ctx) {
