@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#include <math.h>
 #import "bridge.h"
 
 @interface SamVideoReader : NSObject
@@ -198,6 +199,10 @@
 @property (nonatomic, strong) NSButton *openBtn;
 @property (nonatomic, strong) NSButton *openVideoBtn;
 @property (nonatomic, strong) NSButton *playBtn;
+@property (nonatomic, strong) NSButton *stepBtn;
+@property (nonatomic, strong) NSButton *restartBtn;
+@property (nonatomic, strong) NSSlider *seekSlider;
+@property (nonatomic, strong) NSTextField *timeLabel;
 @property (nonatomic, strong) NSButton *sampleBtn;
 @property (nonatomic, strong) NSSegmentedControl *modeSeg;
 @property (nonatomic, strong) NSButton *clearBtn;
@@ -208,12 +213,14 @@
 @property (nonatomic, strong) NSMutableArray<NSButton *> *maskButtons;
 @property (nonatomic, assign) const SamCallbacks *callbacks;
 @property (nonatomic, assign) BOOL videoMode;
+@property (nonatomic, assign) BOOL videoPlaying;
 
 - (instancetype)initWithCallbacks:(const SamCallbacks *)callbacks;
 - (void)createWindow;
 - (void)updateMasks:(NSArray<NSDictionary *> *)masks bestIndex:(int)bestIndex selectedIndex:(int)selectedIndex;
 - (void)setBusy:(BOOL)busy;
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing;
+- (void)setVideoTimelineDuration:(double)duration position:(double)position;
 @end
 
 static SamAppDelegate *g_delegate = nil;
@@ -257,6 +264,15 @@ static SamAppDelegate *g_delegate = nil;
     _openVideoBtn = [NSButton buttonWithTitle:@"Open Video…" target:self action:@selector(openVideo:)];
     _playBtn = [NSButton buttonWithTitle:@"Play" target:self action:@selector(playPause:)];
     _playBtn.enabled = NO;
+    _stepBtn = [NSButton buttonWithTitle:@"Next Frame" target:self action:@selector(stepFrame:)];
+    _stepBtn.enabled = NO;
+    _restartBtn = [NSButton buttonWithTitle:@"Restart" target:self action:@selector(restartVideo:)];
+    _restartBtn.enabled = NO;
+    _seekSlider = [NSSlider sliderWithValue:0 minValue:0 maxValue:1 target:self action:@selector(seekVideo:)];
+    _seekSlider.continuous = NO;
+    _seekSlider.enabled = NO;
+    _timeLabel = [NSTextField labelWithString:@"0:00 / 0:00"];
+    _timeLabel.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
     _sampleBtn = [NSButton buttonWithTitle:@"Sample Image" target:self action:@selector(sampleClick:)];
 
     _modeSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Clicks add to mask", @"Clicks cut from mask"]
@@ -272,9 +288,10 @@ static SamAppDelegate *g_delegate = nil;
     row1.spacing = 8.0;
     row1.alignment = NSLayoutAttributeCenterY;
 
-    NSStackView *videoRow = [NSStackView stackViewWithViews:@[_openVideoBtn, _playBtn]];
+    NSStackView *videoRow = [NSStackView stackViewWithViews:@[_openVideoBtn, _restartBtn, _playBtn, _stepBtn, _seekSlider, _timeLabel]];
     videoRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     videoRow.spacing = 8.0;
+    videoRow.alignment = NSLayoutAttributeCenterY;
 
     // Row 2
     _conceptField = [[NSTextField alloc] init];
@@ -333,6 +350,8 @@ static SamAppDelegate *g_delegate = nil;
         // Row 2
         [videoRow.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:8.0],
         [videoRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+        [videoRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [_seekSlider.widthAnchor constraintGreaterThanOrEqualToConstant:120.0],
 
         [row2.topAnchor constraintEqualToAnchor:videoRow.bottomAnchor constant:8.0],
         [row2.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
@@ -406,6 +425,18 @@ static SamAppDelegate *g_delegate = nil;
     if (_callbacks && _callbacks->on_video_play_pause) _callbacks->on_video_play_pause();
 }
 
+- (void)restartVideo:(id)sender {
+    if (_callbacks && _callbacks->on_video_seek) _callbacks->on_video_seek(0);
+}
+
+- (void)stepFrame:(id)sender {
+    if (_callbacks && _callbacks->on_video_step) _callbacks->on_video_step();
+}
+
+- (void)seekVideo:(NSSlider *)sender {
+    if (_callbacks && _callbacks->on_video_seek) _callbacks->on_video_seek(sender.doubleValue);
+}
+
 - (void)sampleClick:(id)sender {
     if (_callbacks && _callbacks->on_sample_click) {
         _callbacks->on_sample_click();
@@ -472,6 +503,9 @@ static SamAppDelegate *g_delegate = nil;
     _openBtn.enabled = !busy;
     _openVideoBtn.enabled = !busy;
     _playBtn.enabled = !busy && _videoMode;
+    _stepBtn.enabled = !busy && _videoMode && !_videoPlaying;
+    _restartBtn.enabled = !busy && _videoMode;
+    _seekSlider.enabled = !busy && _videoMode && _seekSlider.maxValue > 0;
     _sampleBtn.enabled = !busy;
     _clearBtn.enabled = !busy;
     _findBtn.enabled = !busy;
@@ -486,10 +520,25 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing {
     _videoMode = active;
+    _videoPlaying = playing;
     _playBtn.enabled = active && !_canvasView.isBusy;
+    _stepBtn.enabled = active && !playing && !_canvasView.isBusy;
+    _restartBtn.enabled = active && !_canvasView.isBusy;
+    _seekSlider.enabled = active && !_canvasView.isBusy && _seekSlider.maxValue > 0;
     _playBtn.title = playing ? @"Pause" : @"Play";
     _clearBtn.enabled = !active && !_canvasView.isBusy;
     _modeSeg.enabled = !active;
+}
+
+- (void)setVideoTimelineDuration:(double)duration position:(double)position {
+    double safeDuration = isfinite(duration) && duration > 0 ? duration : 0;
+    double safePosition = isfinite(position) ? fmax(0, fmin(position, safeDuration)) : 0;
+    _seekSlider.maxValue = safeDuration > 0 ? safeDuration : 1;
+    _seekSlider.doubleValue = safePosition;
+    _seekSlider.enabled = _videoMode && !_canvasView.isBusy && safeDuration > 0;
+    _timeLabel.stringValue = [NSString stringWithFormat:@"%d:%02d / %d:%02d",
+                              (int)safePosition / 60, (int)safePosition % 60,
+                              (int)safeDuration / 60, (int)safeDuration % 60];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -643,7 +692,13 @@ void sam_macos_set_video_mode(int active, int playing) {
     });
 }
 
-void *sam_macos_video_open(const char *path) {
+void sam_macos_set_video_timeline(double duration, double position) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_delegate setVideoTimelineDuration:duration position:position];
+    });
+}
+
+void *sam_macos_video_open(const char *path, double start_seconds) {
     @autoreleasepool {
         NSString *name = [NSString stringWithUTF8String:path];
         if (!name) return NULL;
@@ -656,6 +711,14 @@ void *sam_macos_video_open(const char *path) {
         if (!reader) {
             NSLog(@"Video reader failed: %@", error);
             return NULL;
+        }
+        double duration = CMTimeGetSeconds(asset.duration);
+        if (isfinite(duration) && duration > 0 && start_seconds >= duration) {
+            start_seconds = fmax(0, duration - 1.0 / 60000.0);
+        }
+        if (isfinite(start_seconds) && start_seconds > 0 && isfinite(duration) && start_seconds < duration) {
+            CMTime start = CMTimeMakeWithSeconds(start_seconds, 60000);
+            reader.timeRange = CMTimeRangeFromTimeToTime(start, asset.duration);
         }
 
         NSDictionary *settings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
@@ -675,6 +738,13 @@ void *sam_macos_video_open(const char *path) {
         handle.output = output;
         return (void *)CFBridgingRetain(handle);
     }
+}
+
+double sam_macos_video_duration(void *opaque) {
+    if (!opaque) return 0;
+    SamVideoReader *handle = (__bridge SamVideoReader *)opaque;
+    double duration = CMTimeGetSeconds(handle.reader.asset.duration);
+    return isfinite(duration) && duration > 0 ? duration : 0;
 }
 
 int sam_macos_video_next(void *opaque, SamVideoFrame *frame) {
