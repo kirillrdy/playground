@@ -25,6 +25,9 @@ typedef struct {
 typedef struct {
     float score;
     float coverage;
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
 } SamMaskInfo;
 
 typedef struct {

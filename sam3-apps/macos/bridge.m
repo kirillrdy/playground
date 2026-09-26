@@ -466,6 +466,9 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)maskClicked:(NSButton *)sender {
     int index = (int)sender.tag;
+    for (NSButton *button in _maskButtons) {
+        button.state = button == sender ? NSControlStateValueOn : NSControlStateValueOff;
+    }
     if (_callbacks && _callbacks->on_select_mask) {
         _callbacks->on_select_mask(index);
     }
@@ -480,18 +483,20 @@ static SamAppDelegate *g_delegate = nil;
     for (int i = 0; i < (int)masks.count; i++) {
         float score = [masks[i][@"score"] floatValue];
         float coverage = [masks[i][@"coverage"] floatValue];
+        NSColor *color = [NSColor colorWithCalibratedRed:[masks[i][@"red"] doubleValue] / 255.0
+                                                  green:[masks[i][@"green"] doubleValue] / 255.0
+                                                   blue:[masks[i][@"blue"] doubleValue] / 255.0
+                                                  alpha:1.0];
         NSString *star = (i == bestIndex) ? @" ★" : @"";
-        NSString *title = [NSString stringWithFormat:@"Mask %d%@ (%.3f · %.1f%%)",
+        NSString *title = [NSString stringWithFormat:@"● Mask %d%@ (%.3f · %.1f%%)",
                            i, star, score, coverage * 100.0f];
 
         NSButton *btn = [NSButton buttonWithTitle:title target:self action:@selector(maskClicked:)];
         btn.tag = i;
         btn.bezelStyle = NSBezelStyleRounded;
-        if (i == selectedIndex) {
-            btn.contentTintColor = [NSColor colorWithCalibratedRed:0.0 green:0.86 blue:0.39 alpha:1.0];
-        } else {
-            btn.contentTintColor = [NSColor colorWithCalibratedRed:0.90 green:0.91 blue:0.93 alpha:1.0];
-        }
+        [btn setButtonType:NSButtonTypeToggle];
+        btn.state = i == selectedIndex ? NSControlStateValueOn : NSControlStateValueOff;
+        btn.contentTintColor = color;
 
         [_masksStackView addArrangedSubview:btn];
         [_maskButtons addObject:btn];
@@ -667,7 +672,10 @@ void sam_macos_set_masks(int count, const SamMaskInfo *masks, int best_index, in
     for (int i = 0; i < count; i++) {
         [list addObject:@{
             @"score": @(masks[i].score),
-            @"coverage": @(masks[i].coverage)
+            @"coverage": @(masks[i].coverage),
+            @"red": @(masks[i].red),
+            @"green": @(masks[i].green),
+            @"blue": @(masks[i].blue)
         }];
     }
     dispatch_async(dispatch_get_main_queue(), ^{

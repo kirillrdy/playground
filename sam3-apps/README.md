@@ -32,3 +32,5 @@ queries directly.
 The macOS video controls also include a timeline for seeking, **Restart**, and
 **Next Frame** for stepping while paused. Opening or seeking a video shows the
 decoded frame immediately; when a word is set, its mask appears after inference.
+All returned masks appear together in distinct colors. Select a mask in the bar
+to make it more prominent while keeping the others visible.
