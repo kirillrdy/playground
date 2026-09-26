@@ -1,8 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) !void {
     //const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{
+        .default_target = if (builtin.os.tag == .macos) .{
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+        } else .{},
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const geos_source = b.dependency("geos_source", .{});
@@ -90,6 +96,8 @@ pub fn build(b: *std.Build) !void {
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
         }),
         .kind = .lib,
         .linkage = .static,
@@ -551,22 +559,21 @@ pub fn build(b: *std.Build) !void {
         "src/index/intervalrtree/SortedPackedIntervalRTree.cpp",
     };
 
-    geos_lib.addCSourceFiles(.{
+    geos_lib.root_module.addCSourceFiles(.{
         .root = geos_source.path(""),
         .files = &geos_cpp_files,
         .flags = cpp_flags,
     });
 
     // Add ryu source
-    geos_lib.addCSourceFile(.{
+    geos_lib.root_module.addCSourceFile(.{
         .file = geos_source.path("src/deps/ryu/d2s.c"),
         .flags = &[_][]const u8{"-std=c11"},
     });
 
-    geos_lib.addIncludePath(geos_source.path("include"));
-    geos_lib.addIncludePath(geos_source.path("src/deps"));
-    geos_lib.addIncludePath(version_h_step.getOutputDir());
-    geos_lib.linkLibCpp();
+    geos_lib.root_module.addIncludePath(geos_source.path("include"));
+    geos_lib.root_module.addIncludePath(geos_source.path("src/deps"));
+    geos_lib.root_module.addIncludePath(version_h_step.getOutputDir());
     b.installArtifact(geos_lib);
 
     // Build the GEOS C API library
@@ -575,12 +582,14 @@ pub fn build(b: *std.Build) !void {
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
         }),
         .kind = .lib,
         .linkage = .static,
     });
 
-    geos_c_lib.addCSourceFiles(.{
+    geos_c_lib.root_module.addCSourceFiles(.{
         .root = geos_source.path(""),
         .files = &.{
             "capi/geos_c.cpp",
@@ -589,12 +598,11 @@ pub fn build(b: *std.Build) !void {
         .flags = cpp_flags,
     });
 
-    geos_c_lib.addIncludePath(geos_source.path("include"));
-    geos_c_lib.addIncludePath(geos_source.path("src/deps"));
-    geos_c_lib.addIncludePath(geos_c_h_step.getOutputDir());
-    geos_c_lib.addIncludePath(version_h_step.getOutputDir());
-    geos_c_lib.linkLibrary(geos_lib);
-    geos_c_lib.linkLibCpp();
+    geos_c_lib.root_module.addIncludePath(geos_source.path("include"));
+    geos_c_lib.root_module.addIncludePath(geos_source.path("src/deps"));
+    geos_c_lib.root_module.addIncludePath(geos_c_h_step.getOutputDir());
+    geos_c_lib.root_module.addIncludePath(version_h_step.getOutputDir());
+    geos_c_lib.root_module.linkLibrary(geos_lib);
     b.installArtifact(geos_c_lib);
 
     // Build the example app
@@ -604,14 +612,15 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
         }),
     });
 
-    exe.addIncludePath(geos_c_h_step.getOutputDir());
-    exe.addIncludePath(geos_source.path("include"));
-    exe.linkLibrary(geos_c_lib);
-    exe.linkLibrary(geos_lib);
-    exe.linkLibCpp();
+    exe.root_module.addIncludePath(geos_c_h_step.getOutputDir());
+    exe.root_module.addIncludePath(geos_source.path("include"));
+    exe.root_module.linkLibrary(geos_c_lib);
+    exe.root_module.linkLibrary(geos_lib);
 
     b.installArtifact(exe);
 
