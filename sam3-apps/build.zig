@@ -21,12 +21,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const zimo = b.dependency("zimo", .{});
+    const log = b.createModule(.{
+        .root_source_file = b.path("log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const native_main = b.createModule(.{
         .root_source_file = b.path("native_main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "sam3", .module = sam3.module("sam3") }},
+        .imports = &.{
+            .{ .name = "sam3", .module = sam3.module("sam3") },
+            .{ .name = "log", .module = log },
+        },
     });
 
     if (target.result.os.tag.isDarwin()) {
@@ -40,6 +48,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zigimg", .module = zigimg.module("zigimg") },
                 .{ .name = "zimo", .module = zimo.module("zimo") },
                 .{ .name = "native_main", .module = native_main },
+                .{ .name = "log", .module = log },
             },
         });
         macos_mod.addIncludePath(b.path("macos"));

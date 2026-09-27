@@ -3,6 +3,7 @@ const sam3 = @import("sam3");
 const render = sam3.render;
 const zigimg = @import("zigimg");
 const zimo = @import("zimo");
+const log = @import("log");
 const here = zimo.bind(@This(), @embedFile("app.zig"));
 
 const SamCallbacks = extern struct {
@@ -156,7 +157,7 @@ pub const App = struct {
             self.allocator,
             .limited(64 * 1024 * 1024),
         ) catch |err| {
-            std.debug.print("Failed to read image file {s}: {t}\n", .{ path, err });
+            log.info(self.io, "Failed to read image file {s}: {t}", .{ path, err });
             sam_macos_set_status("Could not open that file.");
             return;
         };
@@ -170,7 +171,7 @@ pub const App = struct {
         defer self.mutex.unlock(self.io);
 
         var decoded = sam3.decodeImage(self.allocator, bytes) catch |err| {
-            std.debug.print("Failed to decode image: {t}\n", .{err});
+            log.info(self.io, "Failed to decode image: {t}", .{err});
             sam_macos_set_status("That file is not an image this can decode.");
             return;
         };
@@ -409,7 +410,7 @@ pub const App = struct {
                 phrase,
                 @as(f32, 0.5),
             }) catch |err| {
-                std.debug.print("Video frame lookup failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
+                log.info(self.io, "Video frame lookup failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
                 sam_macos_set_status("Video frame inference failed.");
                 self.video_playing.store(false, .release);
                 sam_macos_set_video_mode(1, 0);
@@ -486,7 +487,7 @@ pub const App = struct {
                 timecode, masks.count, phrase, lookup_elapsed,
             }) catch "Video frame processed.";
             sam_macos_set_status(status);
-            std.debug.print("  at {s}: \"{s}\" -> {d} object(s) in {f}\n", .{
+            log.info(self.io, "at {s}: \"{s}\" -> {d} object(s) in {f}", .{
                 timecode, phrase, masks.count, lookup_elapsed,
             });
         }
@@ -523,7 +524,7 @@ pub const App = struct {
         const started = std.Io.Timestamp.now(self.io, .awake);
 
         var embedding = self.ensureEmbedding(false) catch |err| {
-            std.debug.print("Vision encoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
+            log.info(self.io, "Vision encoder failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Vision encoder failed");
             self.is_busy = false;
             sam_macos_set_busy(0);
@@ -533,14 +534,14 @@ pub const App = struct {
 
         const decode_started = std.Io.Timestamp.now(self.io, .awake);
         const masks = self.model.segment(&embedding, self.points[0..self.points_len]) catch |err| {
-            std.debug.print("Decoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
+            log.info(self.io, "Decoder failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Segmentation failed");
             self.is_busy = false;
             sam_macos_set_busy(0);
             return;
         };
         const decode_elapsed = decode_started.untilNow(self.io, .awake);
-        std.debug.print("  {d} point(s) -> {d} masks in {f}\n", .{
+        log.info(self.io, "{d} point(s) -> {d} masks in {f}", .{
             self.points_len,
             masks.count,
             decode_elapsed,
@@ -653,7 +654,7 @@ pub const App = struct {
             phrase,
             @as(f32, 0.5),
         }) catch |err| {
-            std.debug.print("Text lookup failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
+            log.info(self.io, "Text lookup failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Text lookup failed");
             self.is_busy = false;
             sam_macos_set_busy(0);
@@ -661,14 +662,14 @@ pub const App = struct {
         };
         defer self.allocator.free(values);
         const masks = unpackMasks(self.allocator, values) catch |err| {
-            std.debug.print("Cached text lookup failed: {t}\n", .{err});
+            log.info(self.io, "Cached text lookup failed: {t}", .{err});
             sam_macos_set_status("Text lookup failed");
             self.is_busy = false;
             sam_macos_set_busy(0);
             return;
         };
         const lookup_elapsed = lookup_started.untilNow(self.io, .awake);
-        std.debug.print("  \"{s}\" -> {d} object(s) in {f}\n", .{
+        log.info(self.io, "\"{s}\" -> {d} object(s) in {f}", .{
             phrase,
             masks.count,
             lookup_elapsed,
@@ -750,7 +751,7 @@ pub const App = struct {
         const started = std.Io.Timestamp.now(self.io, .awake);
         const rgb = sam3.RgbImage.fromImage(img);
         const embedding = if (concept) try self.model.encodeForText(rgb) else try self.model.encodePoints(rgb);
-        std.debug.print("  {s}encoded {d}x{d} in {f}\n", .{
+        log.info(self.io, "{s}encoded {d}x{d} in {f}", .{
             if (concept) "concept-" else "",
             img.width,
             img.height,
