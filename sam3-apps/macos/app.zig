@@ -6,6 +6,12 @@ const zimo = @import("zimo");
 const here = zimo.bind(@This(), @embedFile("app.zig"));
 threadlocal var active_model: ?*sam3.Model = null;
 threadlocal var query_computed = false;
+threadlocal var text_features_computed = false;
+
+fn cacheDescription() []const u8 {
+    if (!query_computed) return "cache hit";
+    return if (text_features_computed) "computed" else "computed, text cache hit";
+}
 
 const SamCallbacks = extern struct {
     on_open_file: ?*const fn (path: [*:0]const u8) callconv(.c) void,
@@ -410,6 +416,8 @@ pub const App = struct {
                     sam3.assets.concept_text_encoder.sha256,
                     sam3.assets.concept_decoder.sha256,
                     sam3.assets.concept_tokenizer_json.sha256,
+                    sam3.assets.concept_vision_encoder_data.sha256,
+                    sam3.assets.concept_text_encoder_data.sha256,
                 },
                 sam3.RgbImage.fromImage(decoded),
                 phrase,
@@ -422,7 +430,7 @@ pub const App = struct {
                 continue;
             };
             defer self.allocator.free(values);
-            const cache_hit = !query_computed;
+            const cache_status = cacheDescription();
             var masks = unpackMasks(self.allocator, values) catch {
                 sam_macos_set_status("Cached video frame is invalid.");
                 continue;
@@ -484,12 +492,12 @@ pub const App = struct {
             var status_buf: [256]u8 = undefined;
             const status = std.fmt.bufPrintZ(&status_buf, "Frame {d}: {d} match(es) for “{s}” in {f} ({s})", .{
                 frame_number, masks.count, phrase, lookup_elapsed,
-                if (cache_hit) "cache hit" else "computed",
+                cache_status,
             }) catch "Video frame processed.";
             sam_macos_set_status(status);
             std.debug.print("  frame {d}: \"{s}\" -> {d} object(s) in {f} ({s})\n", .{
                 frame_number, phrase, masks.count, lookup_elapsed,
-                if (cache_hit) "cache hit" else "computed",
+                cache_status,
             });
         }
     }
@@ -651,6 +659,8 @@ pub const App = struct {
                 sam3.assets.concept_text_encoder.sha256,
                 sam3.assets.concept_decoder.sha256,
                 sam3.assets.concept_tokenizer_json.sha256,
+                sam3.assets.concept_vision_encoder_data.sha256,
+                sam3.assets.concept_text_encoder_data.sha256,
             },
             sam3.RgbImage.fromImage(self.image.?),
             phrase,
@@ -663,7 +673,7 @@ pub const App = struct {
             return;
         };
         defer self.allocator.free(values);
-        const cache_hit = !query_computed;
+        const cache_status = cacheDescription();
         const masks = unpackMasks(self.allocator, values) catch |err| {
             std.debug.print("Cached text lookup failed: {t}\n", .{err});
             sam_macos_set_status("Text lookup failed");
@@ -676,7 +686,7 @@ pub const App = struct {
             phrase,
             masks.count,
             lookup_elapsed,
-            if (cache_hit) "cache hit" else "computed",
+            cache_status,
         });
 
         self.mutex.lock(self.io) catch return;
@@ -860,17 +870,27 @@ fn blendChannel(original: u8, tint: u8, alpha: f32) u8 {
 
 pub fn computeQuery(
     allocator: std.mem.Allocator,
-    model_ids: [4][]const u8,
+    model_ids: [6][]const u8,
     image: sam3.RgbImage,
     phrase: []const u8,
     min_score: f32,
 ) ![]f32 {
-    _ = model_ids;
     query_computed = true;
     const model = active_model orelse return error.NoActiveModel;
+    text_features_computed = false;
+    const text_features = try here.call(.computeTextFeatures, .{
+        allocator,
+        [_][]const u8{
+            model_ids[1],
+            model_ids[5],
+            model_ids[3],
+        },
+        phrase,
+    });
+    defer allocator.free(text_features);
     var embedding = try model.encodeForText(image);
     defer embedding.deinit();
-    var masks = try model.find(&embedding, phrase, .{ .min_score = min_score });
+    var masks = try model.findWithTextFeatures(&embedding, phrase, text_features, .{ .min_score = min_score });
     defer masks.deinit();
 
     const header_and_scores = try std.math.add(usize, 4, masks.scores.len);
@@ -883,6 +903,18 @@ pub fn computeQuery(
     @memcpy(values[4..][0..masks.scores.len], masks.scores);
     @memcpy(values[header_and_scores..], masks.logits);
     return values;
+}
+
+pub fn computeTextFeatures(
+    allocator: std.mem.Allocator,
+    model_ids: [3][]const u8,
+    phrase: []const u8,
+) ![]f32 {
+    _ = allocator;
+    _ = model_ids;
+    text_features_computed = true;
+    const model = active_model orelse return error.NoActiveModel;
+    return model.encodeTextFeatures(phrase);
 }
 
 fn unpackMasks(allocator: std.mem.Allocator, values: []const f32) !sam3.Masks {
