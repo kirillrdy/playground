@@ -4,7 +4,6 @@ const render = sam3.render;
 const zigimg = @import("zigimg");
 const zimo = @import("zimo");
 const here = zimo.bind(@This(), @embedFile("app.zig"));
-threadlocal var active_model: ?*sam3.Model = null;
 threadlocal var query_computed = false;
 threadlocal var text_features_computed = false;
 
@@ -307,8 +306,6 @@ pub const App = struct {
     }
 
     fn runVideoWorker(self: *App) void {
-        active_model = self.model;
-        defer active_model = null;
         var reader: ?*anyopaque = null;
         defer if (reader) |handle| sam_macos_video_close(handle);
         var frame_number: usize = 0;
@@ -649,8 +646,6 @@ pub const App = struct {
         const started = std.Io.Timestamp.now(self.io, .awake);
 
         const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-        active_model = self.model;
-        defer active_model = null;
         query_computed = false;
         const values = here.call(.computeQuery, .{
             self.allocator,
@@ -876,7 +871,7 @@ pub fn computeQuery(
     min_score: f32,
 ) ![]f32 {
     query_computed = true;
-    const model = active_model orelse return error.NoActiveModel;
+    const model = (g_app orelse return error.NoActiveApp).model;
     text_features_computed = false;
     const text_features = try here.call(.computeTextFeatures, .{
         allocator,
@@ -913,7 +908,7 @@ pub fn computeTextFeatures(
     _ = allocator;
     _ = model_ids;
     text_features_computed = true;
-    const model = active_model orelse return error.NoActiveModel;
+    const model = (g_app orelse return error.NoActiveApp).model;
     return model.encodeTextFeatures(phrase);
 }
 
