@@ -77,6 +77,7 @@ pub const App = struct {
     example_path: []const u8,
 
     mutex: std.Io.Mutex = .init,
+    model_mutex: std.Io.Mutex = .init,
     is_busy: bool = false,
 
     image: ?zigimg.Image = null,
@@ -103,7 +104,7 @@ pub const App = struct {
     video_previewed: bool = false,
     video_seek_target: ?f64 = null,
     video_step_requested: bool = false,
-    precache_requested: bool = false,
+    precache_thread: ?std.Thread = null,
     precache_active: std.atomic.Value(bool) = .init(false),
     precache_cancel: std.atomic.Value(bool) = .init(false),
     precache_phrase: [256]u8 = undefined,
@@ -218,7 +219,9 @@ pub const App = struct {
         self.video_stop.store(true, .release);
         self.precache_cancel.store(true, .release);
         if (self.video_thread) |thread| thread.join();
+        if (self.precache_thread) |thread| thread.join();
         self.video_thread = null;
+        self.precache_thread = null;
         if (self.video_path) |path| self.allocator.free(path);
         self.video_path = null;
         self.video_active = false;
@@ -229,7 +232,6 @@ pub const App = struct {
         self.video_previewed = false;
         self.video_seek_target = null;
         self.video_step_requested = false;
-        self.precache_requested = false;
         self.precache_active.store(false, .release);
         self.precache_phrase_len = 0;
         sam_macos_set_video_mode(0, 0);
@@ -274,7 +276,7 @@ pub const App = struct {
     }
 
     fn handleVideoPlayPause(self: *App) void {
-        if (!self.video_active or self.precache_active.load(.acquire)) return;
+        if (!self.video_active) return;
         self.mutex.lock(self.io) catch return;
         const has_phrase = self.video_phrase_len > 0;
         self.mutex.unlock(self.io);
@@ -289,7 +291,7 @@ pub const App = struct {
     }
 
     fn handleVideoSeek(self: *App, seconds: f64) void {
-        if (!self.video_active or self.precache_active.load(.acquire) or !std.math.isFinite(seconds)) return;
+        if (!self.video_active or !std.math.isFinite(seconds)) return;
         self.mutex.lock(self.io) catch return;
         const target = std.math.clamp(seconds, 0, self.video_duration);
         const duration = self.video_duration;
@@ -300,7 +302,7 @@ pub const App = struct {
     }
 
     fn handleVideoStep(self: *App) void {
-        if (!self.video_active or self.precache_active.load(.acquire) or self.video_playing.load(.acquire)) return;
+        if (!self.video_active or self.video_playing.load(.acquire)) return;
         self.mutex.lock(self.io) catch return;
         const has_phrase = self.video_phrase_len > 0;
         if (has_phrase) self.video_step_requested = true;
@@ -320,6 +322,10 @@ pub const App = struct {
             sam_macos_set_status("Cancelling pre-cache after this frame…");
             return;
         }
+        if (self.precache_thread) |thread| {
+            thread.join();
+            self.precache_thread = null;
+        }
         const phrase = std.mem.span(text);
         if (phrase.len == 0) {
             sam_macos_set_status("Enter a word to pre-cache this video.");
@@ -330,16 +336,29 @@ pub const App = struct {
         @memcpy(self.precache_phrase[0..self.precache_phrase_len], phrase[0..self.precache_phrase_len]);
         self.video_phrase_len = self.precache_phrase_len;
         @memcpy(self.video_phrase[0..self.video_phrase_len], self.precache_phrase[0..self.precache_phrase_len]);
-        self.precache_requested = true;
         self.precache_cancel.store(false, .release);
         self.precache_active.store(true, .release);
-        self.video_playing.store(false, .release);
-        self.video_step_requested = false;
-        self.video_seek_target = null;
         self.mutex.unlock(self.io);
-        sam_macos_set_video_mode(1, 0);
         sam_macos_set_precache_progress(1, 0);
         sam_macos_set_status("Pre-caching video frames…");
+        self.precache_thread = std.Thread.spawn(.{}, runPrecacheWorker, .{self}) catch {
+            self.precache_active.store(false, .release);
+            sam_macos_set_precache_progress(0, 0);
+            sam_macos_set_status("Could not start video pre-cache.");
+            return;
+        };
+    }
+
+    fn runPrecacheWorker(self: *App) void {
+        self.runPrecache(self.precache_phrase[0..self.precache_phrase_len]);
+        self.precache_active.store(false, .release);
+        sam_macos_set_precache_progress(2, 0);
+        if (!self.video_stop.load(.acquire) and !self.video_playing.load(.acquire)) {
+            self.mutex.lock(self.io) catch return;
+            self.video_seek_target = self.video_position;
+            self.video_step_requested = true;
+            self.mutex.unlock(self.io);
+        }
     }
 
     fn runVideoWorker(self: *App) void {
@@ -352,35 +371,11 @@ pub const App = struct {
 
         while (!self.video_stop.load(.acquire)) {
             self.mutex.lock(self.io) catch return;
-            const precache = self.precache_requested;
-            self.precache_requested = false;
-            var precache_phrase: [256]u8 = undefined;
-            const precache_len = if (precache) self.precache_phrase_len else 0;
-            if (precache) @memcpy(precache_phrase[0..precache_len], self.precache_phrase[0..precache_len]);
-            const resume_at = self.video_position;
             const seek = self.video_seek_target;
             self.video_seek_target = null;
             const step = self.video_step_requested;
             self.video_step_requested = false;
             self.mutex.unlock(self.io);
-            if (precache) {
-                if (reader) |handle| sam_macos_video_close(handle);
-                reader = null;
-                self.runPrecache(precache_phrase[0..precache_len]);
-                open_at = resume_at;
-                retry_required = true;
-                previous_pts = null;
-                previous_display = null;
-                self.precache_active.store(false, .release);
-                sam_macos_set_precache_progress(2, 0);
-                if (!self.video_stop.load(.acquire)) {
-                    self.mutex.lock(self.io) catch return;
-                    self.video_seek_target = resume_at;
-                    self.video_step_requested = true;
-                    self.mutex.unlock(self.io);
-                }
-                continue;
-            }
             if (seek) |target| {
                 if (reader) |handle| sam_macos_video_close(handle);
                 reader = null;
@@ -463,33 +458,24 @@ pub const App = struct {
             const phrase = phrase_buf[0..phrase_len];
 
             const started = std.Io.Timestamp.now(self.io, .awake);
-            const values = here.call(.computeQuery, .{
-                self.allocator,
-                [_][]const u8{
-                    sam3.assets.concept_vision_encoder.sha256,
-                    sam3.assets.concept_text_encoder.sha256,
-                    sam3.assets.concept_decoder.sha256,
-                    sam3.assets.concept_tokenizer_json.sha256,
-                    sam3.assets.concept_vision_encoder_data.sha256,
-                    sam3.assets.concept_text_encoder_data.sha256,
-                },
-                sam3.RgbImage.fromImage(decoded),
-                phrase,
-                @as(f32, 0.5),
-            }) catch |err| {
+            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase) catch |err| {
                 log.info(self.io, "Video frame lookup failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
                 sam_macos_set_status("Video frame inference failed.");
                 self.video_playing.store(false, .release);
                 sam_macos_set_video_mode(1, 0);
                 continue;
             };
-            defer self.allocator.free(values);
-            var masks = unpackMasks(self.allocator, values) catch {
-                sam_macos_set_status("Cached video frame is invalid.");
-                continue;
-            };
-            var masks_owned = true;
-            defer if (masks_owned) masks.deinit();
+            defer if (maybe_values) |values| self.allocator.free(values);
+            var masks: ?sam3.Masks = null;
+            if (maybe_values) |values| {
+                masks = unpackMasks(self.allocator, values) catch blk: {
+                    // The pre-cache worker may still be writing this entry.
+                    if (self.precache_active.load(.acquire)) break :blk null;
+                    sam_macos_set_status("Cached video frame is invalid.");
+                    continue;
+                };
+            }
+            defer if (masks) |*m| m.deinit();
             const lookup_elapsed = started.untilNow(self.io, .awake);
 
             if (!step) {
@@ -523,18 +509,22 @@ pub const App = struct {
             decoded_owned = false;
             self.frame = next_frame;
             self.masks = masks;
-            masks_owned = false;
+            masks = null;
             self.points_len = 0;
-            if (self.coverages.len != masks.count) {
+            const mask_count = if (self.masks) |m| m.count else 0;
+            if (self.coverages.len != mask_count) {
                 self.allocator.free(self.coverages);
-                self.coverages = self.allocator.alloc(f32, masks.count) catch &.{};
+                self.coverages = self.allocator.alloc(f32, mask_count) catch &.{};
             }
-            self.best_mask_idx = if (masks.count == 0) -1 else @intCast(render.scoreMasks(masks.logits, masks.scores, masks.count, masks.width, masks.height, self.coverages));
+            self.best_mask_idx = if (mask_count == 0) -1 else blk: {
+                const m = self.masks.?;
+                break :blk @intCast(render.scoreMasks(m.logits, m.scores, m.count, m.width, m.height, self.coverages));
+            };
             self.selected_mask = self.best_mask_idx;
             self.video_position = video_frame.pts_seconds;
             self.renderComposite(self.selected_mask);
             sam_macos_set_image(self.frame.ptr, @intCast(width), @intCast(height));
-            self.showMaskButtons(masks);
+            if (self.masks) |m| self.showMaskButtons(m) else sam_macos_set_masks(0, null, 0, -1);
             const duration = self.video_duration;
             self.mutex.unlock(self.io);
             sam_macos_set_video_timeline(duration, video_frame.pts_seconds);
@@ -550,14 +540,41 @@ pub const App = struct {
                 position_ms % 1_000,
             }) catch "0:00.000";
             var status_buf: [256]u8 = undefined;
-            const status = std.fmt.bufPrintZ(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{
-                timecode, masks.count, phrase, lookup_elapsed,
-            }) catch "Video frame processed.";
+            const status = if (self.masks != null)
+                std.fmt.bufPrintZ(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{
+                    timecode, mask_count, phrase, lookup_elapsed,
+                }) catch "Video frame processed."
+            else
+                std.fmt.bufPrintZ(&status_buf, "At {s}: waiting for cached “{s}” result.", .{ timecode, phrase }) catch "Frame shown without a cached result.";
             sam_macos_set_status(status);
-            log.info(self.io, "at {s}: \"{s}\" -> {d} object(s) in {f}", .{
-                timecode, phrase, masks.count, lookup_elapsed,
+            if (self.masks != null) log.info(self.io, "at {s}: \"{s}\" -> {d} object(s) in {f}", .{
+                timecode, phrase, mask_count, lookup_elapsed,
             });
         }
+    }
+
+    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8) !?[]f32 {
+        const args = .{
+            self.allocator,
+            [_][]const u8{
+                sam3.assets.concept_vision_encoder.sha256,
+                sam3.assets.concept_text_encoder.sha256,
+                sam3.assets.concept_decoder.sha256,
+                sam3.assets.concept_tokenizer_json.sha256,
+                sam3.assets.concept_vision_encoder_data.sha256,
+                sam3.assets.concept_text_encoder_data.sha256,
+            },
+            image,
+            phrase,
+            @as(f32, 0.5),
+        };
+        if (self.precache_active.load(.acquire)) {
+            if (here.lookup(.computeQuery, args)) |cached| return try cached;
+            return null;
+        }
+        self.model_mutex.lock(self.io) catch return error.ModelLockFailed;
+        defer self.model_mutex.unlock(self.io);
+        return try here.call(.computeQuery, args);
     }
 
     fn runPrecache(self: *App, phrase: []const u8) void {
@@ -601,7 +618,7 @@ pub const App = struct {
                 return;
             };
             defer decoded.deinit(self.allocator);
-            const values = here.call(.computeQuery, .{
+            const args = .{
                 self.allocator,
                 [_][]const u8{
                     sam3.assets.concept_vision_encoder.sha256,
@@ -614,7 +631,11 @@ pub const App = struct {
                 sam3.RgbImage.fromImage(decoded),
                 phrase,
                 @as(f32, 0.5),
-            }) catch |err| {
+            };
+            self.model_mutex.lock(self.io) catch return;
+            const result = here.call(.computeQuery, args);
+            self.model_mutex.unlock(self.io);
+            const values = result catch |err| {
                 log.info(self.io, "Video pre-cache failed at frame {d}: {t}: {s}", .{ frames, err, sam3.onnx.lastError() });
                 sam_macos_set_status("Video pre-cache inference failed.");
                 return;
@@ -724,7 +745,6 @@ pub const App = struct {
         const phrase = std.mem.span(text);
         if (phrase.len == 0) return;
         if (self.video_active) {
-            if (self.precache_active.load(.acquire)) return;
             self.mutex.lock(self.io) catch return;
             if (self.video_previewed and self.video_seek_target == null) {
                 self.video_seek_target = self.video_position;
