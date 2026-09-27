@@ -3,9 +3,30 @@ const sam3 = @import("sam3");
 const zigimg = @import("zigimg");
 const wayland = @import("wayland.zig");
 const font = @import("font.zig");
+const zimo = @import("zimo");
+const here = zimo.bind(@This(), @embedFile("app.zig"));
+
+const VideoFrame = extern struct { rgb: ?[*]u8, width: c_int, height: c_int, pts_seconds: f64 };
+extern fn sam_linux_video_open(path: [*:0]const u8, start: f64) ?*anyopaque;
+extern fn sam_linux_video_duration(reader: *anyopaque) f64;
+extern fn sam_linux_video_next(reader: *anyopaque, frame: *VideoFrame) c_int;
+extern fn sam_linux_video_free_frame(frame: *VideoFrame) void;
+extern fn sam_linux_video_close(reader: *anyopaque) void;
 
 const render = sam3.render;
 const max_points = 32;
+const MaskColor = struct { red: u8, green: u8, blue: u8 };
+const mask_colors = [_]MaskColor{
+    .{ .red = 0, .green = 220, .blue = 100 },
+    .{ .red = 0, .green = 180, .blue = 255 },
+    .{ .red = 255, .green = 175, .blue = 0 },
+    .{ .red = 220, .green = 90, .blue = 255 },
+    .{ .red = 255, .green = 80, .blue = 110 },
+    .{ .red = 255, .green = 225, .blue = 80 },
+    .{ .red = 70, .green = 220, .blue = 210 },
+    .{ .red = 160, .green = 155, .blue = 255 },
+};
+fn maskColor(index: usize) MaskColor { return mask_colors[index % mask_colors.len]; }
 const BrowserEntry = struct {
     name: []u8,
     is_dir: bool,
@@ -20,6 +41,7 @@ pub const App = struct {
     client: wayland.WaylandClient,
 
     mutex: std.Io.Mutex = .init,
+    model_mutex: std.Io.Mutex = .init,
     is_busy: bool = false,
     redraw_pending: std.atomic.Value(bool) = .init(true),
 
@@ -34,6 +56,26 @@ pub const App = struct {
     coverages: []f32 = &.{},
     selected_mask: i32 = -1,
     best_mask_idx: i32 = -1,
+
+    video_path: ?[:0]u8 = null,
+    video_thread: ?std.Thread = null,
+    video_active: bool = false,
+    video_stop: std.atomic.Value(bool) = .init(false),
+    video_playing: std.atomic.Value(bool) = .init(false),
+    video_phrase: [160]u8 = undefined,
+    video_phrase_len: usize = 0,
+    video_duration: f64 = 0,
+    video_position: f64 = 0,
+    video_seek_target: ?f64 = null,
+    video_step_requested: bool = false,
+    video_find_requested: bool = false,
+    precache_thread: ?std.Thread = null,
+    precache_active: std.atomic.Value(bool) = .init(false),
+    precache_cancel: std.atomic.Value(bool) = .init(false),
+    precache_phrase: [160]u8 = undefined,
+    precache_phrase_len: usize = 0,
+    precache_progress: f64 = 0,
+    precache_scanned_until: f64 = -1,
 
     status_text: [256]u8 = undefined,
     status_len: usize = 0,
@@ -64,7 +106,7 @@ pub const App = struct {
 
     // Layout geometry
     canvas_x: usize = 16,
-    canvas_y: usize = 140,
+    canvas_y: usize = 180,
     canvas_w: usize = 968,
     canvas_h: usize = 510,
 
@@ -100,6 +142,8 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.stopVideo();
+        g_app = null;
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
@@ -121,6 +165,9 @@ pub const App = struct {
     }
 
     pub fn run(self: *App) !void {
+        g_app = self;
+        _ = here.id(.computeQuery);
+        _ = here.id(.computeTextFeatures);
         // Open sample image by default
         _ = self.openImageFromPath(self.example_path);
 
@@ -179,6 +226,7 @@ pub const App = struct {
     }
 
     fn openImageFromPath(self: *App, path: []const u8) bool {
+        self.stopVideo();
         const file_bytes = std.Io.Dir.cwd().readFileAlloc(
             self.io,
             path,
@@ -282,10 +330,13 @@ pub const App = struct {
     }
 
     fn browserOpenPath(self: *App, path: []const u8) void {
+        if (self.is_busy) return;
         const dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch null;
         if (dir) |d| {
             d.close(self.io);
             self.browseDir(path);
+        } else if (isVideoPath(path)) {
+            if (self.openVideoFromPath(path)) self.browser_open = false;
         } else if (self.openImageFromPath(path)) {
             self.browser_open = false;
         }
@@ -458,11 +509,31 @@ pub const App = struct {
             self.triggerFind();
             return false;
         }
+        if (x >= 526 and x < 656 and y >= 78 and y < 106) {
+            self.openBrowser();
+            return false;
+        }
+        if (self.video_active and y >= 140 and y < 168 and button == 0x110) {
+            if (x >= 16 and x < 96) {
+                self.toggleVideoPlay();
+            } else if (x >= 104 and x < 184) {
+                self.seekVideo(0);
+            } else if (x >= 192 and x < 292) {
+                self.stepVideo();
+            } else if (x >= 300 and x < 460) {
+                self.togglePrecache();
+            } else if (x >= 470 and x < stride -| 16) {
+                const width = stride -| 486;
+                if (width > 0) self.seekVideo(self.video_duration * @as(f64, @floatFromInt(x - 470)) / @as(f64, @floatFromInt(width)));
+            }
+            return false;
+        }
 
         // Bottom row: mask candidate buttons
-        if (self.masks) |m| {
-            const btn_y = self.client.height - 44;
-            if (y >= btn_y and y <= btn_y + 32) {
+        if (y >= self.client.height -| 44 and y <= self.client.height -| 12) {
+            self.mutex.lock(self.io) catch return false;
+            defer self.mutex.unlock(self.io);
+            if (self.masks) |m| {
                 var cur_btn_x: usize = 16;
                 for (0..m.count) |i| {
                     if (x >= cur_btn_x and x <= cur_btn_x + 160) {
@@ -629,13 +700,13 @@ pub const App = struct {
     }
 
     fn triggerFind(self: *App) void {
-        if (self.search_len == 0 or self.is_busy or self.image == null) return;
+        if (self.search_len == 0 or self.is_busy or (self.image == null and !self.video_active)) return;
         const phrase = self.search_text[0..self.search_len];
         self.handleFindText(phrase);
     }
 
     fn handleCanvasClick(self: *App, norm_x: f32, norm_y: f32, is_positive: c_int) void {
-        if (self.is_busy or self.image == null or self.points_len >= max_points) return;
+        if (self.video_active or self.is_busy or self.image == null or self.points_len >= max_points) return;
 
         self.mutex.lock(self.io) catch return;
         self.points[self.points_len] = .{
@@ -711,6 +782,20 @@ pub const App = struct {
     }
 
     fn handleFindText(self: *App, phrase: []const u8) void {
+        if (self.video_active) {
+            self.mutex.lock(self.io) catch return;
+            self.video_phrase_len = @min(phrase.len, self.video_phrase.len);
+            @memcpy(self.video_phrase[0..self.video_phrase_len], phrase[0..self.video_phrase_len]);
+            const playing = self.video_playing.load(.acquire);
+            if (!playing) {
+                self.video_seek_target = self.video_position;
+                self.video_step_requested = true;
+                self.video_find_requested = true;
+            }
+            self.mutex.unlock(self.io);
+            self.setStatus(if (playing) "Playing; use Pre-cache Video for uncached masks." else "Processing current video frame…");
+            return;
+        }
         self.is_busy = true;
 
         var status_buf: [256]u8 = undefined;
@@ -750,18 +835,16 @@ pub const App = struct {
         const phrase = ctx.phrase;
         const started = std.Io.Timestamp.now(self.io, .awake);
 
-        var concept_embedding = self.ensureEmbedding(true) catch |err| {
-            std.debug.print("Concept encoder failed: {t}\n", .{err});
-            self.setStatus("Concept encoder failed");
+        const lookup_started = std.Io.Timestamp.now(self.io, .awake);
+        const values = cachedQuery(self.allocator, sam3.RgbImage.fromImage(self.image.?), phrase) catch |err| {
+            std.debug.print("Lookup failed: {t}\n", .{err});
+            self.setStatus("Lookup failed");
             self.is_busy = false;
             return;
         };
-        defer concept_embedding.deinit();
-
-        const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-        const masks = self.model.find(&concept_embedding, phrase, .{ .min_score = 0.5 }) catch |err| {
-            std.debug.print("Lookup failed: {t}\n", .{err});
-            self.setStatus("Lookup failed");
+        defer self.allocator.free(values);
+        const masks = unpackMasks(self.allocator, values) catch {
+            self.setStatus("Cached lookup is invalid.");
             self.is_busy = false;
             return;
         };
@@ -823,6 +906,387 @@ pub const App = struct {
         self.setStatus("Points cleared.");
     }
 
+    fn stopVideo(self: *App) void {
+        self.video_stop.store(true, .release);
+        self.precache_cancel.store(true, .release);
+        if (self.video_thread) |thread| thread.join();
+        if (self.precache_thread) |thread| thread.join();
+        self.video_thread = null;
+        self.precache_thread = null;
+        if (self.video_path) |path| self.allocator.free(path);
+        self.video_path = null;
+        self.video_active = false;
+        self.video_playing.store(false, .release);
+        self.video_phrase_len = 0;
+        self.video_duration = 0;
+        self.video_position = 0;
+        self.video_seek_target = null;
+        self.video_step_requested = false;
+        self.video_find_requested = false;
+        self.precache_active.store(false, .release);
+        self.precache_phrase_len = 0;
+        self.precache_progress = 0;
+        self.precache_scanned_until = -1;
+        self.redraw_pending.store(true, .release);
+    }
+
+    fn openVideoFromPath(self: *App, path: []const u8) bool {
+        if (self.is_busy) return false;
+        self.stopVideo();
+        const owned = self.allocator.dupeZ(u8, path) catch return false;
+        self.video_path = owned;
+        self.video_active = true;
+        self.video_stop.store(false, .release);
+        self.precache_cancel.store(false, .release);
+        self.video_seek_target = 0;
+        self.mutex.lock(self.io) catch return false;
+        if (self.image) |*img| img.deinit(self.allocator);
+        self.image = null;
+        self.allocator.free(self.frame);
+        self.frame = &.{};
+        if (self.masks) |*m| m.deinit();
+        self.masks = null;
+        self.points_len = 0;
+        self.selected_mask = -1;
+        self.best_mask_idx = -1;
+        self.mutex.unlock(self.io);
+        self.setStatus("Video opened. Enter a word and press Find.");
+        self.video_thread = std.Thread.spawn(.{}, runVideoWorker, .{self}) catch {
+            self.stopVideo();
+            self.setStatus("Could not start video decoder.");
+            return false;
+        };
+        return true;
+    }
+
+    fn toggleVideoPlay(self: *App) void {
+        const playing = !self.video_playing.load(.acquire);
+        self.video_playing.store(playing, .release);
+        if (!playing) self.setStatus("Video paused.");
+        self.redraw_pending.store(true, .release);
+    }
+
+    fn seekVideo(self: *App, seconds: f64) void {
+        if (!std.math.isFinite(seconds)) return;
+        self.mutex.lock(self.io) catch return;
+        self.video_seek_target = std.math.clamp(seconds, 0, self.video_duration);
+        self.video_step_requested = false;
+        self.video_find_requested = false;
+        self.mutex.unlock(self.io);
+        self.redraw_pending.store(true, .release);
+    }
+
+    fn stepVideo(self: *App) void {
+        if (self.video_playing.load(.acquire)) return;
+        self.mutex.lock(self.io) catch return;
+        self.video_step_requested = true;
+        self.mutex.unlock(self.io);
+    }
+
+    fn togglePrecache(self: *App) void {
+        if (self.precache_active.load(.acquire)) {
+            self.precache_cancel.store(true, .release);
+            self.setStatus("Cancelling pre-cache after this frame…");
+            return;
+        }
+        if (self.precache_thread) |thread| {
+            thread.join();
+            self.precache_thread = null;
+        }
+        if (self.search_len == 0) {
+            self.setStatus("Enter a word to pre-cache this video.");
+            return;
+        }
+        self.mutex.lock(self.io) catch return;
+        self.precache_phrase_len = @min(self.search_len, self.precache_phrase.len);
+        @memcpy(self.precache_phrase[0..self.precache_phrase_len], self.search_text[0..self.precache_phrase_len]);
+        self.video_phrase_len = self.precache_phrase_len;
+        @memcpy(self.video_phrase[0..self.video_phrase_len], self.precache_phrase[0..self.precache_phrase_len]);
+        self.precache_cancel.store(false, .release);
+        self.precache_active.store(true, .release);
+        self.precache_progress = 0;
+        self.precache_scanned_until = -1;
+        self.mutex.unlock(self.io);
+        self.setStatus("Pre-caching video frames…");
+        self.precache_thread = std.Thread.spawn(.{}, runPrecacheWorker, .{self}) catch {
+            self.precache_active.store(false, .release);
+            self.setStatus("Could not start video pre-cache.");
+            return;
+        };
+    }
+
+    fn runPrecacheWorker(self: *App) void {
+        self.runPrecache(self.precache_phrase[0..self.precache_phrase_len]);
+        self.precache_active.store(false, .release);
+        self.redraw_pending.store(true, .release);
+        if (!self.video_stop.load(.acquire) and !self.video_playing.load(.acquire)) {
+            self.mutex.lock(self.io) catch return;
+            self.video_seek_target = self.video_position;
+            self.video_step_requested = true;
+            self.video_find_requested = false;
+            self.mutex.unlock(self.io);
+        }
+    }
+
+    fn runVideoWorker(self: *App) void {
+        var reader: ?*anyopaque = null;
+        defer if (reader) |r| sam_linux_video_close(r);
+        var playback_start: ?std.Io.Timestamp = null;
+        var playback_first_pts: f64 = 0;
+        var retry_required = false;
+        var open_at: f64 = 0;
+        while (!self.video_stop.load(.acquire)) {
+            self.mutex.lock(self.io) catch return;
+            const seek = self.video_seek_target;
+            self.video_seek_target = null;
+            const step = self.video_step_requested;
+            self.video_step_requested = false;
+            const find = self.video_find_requested;
+            self.video_find_requested = false;
+            var phrase_buf: [160]u8 = undefined;
+            const phrase_len = self.video_phrase_len;
+            @memcpy(phrase_buf[0..phrase_len], self.video_phrase[0..phrase_len]);
+            self.mutex.unlock(self.io);
+            if (seek) |target| {
+                if (reader) |r| sam_linux_video_close(r);
+                reader = null;
+                open_at = target;
+                playback_start = null;
+            }
+            if (reader == null and (!retry_required or self.video_playing.load(.acquire) or step or seek != null)) {
+                reader = sam_linux_video_open(self.video_path.?.ptr, open_at);
+                retry_required = true;
+                if (reader) |r| {
+                    self.mutex.lock(self.io) catch return;
+                    self.video_duration = sam_linux_video_duration(r);
+                    self.mutex.unlock(self.io);
+                } else {
+                    self.video_playing.store(false, .release);
+                    self.setStatus("Could not decode video. Install FFmpeg and ffprobe.");
+                }
+            }
+            if (reader == null or (!self.video_playing.load(.acquire) and !step and seek == null)) {
+                if (!self.video_playing.load(.acquire)) playback_start = null;
+                std.Io.sleep(self.io, .fromMilliseconds(20), .awake) catch {};
+                continue;
+            }
+            var raw: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
+            const result = sam_linux_video_next(reader.?, &raw);
+            if (result <= 0) {
+                sam_linux_video_close(reader.?);
+                reader = null;
+                self.video_playing.store(false, .release);
+                self.setStatus(if (result == 0) "End of video. Press Play to replay." else "Video decoding failed.");
+                open_at = 0;
+                playback_start = null;
+                continue;
+            }
+            defer sam_linux_video_free_frame(&raw);
+            if (!self.video_playing.load(.acquire) and !step and seek == null) {
+                playback_start = null;
+                continue;
+            }
+            if (self.video_playing.load(.acquire) and !step and std.math.isFinite(raw.pts_seconds)) {
+                if (playback_start == null) {
+                    playback_start = std.Io.Timestamp.now(self.io, .awake);
+                    playback_first_pts = raw.pts_seconds;
+                } else {
+                    const offset = raw.pts_seconds - playback_first_pts;
+                    if (offset >= 0 and offset < 1.0e6) {
+                        const target_ns: i96 = @intFromFloat(offset * 1e9);
+                        var elapsed_ns = playback_start.?.untilNow(self.io, .awake).nanoseconds;
+                        if (elapsed_ns > target_ns + 70_000_000) continue;
+                        while (target_ns > elapsed_ns and self.video_playing.load(.acquire) and !self.video_stop.load(.acquire)) {
+                            std.Io.sleep(self.io, .fromNanoseconds(@min(target_ns - elapsed_ns, 20_000_000)), .awake) catch {};
+                            elapsed_ns = playback_start.?.untilNow(self.io, .awake).nanoseconds;
+                        }
+                        if (!self.video_playing.load(.acquire)) continue;
+                    }
+                }
+            }
+            const width: usize = @intCast(raw.width);
+            const height: usize = @intCast(raw.height);
+            const rgb_len = std.math.mul(usize, std.math.mul(usize, width, height) catch continue, 3) catch continue;
+            const pixels = self.allocator.dupe(u8, raw.rgb.?[0..rgb_len]) catch continue;
+            var decoded = zigimg.Image.fromRawPixelsOwned(width, height, pixels, .rgb24) catch {
+                self.allocator.free(pixels);
+                continue;
+            };
+            var decoded_owned = true;
+            defer if (decoded_owned) decoded.deinit(self.allocator);
+            const show_preview = phrase_len == 0 or step or seek != null;
+            if (self.video_stop.load(.acquire)) break;
+            if (show_preview) {
+                const frame_len = std.math.mul(usize, std.math.mul(usize, width, height) catch continue, 4) catch continue;
+                const next_frame = self.allocator.alloc(u8, frame_len) catch continue;
+                self.mutex.lock(self.io) catch {
+                    self.allocator.free(next_frame);
+                    return;
+                };
+                if (self.video_seek_target != null) {
+                    self.mutex.unlock(self.io);
+                    self.allocator.free(next_frame);
+                    continue;
+                }
+                if (self.image) |*old| old.deinit(self.allocator);
+                self.allocator.free(self.frame);
+                if (self.masks) |*old| old.deinit();
+                self.image = decoded;
+                decoded_owned = false;
+                self.frame = next_frame;
+                self.masks = null;
+                self.points_len = 0;
+                self.selected_mask = -1;
+                self.best_mask_idx = -1;
+                self.video_position = raw.pts_seconds;
+                self.renderComposite(-1);
+                self.mutex.unlock(self.io);
+            }
+            if (phrase_len == 0) {
+                var preview_status: [96]u8 = undefined;
+                self.setStatus(std.fmt.bufPrint(&preview_status, "Video at {d:.2}s", .{raw.pts_seconds}) catch "Video playing.");
+                continue;
+            }
+            const cache_only = (seek != null and !find) or self.video_playing.load(.acquire);
+            if (show_preview and !cache_only) self.setStatus("Processing current video frame…");
+            var masks: ?sam3.Masks = null;
+            var mask_result_valid = false;
+            defer if (masks) |*m| m.deinit();
+            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase_buf[0..phrase_len], raw.pts_seconds, cache_only) catch |err| {
+                std.debug.print("Video lookup failed: {t}\n", .{err});
+                self.video_playing.store(false, .release);
+                self.setStatus("Video frame inference failed.");
+                continue;
+            };
+            defer if (maybe_values) |values| self.allocator.free(values);
+            if (maybe_values) |values| {
+                masks = unpackMasks(self.allocator, values) catch blk: {
+                    if (self.precache_active.load(.acquire) or self.video_playing.load(.acquire)) break :blk null;
+                    self.setStatus("Cached video frame is invalid.");
+                    continue;
+                };
+                mask_result_valid = masks != null;
+            }
+            if (self.video_stop.load(.acquire)) break;
+            const next_frame: ?[]u8 = if (show_preview) null else blk: {
+                const frame_len = std.math.mul(usize, std.math.mul(usize, width, height) catch continue, 4) catch continue;
+                break :blk self.allocator.alloc(u8, frame_len) catch continue;
+            };
+            self.mutex.lock(self.io) catch {
+                if (next_frame) |frame| self.allocator.free(frame);
+                return;
+            };
+            if (self.video_seek_target != null) {
+                self.mutex.unlock(self.io);
+                if (next_frame) |frame| self.allocator.free(frame);
+                continue;
+            }
+            if (next_frame) |frame| {
+                if (self.image) |*old| old.deinit(self.allocator);
+                self.allocator.free(self.frame);
+                if (self.masks) |*old| old.deinit();
+                self.image = decoded;
+                decoded_owned = false;
+                self.frame = frame;
+                self.points_len = 0;
+            }
+            self.masks = masks;
+            masks = null;
+            if (self.masks) |m| {
+                if (self.coverages.len != m.count) {
+                    self.allocator.free(self.coverages);
+                    self.coverages = self.allocator.alloc(f32, m.count) catch &.{};
+                }
+                self.best_mask_idx = if (m.count == 0) -1 else @intCast(render.scoreMasks(m.logits, m.scores, m.count, m.width, m.height, self.coverages));
+            } else self.best_mask_idx = -1;
+            self.selected_mask = self.best_mask_idx;
+            self.video_position = raw.pts_seconds;
+            self.renderComposite(self.selected_mask);
+            const mask_count = if (self.masks) |m| m.count else @as(usize, 0);
+            self.mutex.unlock(self.io);
+            var status_buf: [256]u8 = undefined;
+            const status = if (mask_result_valid)
+                std.fmt.bufPrint(&status_buf, "At {d:.2}s: {d} match(es) for {s}", .{ raw.pts_seconds, mask_count, phrase_buf[0..phrase_len] }) catch "Video frame processed."
+            else if (self.precache_active.load(.acquire))
+                std.fmt.bufPrint(&status_buf, "At {d:.2}s: waiting for cached result for {s}", .{ raw.pts_seconds, phrase_buf[0..phrase_len] }) catch "Frame shown without a cached result."
+            else
+                std.fmt.bufPrint(&status_buf, "At {d:.2}s: no cached mask; use Pre-cache Video", .{raw.pts_seconds}) catch "Video playing without a cached mask.";
+            self.setStatus(status);
+        }
+    }
+
+    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8, pts: f64, cache_only: bool) !?[]f32 {
+        if (cache_only) {
+            return try cachedQueryIfPresent(self.allocator, self.io, image, phrase);
+        }
+        if (self.precache_active.load(.acquire)) {
+            self.mutex.lock(self.io) catch return error.VideoLockFailed;
+            const scanned_until = self.precache_scanned_until;
+            const scanned_phrase = std.mem.eql(u8, phrase, self.precache_phrase[0..self.precache_phrase_len]);
+            self.mutex.unlock(self.io);
+            if (!scanned_phrase or !std.math.isFinite(pts) or pts > scanned_until) return null;
+            return try cachedQuery(self.allocator, image, phrase);
+        }
+        self.model_mutex.lock(self.io) catch return error.ModelLockFailed;
+        defer self.model_mutex.unlock(self.io);
+        return try cachedQuery(self.allocator, image, phrase);
+    }
+
+    fn runPrecache(self: *App, phrase: []const u8) void {
+        const reader = sam_linux_video_open(self.video_path.?.ptr, 0) orelse {
+            self.setStatus("Could not decode video for pre-cache.");
+            return;
+        };
+        defer sam_linux_video_close(reader);
+        const duration = sam_linux_video_duration(reader);
+        var frames: usize = 0;
+        while (!self.video_stop.load(.acquire) and !self.precache_cancel.load(.acquire)) {
+            var raw: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
+            const result = sam_linux_video_next(reader, &raw);
+            if (result <= 0) {
+                if (result == 0) {
+                    self.mutex.lock(self.io) catch return;
+                    self.precache_progress = 1;
+                    self.mutex.unlock(self.io);
+                    var msg: [160]u8 = undefined;
+                    self.setStatus(std.fmt.bufPrint(&msg, "Pre-cached {d} frames for {s}.", .{ frames, phrase }) catch "Video pre-cache complete.");
+                } else self.setStatus("Video decoding failed during pre-cache.");
+                return;
+            }
+            defer sam_linux_video_free_frame(&raw);
+            const width: usize = @intCast(raw.width);
+            const height: usize = @intCast(raw.height);
+            const rgb_len = std.math.mul(usize, std.math.mul(usize, width, height) catch continue, 3) catch continue;
+            const pixels = self.allocator.dupe(u8, raw.rgb.?[0..rgb_len]) catch return;
+            var decoded = zigimg.Image.fromRawPixelsOwned(width, height, pixels, .rgb24) catch {
+                self.allocator.free(pixels);
+                return;
+            };
+            defer decoded.deinit(self.allocator);
+            self.model_mutex.lock(self.io) catch return;
+            const result_query = cachedQuery(self.allocator, sam3.RgbImage.fromImage(decoded), phrase);
+            self.model_mutex.unlock(self.io);
+            const values = result_query catch {
+                self.setStatus("Video pre-cache inference failed.");
+                return;
+            };
+            self.allocator.free(values);
+            frames += 1;
+            if (std.math.isFinite(raw.pts_seconds)) {
+                self.mutex.lock(self.io) catch return;
+                self.precache_scanned_until = @max(self.precache_scanned_until, raw.pts_seconds);
+                self.mutex.unlock(self.io);
+            }
+            if (duration > 0 and std.math.isFinite(raw.pts_seconds)) {
+                self.mutex.lock(self.io) catch return;
+                self.precache_progress = std.math.clamp(raw.pts_seconds / duration, 0, 1);
+                self.mutex.unlock(self.io);
+                self.redraw_pending.store(true, .release);
+            }
+        }
+        if (!self.video_stop.load(.acquire)) self.setStatus("Video pre-cache cancelled.");
+    }
+
     fn ensureEmbedding(self: *App, comptime concept: bool) !if (concept) sam3.TextImageEmbedding else sam3.PointEmbedding {
         const img = self.image orelse return error.NoImageLoaded;
         const started = std.Io.Timestamp.now(self.io, .awake);
@@ -839,20 +1303,79 @@ pub const App = struct {
 
     fn renderComposite(self: *App, mask_index: i32) void {
         const img = self.image orelse return;
-        var plane: ?[]const f32 = null;
-        var mw: usize = 0;
-        var mh: usize = 0;
-        if (mask_index >= 0 and self.masks != null) {
+        if (mask_index < 0 or self.masks == null) {
+            if (self.video_active and self.points_len == 0) {
+                for (img.pixels.rgb24, 0..) |pixel, i| {
+                    self.frame[i * 4] = pixel.r;
+                    self.frame[i * 4 + 1] = pixel.g;
+                    self.frame[i * 4 + 2] = pixel.b;
+                    self.frame[i * 4 + 3] = 255;
+                }
+            } else {
+                render.compositeRgba(self.allocator, img, self.frame, null, 0, 0, self.points[0..self.points_len]);
+            }
+        } else {
+            render.compositeRgba(self.allocator, img, self.frame, null, 0, 0, &.{});
             const masks = self.masks.?;
-            const u_index: usize = @intCast(mask_index);
-            if (u_index < masks.count) {
-                plane = masks.plane(u_index);
-                mw = masks.width;
-                mh = masks.height;
+            const selected: usize = @intCast(mask_index);
+            for (0..masks.count) |i| {
+                if (i != selected) self.overlayMask(img, masks, i, 0.35);
+            }
+            if (selected < masks.count) self.overlayMask(img, masks, selected, 0.6);
+            self.drawPointMarkers(img);
+        }
+        self.redraw_pending.store(true, .release);
+    }
+
+    fn overlayMask(self: *App, img: zigimg.Image, masks: sam3.Masks, index: usize, alpha: f32) void {
+        const plane = masks.plane(index);
+        const color = maskColor(index);
+        const ratio_x = @as(f32, @floatFromInt(masks.width)) / @as(f32, @floatFromInt(img.width));
+        const ratio_y = @as(f32, @floatFromInt(masks.height)) / @as(f32, @floatFromInt(img.height));
+        for (0..img.height) |y| {
+            const source_y = ratio_y * (@as(f32, @floatFromInt(y)) + 0.5) - 0.5;
+            const y0 = clampMaskIndex(source_y, masks.height);
+            const y1 = @min(y0 + 1, masks.height - 1);
+            const wy = @max(0.0, source_y - @as(f32, @floatFromInt(y0)));
+            for (0..img.width) |x| {
+                const source_x = ratio_x * (@as(f32, @floatFromInt(x)) + 0.5) - 0.5;
+                const x0 = clampMaskIndex(source_x, masks.width);
+                const x1 = @min(x0 + 1, masks.width - 1);
+                const wx = @max(0.0, source_x - @as(f32, @floatFromInt(x0)));
+                const top = std.math.lerp(plane[y0 * masks.width + x0], plane[y0 * masks.width + x1], wx);
+                const bottom = std.math.lerp(plane[y1 * masks.width + x0], plane[y1 * masks.width + x1], wx);
+                if (std.math.lerp(top, bottom, wy) <= 0) continue;
+                const offset = (y * img.width + x) * 4;
+                self.frame[offset] = blendChannel(self.frame[offset], color.red, alpha);
+                self.frame[offset + 1] = blendChannel(self.frame[offset + 1], color.green, alpha);
+                self.frame[offset + 2] = blendChannel(self.frame[offset + 2], color.blue, alpha);
             }
         }
-        render.compositeRgba(self.allocator, img, self.frame, plane, mw, mh, self.points[0..self.points_len]);
-        self.redraw_pending.store(true, .release);
+    }
+
+    fn drawPointMarkers(self: *App, img: zigimg.Image) void {
+        for (self.points[0..self.points_len]) |point| {
+            const center_x: isize = @intFromFloat(point.x * @as(f32, @floatFromInt(img.width)));
+            const center_y: isize = @intFromFloat(point.y * @as(f32, @floatFromInt(img.height)));
+            const color: MaskColor = if (point.label == .positive)
+                .{ .red = 0, .green = 255, .blue = 0 }
+            else
+                .{ .red = 255, .green = 0, .blue = 0 };
+            for (0..15) |row| {
+                for (0..15) |col| {
+                    const dx: isize = @as(isize, @intCast(col)) - 7;
+                    const dy: isize = @as(isize, @intCast(row)) - 7;
+                    if (dx * dx + dy * dy > 49) continue;
+                    const x = center_x + dx;
+                    const y = center_y + dy;
+                    if (x < 0 or y < 0 or x >= img.width or y >= img.height) continue;
+                    const offset = (@as(usize, @intCast(y)) * img.width + @as(usize, @intCast(x))) * 4;
+                    self.frame[offset] = color.red;
+                    self.frame[offset + 1] = color.green;
+                    self.frame[offset + 2] = color.blue;
+                }
+            }
+        }
     }
 
     fn redraw(self: *App) void {
@@ -892,7 +1415,7 @@ pub const App = struct {
 
         // [Clear Points]
         font.drawButton(pixels, stride, 386, 42, 130, 28, "Clear Points", false, false, 0x0000dc64);
-        font.drawButton(pixels, stride, 526, 42, 130, 28, "Open Image", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, 526, 42, 130, 28, "Open File", false, false, 0x0000dc64);
 
         // Row 2: Search field + Find button
         font.fillRect(pixels, stride, 16, 78, 360, 28, if (self.search_focused) 0x0023272e else 0x001c1f25);
@@ -916,15 +1439,29 @@ pub const App = struct {
         }
 
         font.drawButton(pixels, stride, 386, 78, 130, 28, "Find by Word", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, 526, 78, 130, 28, "Open Video", false, false, 0x0000dc64);
 
         // Status text
         font.drawText(pixels, stride, self.status_text[0..self.status_len], 16, 116, 0x00969ba5);
 
         // Canvas Area
         const cx = self.canvas_x;
-        const cy = self.canvas_y;
+        if (self.video_active) {
+            font.drawButton(pixels, stride, 16, 140, 80, 28, if (self.video_playing.load(.acquire)) "Pause" else "Play", false, false, 0x0000dc64);
+            font.drawButton(pixels, stride, 104, 140, 80, 28, "Restart", false, false, 0x0000dc64);
+            font.drawButton(pixels, stride, 192, 140, 100, 28, "Next Frame", false, false, 0x0000dc64);
+            font.drawButton(pixels, stride, 300, 140, 160, 28, if (self.precache_active.load(.acquire)) "Cancel Pre-cache" else "Pre-cache Video", false, false, 0x0000dc64);
+            const timeline_w = stride -| 486;
+            if (timeline_w > 0) {
+                font.fillRect(pixels, stride, 470, 151, timeline_w, 6, 0x00383d45);
+                const fraction = if (self.video_duration > 0) std.math.clamp(self.video_position / self.video_duration, 0, 1) else 0;
+                font.fillRect(pixels, stride, 470, 151, @intFromFloat(@as(f64, @floatFromInt(timeline_w)) * fraction), 6, 0x0000dc64);
+                if (self.precache_active.load(.acquire)) font.fillRect(pixels, stride, 470, 161, @intFromFloat(@as(f64, @floatFromInt(timeline_w)) * self.precache_progress), 3, 0x0000b8ff);
+            }
+        }
+        const cy = if (self.video_active) self.canvas_y else 140;
         const cw = if (stride > 32) stride - 32 else 100;
-        const ch = if (h > 200) h - 200 else 100;
+        const ch = if (h > cy + 60) h - cy - 60 else 100;
         self.canvas_w = cw;
         self.canvas_h = ch;
 
@@ -992,7 +1529,7 @@ pub const App = struct {
         font.fillRect(pixels, stride, x, y, w, h, 0x0023272e);
         font.strokeRect(pixels, stride, x, y, w, h, 0x0000dc64);
         font.drawButton(pixels, stride, x + 12, y + 8, 80, 28, "Parent", false, false, 0x0000dc64);
-        font.drawText(pixels, stride, "Choose image", x + 104, y + 14, 0x00f2f4f6);
+        font.drawText(pixels, stride, "Choose image or video", x + 104, y + 14, 0x00f2f4f6);
         font.drawButton(pixels, stride, x + w - 92, y + 8, 80, 28, "Cancel", false, false, 0x0000dc64);
         font.fillRect(pixels, stride, x + 12, y + 46, w - 24, 28, 0x001c1f25);
         font.strokeRect(pixels, stride, x + 12, y + 46, w - 24, 28, 0x0000dc64);
@@ -1018,6 +1555,23 @@ pub const App = struct {
 
 fn browserVisibleRows(height: usize) usize {
     return (height -| 124) / 24;
+}
+
+fn isVideoPath(path: []const u8) bool {
+    const ext = std.fs.path.extension(path);
+    inline for (.{ ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".mpeg", ".mpg", ".3gp", ".ts", ".mts", ".flv", ".wmv" }) |video_ext| {
+        if (std.ascii.eqlIgnoreCase(ext, video_ext)) return true;
+    }
+    return false;
+}
+
+fn clampMaskIndex(coordinate: f32, limit: usize) usize {
+    if (coordinate <= 0) return 0;
+    return @min(@as(usize, @intFromFloat(@floor(coordinate))), limit - 1);
+}
+
+fn blendChannel(original: u8, tint: u8, alpha: f32) u8 {
+    return @intFromFloat(@as(f32, @floatFromInt(original)) * (1 - alpha) + @as(f32, @floatFromInt(tint)) * alpha);
 }
 
 fn evdevToChar(key: u32, shift: bool, caps: bool) ?u8 {
@@ -1099,3 +1653,117 @@ fn evdevToChar(key: u32, shift: bool, caps: bool) ?u8 {
         else => ch,
     };
 }
+pub fn computeQuery(
+    allocator: std.mem.Allocator,
+    model_ids: [6][]const u8,
+    image: sam3.RgbImage,
+    phrase: []const u8,
+    min_score: f32,
+) ![]f32 {
+    const model = (g_app orelse return error.NoActiveApp).model;
+    const text_features = try here.call(.computeTextFeatures, .{
+        allocator,
+        [_][]const u8{
+            model_ids[1],
+            model_ids[5],
+            model_ids[3],
+        },
+        phrase,
+    });
+    defer allocator.free(text_features);
+    var embedding = try model.encodeForText(image);
+    defer embedding.deinit();
+    var masks = try model.findWithTextFeatures(&embedding, phrase, text_features, .{ .min_score = min_score });
+    defer masks.deinit();
+
+    const header_and_scores = try std.math.add(usize, 4, masks.scores.len);
+    const len = try std.math.add(usize, header_and_scores, masks.logits.len);
+    const values = try allocator.alloc(f32, len);
+    values[0] = @bitCast(@as(u32, @intCast(masks.count)));
+    values[1] = @bitCast(@as(u32, @intCast(masks.width)));
+    values[2] = @bitCast(@as(u32, @intCast(masks.height)));
+    values[3] = masks.object_score;
+    @memcpy(values[4..][0..masks.scores.len], masks.scores);
+    @memcpy(values[header_and_scores..], masks.logits);
+    return values;
+}
+
+fn cachedQuery(allocator: std.mem.Allocator, image: sam3.RgbImage, phrase: []const u8) ![]f32 {
+    return here.call(.computeQuery, queryArgs(allocator, image, phrase));
+}
+
+fn queryArgs(allocator: std.mem.Allocator, image: sam3.RgbImage, phrase: []const u8) std.meta.ArgsTuple(@TypeOf(computeQuery)) {
+    return .{
+        allocator,
+        [_][]const u8{
+            sam3.assets.concept_vision_encoder.sha256,
+            sam3.assets.concept_text_encoder.sha256,
+            sam3.assets.concept_decoder.sha256,
+            sam3.assets.concept_tokenizer_json.sha256,
+            sam3.assets.concept_vision_encoder_data.sha256,
+            sam3.assets.concept_text_encoder_data.sha256,
+        },
+        image,
+        phrase,
+        @as(f32, 0.5),
+    };
+}
+
+fn cachedQueryIfPresent(allocator: std.mem.Allocator, io: std.Io, image: sam3.RgbImage, phrase: []const u8) !?[]f32 {
+    const key = zimo.keyFor(here.id(.computeQuery), queryArgs(allocator, image, phrase));
+    const dir = std.Io.Dir.cwd().openDir(io, ".sam3-zimo", .{}) catch return null;
+    defer dir.close(io);
+    const file = dir.openFile(io, &key, .{}) catch return null;
+    defer file.close(io);
+    const stat = file.stat(io) catch return null;
+    if (stat.size < 17 or stat.size > 256 * 1024 * 1024 or (stat.size - 1) % @sizeOf(f32) != 0) return null;
+    var tag: [1]u8 = undefined;
+    if ((file.readPositionalAll(io, &tag, 0) catch return null) != 1 or tag[0] != 1) return null;
+    const len: usize = @intCast((stat.size - 1) / @sizeOf(f32));
+    const values = try allocator.alloc(f32, len);
+    const bytes = std.mem.sliceAsBytes(values);
+    if ((file.readPositionalAll(io, bytes, 1) catch 0) != bytes.len) {
+        allocator.free(values);
+        return null;
+    }
+    return values;
+}
+
+pub fn computeTextFeatures(
+    allocator: std.mem.Allocator,
+    model_ids: [3][]const u8,
+    phrase: []const u8,
+) ![]f32 {
+    _ = allocator;
+    _ = model_ids;
+    const model = (g_app orelse return error.NoActiveApp).model;
+    return model.encodeTextFeatures(phrase);
+}
+
+fn unpackMasks(allocator: std.mem.Allocator, values: []const f32) !sam3.Masks {
+    if (values.len < 4) return error.InvalidCachedQuery;
+    const count: usize = @as(u32, @bitCast(values[0]));
+    const width: usize = @as(u32, @bitCast(values[1]));
+    const height: usize = @as(u32, @bitCast(values[2]));
+    if (width == 0 or height == 0) return error.InvalidCachedQuery;
+    const pixels = std.math.mul(usize, width, height) catch return error.InvalidCachedQuery;
+    const logits_len = std.math.mul(usize, count, pixels) catch return error.InvalidCachedQuery;
+    const header_and_scores = std.math.add(usize, 4, count) catch return error.InvalidCachedQuery;
+    const expected = std.math.add(usize, header_and_scores, logits_len) catch return error.InvalidCachedQuery;
+    if (values.len != expected) return error.InvalidCachedQuery;
+
+    const scores = try allocator.dupe(f32, values[4..header_and_scores]);
+    errdefer allocator.free(scores);
+    const logits = try allocator.dupe(f32, values[header_and_scores..]);
+    return .{
+        .allocator = allocator,
+        .scores = scores,
+        .logits = logits,
+        .count = count,
+        .width = width,
+        .height = height,
+        .object_score = values[3],
+    };
+}
+
+var g_app: ?*App = null;
