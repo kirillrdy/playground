@@ -46,7 +46,7 @@ void sam_macos_set_masks(int count, const SamMaskInfo *masks, int best_index, in
 void sam_macos_set_busy(int is_busy);
 void sam_macos_set_video_mode(int active, int playing);
 void sam_macos_set_video_timeline(double duration, double position);
-void sam_macos_set_precache_progress(int state, double fraction);
+void sam_macos_set_precache_progress(int state, double fraction, size_t frames);
 void *sam_macos_video_open(const char *path, double start_seconds);
 double sam_macos_video_duration(void *reader);
 int sam_macos_video_next(void *reader, SamVideoFrame *frame);

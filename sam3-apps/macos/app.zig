@@ -60,7 +60,7 @@ extern fn sam_macos_set_masks(count: c_int, masks: ?[*]const SamMaskInfo, best_i
 extern fn sam_macos_set_busy(is_busy: c_int) void;
 extern fn sam_macos_set_video_mode(active: c_int, playing: c_int) void;
 extern fn sam_macos_set_video_timeline(duration: f64, position: f64) void;
-extern fn sam_macos_set_precache_progress(active: c_int, fraction: f64) void;
+extern fn sam_macos_set_precache_progress(state: c_int, fraction: f64, frames: usize) void;
 extern fn sam_macos_video_open(path: [*:0]const u8, start_seconds: f64) ?*anyopaque;
 extern fn sam_macos_video_duration(reader: *anyopaque) f64;
 extern fn sam_macos_video_next(reader: *anyopaque, frame: *VideoFrame) c_int;
@@ -238,7 +238,7 @@ pub const App = struct {
         self.precache_scanned_until = -1;
         sam_macos_set_video_mode(0, 0);
         sam_macos_set_video_timeline(0, 0);
-        sam_macos_set_precache_progress(0, 0);
+        sam_macos_set_precache_progress(0, 0, 0);
     }
 
     fn openVideoFromPath(self: *App, path: []const u8) void {
@@ -342,11 +342,11 @@ pub const App = struct {
         self.precache_scanned_until = -1;
         self.precache_active.store(true, .release);
         self.mutex.unlock(self.io);
-        sam_macos_set_precache_progress(1, 0);
+        sam_macos_set_precache_progress(1, 0, 0);
         sam_macos_set_status("Pre-caching video frames…");
         self.precache_thread = std.Thread.spawn(.{}, runPrecacheWorker, .{self}) catch {
             self.precache_active.store(false, .release);
-            sam_macos_set_precache_progress(0, 0);
+            sam_macos_set_precache_progress(0, 0, 0);
             sam_macos_set_status("Could not start video pre-cache.");
             return;
         };
@@ -355,7 +355,7 @@ pub const App = struct {
     fn runPrecacheWorker(self: *App) void {
         self.runPrecache(self.precache_phrase[0..self.precache_phrase_len]);
         self.precache_active.store(false, .release);
-        sam_macos_set_precache_progress(2, 0);
+        sam_macos_set_precache_progress(2, 0, 0);
         if (!self.video_stop.load(.acquire) and !self.video_playing.load(.acquire)) {
             self.mutex.lock(self.io) catch return;
             self.video_seek_target = self.video_position;
@@ -592,9 +592,11 @@ pub const App = struct {
         defer sam_macos_video_close(reader);
         const duration = sam_macos_video_duration(reader);
         var frames: usize = 0;
-        var last_percent: u8 = 0;
         const started = std.Io.Timestamp.now(self.io, .awake);
-        log.info(self.io, "pre-caching video for \"{s}\"", .{phrase});
+        var last_ui_update = started;
+        var last_log = started;
+        var fraction: f64 = 0;
+        log.info(self.io, "pre-caching video for \"{s}\" ({d:.2} s)", .{ phrase, duration });
         while (!self.video_stop.load(.acquire) and !self.precache_cancel.load(.acquire)) {
             var frame: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
             const next = sam_macos_video_next(reader, &frame);
@@ -602,7 +604,7 @@ pub const App = struct {
                 if (next < 0) {
                     sam_macos_set_status("Video decoding failed during pre-cache.");
                 } else {
-                    sam_macos_set_precache_progress(1, 1);
+                    sam_macos_set_precache_progress(1, 1, frames);
                     var status_buf: [160]u8 = undefined;
                     const status = std.fmt.bufPrintZ(&status_buf, "Pre-cached {d} frames for “{s}”.", .{ frames, phrase }) catch "Video pre-cache complete.";
                     sam_macos_set_status(status);
@@ -639,6 +641,7 @@ pub const App = struct {
                 phrase,
                 @as(f32, 0.5),
             };
+            const frame_started = std.Io.Timestamp.now(self.io, .awake);
             self.model_mutex.lock(self.io) catch return;
             const result = here.call(.computeQuery, args);
             self.model_mutex.unlock(self.io);
@@ -655,11 +658,18 @@ pub const App = struct {
                 self.mutex.unlock(self.io);
             }
             if (duration > 0 and std.math.isFinite(frame.pts_seconds)) {
-                const percent: u8 = @intFromFloat(@min(99, @max(0, frame.pts_seconds / duration * 100)));
-                if (percent > last_percent) {
-                    last_percent = percent;
-                    sam_macos_set_precache_progress(1, @as(f64, @floatFromInt(percent)) / 100);
-                }
+                fraction = @max(fraction, std.math.clamp(frame.pts_seconds / duration, 0, 0.9999));
+            }
+            const now = std.Io.Timestamp.now(self.io, .awake);
+            if (frames == 1 or last_ui_update.untilNow(self.io, .awake).nanoseconds >= 100_000_000) {
+                sam_macos_set_precache_progress(1, fraction, frames);
+                last_ui_update = now;
+            }
+            if (frames == 1 or last_log.untilNow(self.io, .awake).nanoseconds >= 1_000_000_000) {
+                log.info(self.io, "pre-cache frame {d} at {d:.2}/{d:.2} s ({d:.2}%) in {f}", .{
+                    frames, frame.pts_seconds, duration, fraction * 100, frame_started.untilNow(self.io, .awake),
+                });
+                last_log = now;
             }
         }
         if (!self.video_stop.load(.acquire)) {

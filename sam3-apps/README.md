@@ -33,7 +33,8 @@ queries directly.
 The macOS video controls also include a timeline for seeking, **Restart**, and
 **Next Frame** for stepping while paused. Opening or seeking a video shows the
 decoded frame immediately; when a word is set, its mask appears after inference.
-**Pre-cache Video** scans the entire video for the entered word and shows progress.
+**Pre-cache Video** scans the entire video for the entered word and shows frames
+processed and precise percentage progress. Scan progress is also logged to stdout.
 You can cancel the scan; completed frames remain cached. The scanned word becomes
 the playback query. Playback and seeking stay available during the scan: cached
 frames show masks, while frames still waiting for inference show the plain video.
