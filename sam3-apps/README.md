@@ -19,11 +19,12 @@ The default backend is Metal on macOS and OpenCL on Linux. Pass `-Dbackend=cuda`
 and optionally `-Dsm=sm_61` for CUDA. `zig build` installs the app executable
 under `zig-out/bin`. `zig build test` runs the Linux font tests on Linux.
 
-The macOS app caches image-and-text query results in `.sam3-zimo` under the
-working directory. Repeating a query for the same image skips vision encoding
-and text lookup. Open a video, enter a word, and press **Find by Word** to
-process the current frame, then press **Play** to advance with inference on
-each frame. Playback follows the video's timestamps when
+The macOS app caches image-and-text query results and text features by phrase
+in `.sam3-zimo` under the working directory. Repeating a query for the same
+image skips vision encoding and text lookup; using the same phrase on a different
+frame reuses the text features. Open a video, enter a word, and press
+**Find by Word** to process the current frame, then press **Play** to advance
+with inference on each frame. Playback follows the video's timestamps when
 inference is fast enough; otherwise it advances as frames finish. **Play** and
 **Pause** control playback, and Play after the end restarts it. Replaying the
 same video with the same word reuses cached frame results. Linux runs text
