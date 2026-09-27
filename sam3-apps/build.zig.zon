@@ -13,8 +13,8 @@
             .hash = "zigimg-0.1.0-8_eo2jPCFwDJF89NMU5gJjpTRoFdda26viRcdxyJP0Ks",
         },
         .zimo = .{
-            .url = "git+https://github.com/kirillrdy/cache#38eaed4c59f76dc8ec03c7ea07ecfb721c2b57ca",
-            .hash = "zimo-0.1.0-014_hIq2AAA7hEZ6zdz0Cv989Mn3NJJ5KZyjtK5QbzDZ",
+            .url = "git+https://github.com/kirillrdy/cache#1b48798fad4032514153270dc778752a9597ee69",
+            .hash = "zimo-0.1.0-014_hCy8AAAV2ctox1dOMUWmnycJZPMHz_0UjeGHb0nC",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "native_main.zig", "macos", "linux", "README.md" },
