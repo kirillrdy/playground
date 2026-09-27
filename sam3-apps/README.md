@@ -25,8 +25,8 @@ image skips vision encoding and text lookup; using the same phrase on a differen
 frame reuses the text features. Open a video, enter a word, and press
 **Find by Word** to process the current frame. On macOS, **Play** advances with
 inference on each frame, following video timestamps when inference is fast enough.
-On Linux, **Play** follows the timestamps in real time, skips late frames, and
-shows masks only for frames already cached; uncached frames show plain video.
+On Linux, **Play** processes each frame before advancing when a word is set.
+Cached frames replay at the video's pace; uncached frames wait for inference.
 **Pre-cache Video** prepares masks for smooth replay. On Linux, opening or
 seeking shows a decoded frame with its cached mask, if available. Press
 **Find by Word** while paused to process the current frame. **Play** and
