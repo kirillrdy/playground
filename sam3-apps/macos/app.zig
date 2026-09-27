@@ -109,6 +109,7 @@ pub const App = struct {
     precache_cancel: std.atomic.Value(bool) = .init(false),
     precache_phrase: [256]u8 = undefined,
     precache_phrase_len: usize = 0,
+    precache_scanned_until: f64 = -1,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model, example_path: []const u8) App {
         return .{
@@ -234,6 +235,7 @@ pub const App = struct {
         self.video_step_requested = false;
         self.precache_active.store(false, .release);
         self.precache_phrase_len = 0;
+        self.precache_scanned_until = -1;
         sam_macos_set_video_mode(0, 0);
         sam_macos_set_video_timeline(0, 0);
         sam_macos_set_precache_progress(0, 0);
@@ -337,6 +339,7 @@ pub const App = struct {
         self.video_phrase_len = self.precache_phrase_len;
         @memcpy(self.video_phrase[0..self.video_phrase_len], self.precache_phrase[0..self.precache_phrase_len]);
         self.precache_cancel.store(false, .release);
+        self.precache_scanned_until = -1;
         self.precache_active.store(true, .release);
         self.mutex.unlock(self.io);
         sam_macos_set_precache_progress(1, 0);
@@ -458,7 +461,7 @@ pub const App = struct {
             const phrase = phrase_buf[0..phrase_len];
 
             const started = std.Io.Timestamp.now(self.io, .awake);
-            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase) catch |err| {
+            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase, video_frame.pts_seconds) catch |err| {
                 log.info(self.io, "Video frame lookup failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
                 sam_macos_set_status("Video frame inference failed.");
                 self.video_playing.store(false, .release);
@@ -553,7 +556,7 @@ pub const App = struct {
         }
     }
 
-    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8) !?[]f32 {
+    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8, pts: f64) !?[]f32 {
         const args = .{
             self.allocator,
             [_][]const u8{
@@ -569,8 +572,12 @@ pub const App = struct {
             @as(f32, 0.5),
         };
         if (self.precache_active.load(.acquire)) {
-            if (here.lookup(.computeQuery, args)) |cached| return try cached;
-            return null;
+            self.mutex.lock(self.io) catch return error.VideoLockFailed;
+            const scanned_until = self.precache_scanned_until;
+            const scanned_phrase = std.mem.eql(u8, phrase, self.precache_phrase[0..self.precache_phrase_len]);
+            self.mutex.unlock(self.io);
+            if (!scanned_phrase or !std.math.isFinite(pts) or pts > scanned_until) return null;
+            return try here.call(.computeQuery, args);
         }
         self.model_mutex.lock(self.io) catch return error.ModelLockFailed;
         defer self.model_mutex.unlock(self.io);
@@ -642,6 +649,11 @@ pub const App = struct {
             };
             self.allocator.free(values);
             frames += 1;
+            if (std.math.isFinite(frame.pts_seconds)) {
+                self.mutex.lock(self.io) catch return;
+                self.precache_scanned_until = @max(self.precache_scanned_until, frame.pts_seconds);
+                self.mutex.unlock(self.io);
+            }
             if (duration > 0 and std.math.isFinite(frame.pts_seconds)) {
                 const percent: u8 = @intFromFloat(@min(99, @max(0, frame.pts_seconds / duration * 100)));
                 if (percent > last_percent) {
