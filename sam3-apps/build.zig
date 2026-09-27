@@ -80,10 +80,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "sam3", .module = sam3.module("sam3") },
                 .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+                .{ .name = "zimo", .module = zimo.module("zimo") },
                 .{ .name = "native_main", .module = native_main },
             },
         });
         linux_mod.link_libc = true;
+        linux_mod.addCSourceFile(.{ .file = b.path("linux/video.c"), .flags = &.{} });
 
         const exe = b.addExecutable(.{ .name = "sam3-linux", .root_module = linux_mod });
         b.installArtifact(exe);
