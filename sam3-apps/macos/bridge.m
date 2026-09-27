@@ -207,6 +207,9 @@
 @property (nonatomic, strong) NSSegmentedControl *modeSeg;
 @property (nonatomic, strong) NSButton *clearBtn;
 @property (nonatomic, strong) NSButton *findBtn;
+@property (nonatomic, strong) NSButton *precacheBtn;
+@property (nonatomic, strong) NSProgressIndicator *precacheProgress;
+@property (nonatomic, strong) NSTextField *precachePercent;
 @property (nonatomic, strong) NSProgressIndicator *spinner;
 @property (nonatomic, strong) NSStackView *masksStackView;
 @property (nonatomic, strong) NSScrollView *masksScrollView;
@@ -214,6 +217,7 @@
 @property (nonatomic, assign) const SamCallbacks *callbacks;
 @property (nonatomic, assign) BOOL videoMode;
 @property (nonatomic, assign) BOOL videoPlaying;
+@property (nonatomic, assign) BOOL precacheActive;
 
 - (instancetype)initWithCallbacks:(const SamCallbacks *)callbacks;
 - (void)createWindow;
@@ -221,6 +225,7 @@
 - (void)setBusy:(BOOL)busy;
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing;
 - (void)setVideoTimelineDuration:(double)duration position:(double)position;
+- (void)setPrecacheProgressState:(int)state fraction:(double)fraction;
 @end
 
 static SamAppDelegate *g_delegate = nil;
@@ -313,6 +318,23 @@ static SamAppDelegate *g_delegate = nil;
     row2.spacing = 8.0;
     row2.alignment = NSLayoutAttributeCenterY;
 
+    _precacheBtn = [NSButton buttonWithTitle:@"Pre-cache Video" target:self action:@selector(precacheVideo:)];
+    _precacheBtn.enabled = NO;
+    _precacheProgress = [[NSProgressIndicator alloc] init];
+    _precacheProgress.style = NSProgressIndicatorStyleBar;
+    _precacheProgress.indeterminate = NO;
+    _precacheProgress.minValue = 0;
+    _precacheProgress.maxValue = 100;
+    _precacheProgress.doubleValue = 0;
+    _precacheProgress.hidden = YES;
+    _precachePercent = [NSTextField labelWithString:@"0%"];
+    _precachePercent.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+    _precachePercent.hidden = YES;
+    NSStackView *cacheRow = [NSStackView stackViewWithViews:@[_precacheBtn, _precacheProgress, _precachePercent]];
+    cacheRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    cacheRow.spacing = 8.0;
+    cacheRow.alignment = NSLayoutAttributeCenterY;
+
     // Row 3 (Status)
     _statusLabel = [NSTextField labelWithString:@"Initializing SAM 3…"];
     _statusLabel.textColor = [NSColor colorWithCalibratedRed:0.59 green:0.61 blue:0.65 alpha:1.0];
@@ -336,7 +358,7 @@ static SamAppDelegate *g_delegate = nil;
     _masksScrollView.documentView = _masksStackView;
 
     // Layout
-    for (NSView *v in @[row1, videoRow, row2, _statusLabel, _canvasView, _masksScrollView]) {
+    for (NSView *v in @[row1, videoRow, row2, cacheRow, _statusLabel, _canvasView, _masksScrollView]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [contentView addSubview:v];
     }
@@ -358,8 +380,13 @@ static SamAppDelegate *g_delegate = nil;
         [row2.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_conceptField.widthAnchor constraintGreaterThanOrEqualToConstant:280.0],
 
+        [cacheRow.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:8.0],
+        [cacheRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+        [cacheRow.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [_precacheProgress.widthAnchor constraintEqualToConstant:240.0],
+
         // Status
-        [_statusLabel.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:8.0],
+        [_statusLabel.topAnchor constraintEqualToAnchor:cacheRow.bottomAnchor constant:8.0],
         [_statusLabel.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [_statusLabel.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_statusLabel.heightAnchor constraintEqualToConstant:20.0],
@@ -431,6 +458,15 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)stepFrame:(id)sender {
     if (_callbacks && _callbacks->on_video_step) _callbacks->on_video_step();
+}
+
+- (void)precacheVideo:(id)sender {
+    NSString *text = [_conceptField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (_precacheActive || text.length > 0) {
+        if (_callbacks && _callbacks->on_precache_video) _callbacks->on_precache_video([text UTF8String]);
+    } else {
+        [_statusLabel setStringValue:@"Enter a word to pre-cache this video."];
+    }
 }
 
 - (void)seekVideo:(NSSlider *)sender {
@@ -505,16 +541,17 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)setBusy:(BOOL)busy {
     _canvasView.isBusy = busy;
-    _openBtn.enabled = !busy;
-    _openVideoBtn.enabled = !busy;
-    _playBtn.enabled = !busy && _videoMode;
-    _stepBtn.enabled = !busy && _videoMode && !_videoPlaying;
-    _restartBtn.enabled = !busy && _videoMode;
-    _seekSlider.enabled = !busy && _videoMode && _seekSlider.maxValue > 0;
-    _sampleBtn.enabled = !busy;
-    _clearBtn.enabled = !busy;
-    _findBtn.enabled = !busy;
-    _conceptField.enabled = !busy;
+    _openBtn.enabled = !busy && !_precacheActive;
+    _openVideoBtn.enabled = !busy && !_precacheActive;
+    _playBtn.enabled = !busy && _videoMode && !_precacheActive;
+    _stepBtn.enabled = !busy && _videoMode && !_videoPlaying && !_precacheActive;
+    _restartBtn.enabled = !busy && _videoMode && !_precacheActive;
+    _seekSlider.enabled = !busy && _videoMode && !_precacheActive && _seekSlider.maxValue > 0;
+    _sampleBtn.enabled = !busy && !_precacheActive;
+    _clearBtn.enabled = !busy && !_precacheActive;
+    _findBtn.enabled = !busy && !_precacheActive;
+    _conceptField.enabled = !busy && !_precacheActive;
+    _precacheBtn.enabled = _precacheActive || (_videoMode && !busy);
 
     if (busy) {
         [_spinner startAnimation:nil];
@@ -526,10 +563,11 @@ static SamAppDelegate *g_delegate = nil;
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing {
     _videoMode = active;
     _videoPlaying = playing;
-    _playBtn.enabled = active && !_canvasView.isBusy;
-    _stepBtn.enabled = active && !playing && !_canvasView.isBusy;
-    _restartBtn.enabled = active && !_canvasView.isBusy;
-    _seekSlider.enabled = active && !_canvasView.isBusy && _seekSlider.maxValue > 0;
+    _playBtn.enabled = active && !_canvasView.isBusy && !_precacheActive;
+    _stepBtn.enabled = active && !playing && !_canvasView.isBusy && !_precacheActive;
+    _restartBtn.enabled = active && !_canvasView.isBusy && !_precacheActive;
+    _seekSlider.enabled = active && !_canvasView.isBusy && !_precacheActive && _seekSlider.maxValue > 0;
+    _precacheBtn.enabled = _precacheActive || (active && !_canvasView.isBusy);
     _playBtn.title = playing ? @"Pause" : @"Play";
     _clearBtn.enabled = !active && !_canvasView.isBusy;
     _modeSeg.enabled = !active;
@@ -540,10 +578,24 @@ static SamAppDelegate *g_delegate = nil;
     double safePosition = isfinite(position) ? fmax(0, fmin(position, safeDuration)) : 0;
     _seekSlider.maxValue = safeDuration > 0 ? safeDuration : 1;
     _seekSlider.doubleValue = safePosition;
-    _seekSlider.enabled = _videoMode && !_canvasView.isBusy && safeDuration > 0;
+    _seekSlider.enabled = _videoMode && !_canvasView.isBusy && !_precacheActive && safeDuration > 0;
     _timeLabel.stringValue = [NSString stringWithFormat:@"%d:%02d / %d:%02d",
                               (int)safePosition / 60, (int)safePosition % 60,
                               (int)safeDuration / 60, (int)safeDuration % 60];
+}
+
+- (void)setPrecacheProgressState:(int)state fraction:(double)fraction {
+    _precacheActive = state == 1;
+    _precacheBtn.title = _precacheActive ? @"Cancel Pre-cache" : @"Pre-cache Video";
+    _precacheProgress.hidden = state == 0;
+    _precachePercent.hidden = state == 0;
+    if (state != 2) {
+        double percent = isfinite(fraction) ? fmax(0, fmin(100, fraction * 100)) : 0;
+        _precacheProgress.doubleValue = percent;
+        _precachePercent.stringValue = [NSString stringWithFormat:@"%.0f%%", percent];
+    }
+    [self setVideoMode:_videoMode playing:_videoPlaying];
+    [self setBusy:_canvasView.isBusy];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -703,6 +755,12 @@ void sam_macos_set_video_mode(int active, int playing) {
 void sam_macos_set_video_timeline(double duration, double position) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_delegate setVideoTimelineDuration:duration position:position];
+    });
+}
+
+void sam_macos_set_precache_progress(int state, double fraction) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_delegate setPrecacheProgressState:state fraction:fraction];
     });
 }
 
