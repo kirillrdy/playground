@@ -82,6 +82,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zigimg", .module = zigimg.module("zigimg") },
                 .{ .name = "zimo", .module = zimo.module("zimo") },
                 .{ .name = "native_main", .module = native_main },
+                .{ .name = "log", .module = log },
             },
         });
         linux_mod.link_libc = true;
