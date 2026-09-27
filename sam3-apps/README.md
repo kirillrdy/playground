@@ -39,8 +39,8 @@ The video controls also include a timeline for seeking, **Restart**, and
 shows the decoded frame immediately; when a word is set, its mask appears after
 inference. On Linux, **Next Frame** processes the stepped frame.
 **Pre-cache Video** scans the entire video for the entered word and shows progress.
-On macOS, it shows frames processed and precise percentage progress, and logs
-scan progress to stdout.
+On macOS, it shows frames processed and precise percentage progress. Both apps
+log scan progress to stdout about once a second.
 You can cancel the scan; completed frames remain cached. The scanned word becomes
 the playback query. Playback and seeking stay available during the scan: cached
 frames show masks, while frames still waiting for inference show the plain video.

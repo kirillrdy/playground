@@ -1276,7 +1276,10 @@ pub const App = struct {
         const duration = sam_linux_video_duration(reader);
         var frames: usize = 0;
         const started = std.Io.Timestamp.now(self.io, .awake);
-        log.info(self.io, "pre-caching video for \"{s}\"", .{phrase});
+        var last_ui_update = started;
+        var last_log = started;
+        var fraction: f64 = 0;
+        log.info(self.io, "pre-caching video for \"{s}\" ({d:.2} s)", .{ phrase, duration });
         while (!self.video_stop.load(.acquire) and !self.precache_cancel.load(.acquire)) {
             var raw: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
             const result = sam_linux_video_next(reader, &raw);
@@ -1301,6 +1304,7 @@ pub const App = struct {
                 return;
             };
             defer decoded.deinit(self.allocator);
+            const frame_started = std.Io.Timestamp.now(self.io, .awake);
             self.model_mutex.lock(self.io) catch return;
             const result_query = cachedQuery(self.allocator, sam3.RgbImage.fromImage(decoded), phrase);
             self.model_mutex.unlock(self.io);
@@ -1317,10 +1321,21 @@ pub const App = struct {
                 self.mutex.unlock(self.io);
             }
             if (duration > 0 and std.math.isFinite(raw.pts_seconds)) {
+                fraction = @max(fraction, std.math.clamp(raw.pts_seconds / duration, 0, 0.9999));
+            }
+            const now = std.Io.Timestamp.now(self.io, .awake);
+            if (frames == 1 or last_ui_update.untilNow(self.io, .awake).nanoseconds >= 100_000_000) {
                 self.mutex.lock(self.io) catch return;
-                self.precache_progress = std.math.clamp(raw.pts_seconds / duration, 0, 1);
+                self.precache_progress = fraction;
                 self.mutex.unlock(self.io);
                 self.redraw_pending.store(true, .release);
+                last_ui_update = now;
+            }
+            if (frames == 1 or last_log.untilNow(self.io, .awake).nanoseconds >= 1_000_000_000) {
+                log.info(self.io, "pre-cache frame {d} at {d:.2}/{d:.2} s ({d:.2}%) in {f}", .{
+                    frames, raw.pts_seconds, duration, fraction * 100, frame_started.untilNow(self.io, .awake),
+                });
+                last_log = now;
             }
         }
         if (!self.video_stop.load(.acquire)) {
