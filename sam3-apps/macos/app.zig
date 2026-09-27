@@ -4,13 +4,6 @@ const render = sam3.render;
 const zigimg = @import("zigimg");
 const zimo = @import("zimo");
 const here = zimo.bind(@This(), @embedFile("app.zig"));
-threadlocal var query_computed = false;
-threadlocal var text_features_computed = false;
-
-fn cacheDescription() []const u8 {
-    if (!query_computed) return "cache hit";
-    return if (text_features_computed) "computed" else "computed, text cache hit";
-}
 
 const SamCallbacks = extern struct {
     on_open_file: ?*const fn (path: [*:0]const u8) callconv(.c) void,
@@ -405,7 +398,6 @@ pub const App = struct {
             const phrase = phrase_buf[0..phrase_len];
 
             const started = std.Io.Timestamp.now(self.io, .awake);
-            query_computed = false;
             const values = here.call(.computeQuery, .{
                 self.allocator,
                 [_][]const u8{
@@ -427,7 +419,6 @@ pub const App = struct {
                 continue;
             };
             defer self.allocator.free(values);
-            const cache_status = cacheDescription();
             var masks = unpackMasks(self.allocator, values) catch {
                 sam_macos_set_status("Cached video frame is invalid.");
                 continue;
@@ -487,14 +478,12 @@ pub const App = struct {
             previous_pts = video_frame.pts_seconds;
             previous_display = std.Io.Timestamp.now(self.io, .awake);
             var status_buf: [256]u8 = undefined;
-            const status = std.fmt.bufPrintZ(&status_buf, "Frame {d}: {d} match(es) for “{s}” in {f} ({s})", .{
+            const status = std.fmt.bufPrintZ(&status_buf, "Frame {d}: {d} match(es) for “{s}” in {f}", .{
                 frame_number, masks.count, phrase, lookup_elapsed,
-                cache_status,
             }) catch "Video frame processed.";
             sam_macos_set_status(status);
-            std.debug.print("  frame {d}: \"{s}\" -> {d} object(s) in {f} ({s})\n", .{
+            std.debug.print("  frame {d}: \"{s}\" -> {d} object(s) in {f}\n", .{
                 frame_number, phrase, masks.count, lookup_elapsed,
-                cache_status,
             });
         }
     }
@@ -646,7 +635,6 @@ pub const App = struct {
         const started = std.Io.Timestamp.now(self.io, .awake);
 
         const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-        query_computed = false;
         const values = here.call(.computeQuery, .{
             self.allocator,
             [_][]const u8{
@@ -668,7 +656,6 @@ pub const App = struct {
             return;
         };
         defer self.allocator.free(values);
-        const cache_status = cacheDescription();
         const masks = unpackMasks(self.allocator, values) catch |err| {
             std.debug.print("Cached text lookup failed: {t}\n", .{err});
             sam_macos_set_status("Text lookup failed");
@@ -677,11 +664,10 @@ pub const App = struct {
             return;
         };
         const lookup_elapsed = lookup_started.untilNow(self.io, .awake);
-        std.debug.print("  \"{s}\" -> {d} object(s) in {f} ({s})\n", .{
+        std.debug.print("  \"{s}\" -> {d} object(s) in {f}\n", .{
             phrase,
             masks.count,
             lookup_elapsed,
-            cache_status,
         });
 
         self.mutex.lock(self.io) catch return;
@@ -870,9 +856,7 @@ pub fn computeQuery(
     phrase: []const u8,
     min_score: f32,
 ) ![]f32 {
-    query_computed = true;
     const model = (g_app orelse return error.NoActiveApp).model;
-    text_features_computed = false;
     const text_features = try here.call(.computeTextFeatures, .{
         allocator,
         [_][]const u8{
@@ -907,7 +891,6 @@ pub fn computeTextFeatures(
 ) ![]f32 {
     _ = allocator;
     _ = model_ids;
-    text_features_computed = true;
     const model = (g_app orelse return error.NoActiveApp).model;
     return model.encodeTextFeatures(phrase);
 }
