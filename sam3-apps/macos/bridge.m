@@ -225,7 +225,7 @@
 - (void)setBusy:(BOOL)busy;
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing;
 - (void)setVideoTimelineDuration:(double)duration position:(double)position;
-- (void)setPrecacheProgressState:(int)state fraction:(double)fraction;
+- (void)setPrecacheProgressState:(int)state fraction:(double)fraction frames:(size_t)frames;
 @end
 
 static SamAppDelegate *g_delegate = nil;
@@ -327,7 +327,7 @@ static SamAppDelegate *g_delegate = nil;
     _precacheProgress.maxValue = 100;
     _precacheProgress.doubleValue = 0;
     _precacheProgress.hidden = YES;
-    _precachePercent = [NSTextField labelWithString:@"0%"];
+    _precachePercent = [NSTextField labelWithString:@"0 frames · 0.00%"];
     _precachePercent.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
     _precachePercent.hidden = YES;
     NSStackView *cacheRow = [NSStackView stackViewWithViews:@[_precacheBtn, _precacheProgress, _precachePercent]];
@@ -584,7 +584,7 @@ static SamAppDelegate *g_delegate = nil;
                               (int)safeDuration / 60, (int)safeDuration % 60];
 }
 
-- (void)setPrecacheProgressState:(int)state fraction:(double)fraction {
+- (void)setPrecacheProgressState:(int)state fraction:(double)fraction frames:(size_t)frames {
     _precacheActive = state == 1;
     _precacheBtn.title = _precacheActive ? @"Cancel Pre-cache" : @"Pre-cache Video";
     _precacheProgress.hidden = state == 0;
@@ -592,7 +592,7 @@ static SamAppDelegate *g_delegate = nil;
     if (state != 2) {
         double percent = isfinite(fraction) ? fmax(0, fmin(100, fraction * 100)) : 0;
         _precacheProgress.doubleValue = percent;
-        _precachePercent.stringValue = [NSString stringWithFormat:@"%.0f%%", percent];
+        _precachePercent.stringValue = [NSString stringWithFormat:@"%zu frames · %.2f%%", frames, percent];
     }
     [self setVideoMode:_videoMode playing:_videoPlaying];
     [self setBusy:_canvasView.isBusy];
@@ -758,9 +758,9 @@ void sam_macos_set_video_timeline(double duration, double position) {
     });
 }
 
-void sam_macos_set_precache_progress(int state, double fraction) {
+void sam_macos_set_precache_progress(int state, double fraction, size_t frames) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [g_delegate setPrecacheProgressState:state fraction:fraction];
+        [g_delegate setPrecacheProgressState:state fraction:fraction frames:frames];
     });
 }
 
