@@ -301,7 +301,6 @@ pub const App = struct {
     fn runVideoWorker(self: *App) void {
         var reader: ?*anyopaque = null;
         defer if (reader) |handle| sam_macos_video_close(handle);
-        var frame_number: usize = 0;
         var previous_pts: ?f64 = null;
         var previous_display: ?std.Io.Timestamp = null;
         var retry_required = false;
@@ -320,7 +319,6 @@ pub const App = struct {
                 open_at = target;
                 previous_pts = null;
                 previous_display = null;
-                frame_number = 0;
             }
             if (reader == null and (!retry_required or self.video_playing.load(.acquire) or step or seek != null)) {
                 reader = sam_macos_video_open(self.video_path.?.ptr, open_at);
@@ -351,7 +349,6 @@ pub const App = struct {
                 self.video_playing.store(false, .release);
                 sam_macos_set_video_mode(1, 0);
                 sam_macos_set_status(if (next == 0) "End of video. Press Play to replay." else "Video decoding failed. Press Play to retry.");
-                frame_number = 0;
                 previous_pts = null;
                 previous_display = null;
                 open_at = 0;
@@ -474,16 +471,23 @@ pub const App = struct {
             self.mutex.unlock(self.io);
             sam_macos_set_video_timeline(duration, video_frame.pts_seconds);
 
-            frame_number += 1;
             previous_pts = video_frame.pts_seconds;
             previous_display = std.Io.Timestamp.now(self.io, .awake);
+            const seconds = if (std.math.isFinite(video_frame.pts_seconds)) @max(video_frame.pts_seconds, 0) else 0;
+            const position_ms: u64 = @intFromFloat(@min(seconds * 1000, 1.0e15));
+            var time_buf: [32]u8 = undefined;
+            const timecode = std.fmt.bufPrint(&time_buf, "{d}:{d:0>2}.{d:0>3}", .{
+                position_ms / 60_000,
+                position_ms / 1_000 % 60,
+                position_ms % 1_000,
+            }) catch "0:00.000";
             var status_buf: [256]u8 = undefined;
-            const status = std.fmt.bufPrintZ(&status_buf, "Frame {d}: {d} match(es) for “{s}” in {f}", .{
-                frame_number, masks.count, phrase, lookup_elapsed,
+            const status = std.fmt.bufPrintZ(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{
+                timecode, masks.count, phrase, lookup_elapsed,
             }) catch "Video frame processed.";
             sam_macos_set_status(status);
-            std.debug.print("  frame {d}: \"{s}\" -> {d} object(s) in {f}\n", .{
-                frame_number, phrase, masks.count, lookup_elapsed,
+            std.debug.print("  at {s}: \"{s}\" -> {d} object(s) in {f}\n", .{
+                timecode, phrase, masks.count, lookup_elapsed,
             });
         }
     }
