@@ -302,7 +302,7 @@ pub const App = struct {
 
         var it = dir.iterate();
         while (it.next(self.io) catch null) |entry| {
-            if (entry.name.len == 0 or std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
             const is_dir = entry.kind == .directory;
             const name = self.allocator.dupe(u8, entry.name) catch break;
             self.browser_entries.append(self.allocator, .{ .name = name, .is_dir = is_dir }) catch {
