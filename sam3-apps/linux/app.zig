@@ -69,7 +69,6 @@ pub const App = struct {
     video_position: f64 = 0,
     video_seek_target: ?f64 = null,
     video_step_requested: bool = false,
-    video_find_requested: bool = false,
     precache_thread: ?std.Thread = null,
     precache_active: std.atomic.Value(bool) = .init(false),
     precache_cancel: std.atomic.Value(bool) = .init(false),
@@ -791,7 +790,6 @@ pub const App = struct {
             if (!playing) {
                 self.video_seek_target = self.video_position;
                 self.video_step_requested = true;
-                self.video_find_requested = true;
             }
             self.mutex.unlock(self.io);
             self.setStatus(if (playing) "Processing video frames during playback…" else "Processing current video frame…");
@@ -924,7 +922,6 @@ pub const App = struct {
         self.video_position = 0;
         self.video_seek_target = null;
         self.video_step_requested = false;
-        self.video_find_requested = false;
         self.precache_active.store(false, .release);
         self.precache_phrase_len = 0;
         self.precache_progress = 0;
@@ -969,11 +966,10 @@ pub const App = struct {
     }
 
     fn seekVideo(self: *App, seconds: f64) void {
-        if (!std.math.isFinite(seconds)) return;
+        if (!self.video_active or !std.math.isFinite(seconds)) return;
         self.mutex.lock(self.io) catch return;
         self.video_seek_target = std.math.clamp(seconds, 0, self.video_duration);
-        self.video_step_requested = false;
-        self.video_find_requested = false;
+        self.video_step_requested = self.video_phrase_len > 0;
         self.mutex.unlock(self.io);
         self.redraw_pending.store(true, .release);
     }
@@ -1025,7 +1021,6 @@ pub const App = struct {
             self.mutex.lock(self.io) catch return;
             self.video_seek_target = self.video_position;
             self.video_step_requested = true;
-            self.video_find_requested = false;
             self.mutex.unlock(self.io);
         }
     }
@@ -1045,8 +1040,6 @@ pub const App = struct {
             self.video_seek_target = null;
             const step = self.video_step_requested;
             self.video_step_requested = false;
-            const find = self.video_find_requested;
-            self.video_find_requested = false;
             var phrase_buf: [160]u8 = undefined;
             const phrase_len = self.video_phrase_len;
             @memcpy(phrase_buf[0..phrase_len], self.video_phrase[0..phrase_len]);
@@ -1152,6 +1145,7 @@ pub const App = struct {
                 self.best_mask_idx = -1;
                 self.video_position = raw.pts_seconds;
                 self.renderComposite(-1);
+                self.redraw_pending.store(true, .release);
                 self.mutex.unlock(self.io);
             }
             if (phrase_len == 0) {
@@ -1162,13 +1156,12 @@ pub const App = struct {
                 continue;
             }
             playback_start = null;
-            const cache_only = seek != null and !find and !self.video_playing.load(.acquire);
-            if (show_preview and !cache_only) self.setStatus("Processing current video frame…");
+            if (show_preview) self.setStatus("Processing current video frame…");
             var masks: ?sam3.Masks = null;
             var mask_result_valid = false;
             defer if (masks) |*m| m.deinit();
             const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase_buf[0..phrase_len], cache_only) catch |err| {
+            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase_buf[0..phrase_len], raw.pts_seconds) catch |err| {
                 log.info(self.io, "Video frame lookup failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
                 self.video_playing.store(false, .release);
                 self.setStatus("Video frame inference failed.");
@@ -1247,10 +1240,8 @@ pub const App = struct {
             var status_buf: [256]u8 = undefined;
             const status = if (mask_result_valid)
                 std.fmt.bufPrint(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{ timecode, mask_count, phrase_buf[0..phrase_len], lookup_elapsed }) catch "Video frame processed."
-            else if (self.precache_active.load(.acquire))
-                std.fmt.bufPrint(&status_buf, "At {s}: waiting for cached “{s}” result.", .{ timecode, phrase_buf[0..phrase_len] }) catch "Frame shown without a cached result."
             else
-                std.fmt.bufPrint(&status_buf, "At {s}: no cached mask; press Find or Pre-cache Video", .{timecode}) catch "Frame shown without a cached mask.";
+                std.fmt.bufPrint(&status_buf, "At {s}: waiting for cached “{s}” result.", .{ timecode, phrase_buf[0..phrase_len] }) catch "Frame shown without a cached result.";
             self.setStatus(status);
             if (mask_result_valid) log.info(self.io, "at {s}: \"{s}\" -> {d} object(s) in {f}", .{
                 timecode, phrase_buf[0..phrase_len], mask_count, lookup_elapsed,
@@ -1258,9 +1249,14 @@ pub const App = struct {
         }
     }
 
-    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8, cache_only: bool) !?[]f32 {
-        if (cache_only) {
-            return try cachedQueryIfPresent(self.allocator, self.io, image, phrase);
+    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8, pts: f64) !?[]f32 {
+        if (self.precache_active.load(.acquire)) {
+            self.mutex.lock(self.io) catch return error.VideoLockFailed;
+            const scanned_until = self.precache_scanned_until;
+            const scanned_phrase = std.mem.eql(u8, phrase, self.precache_phrase[0..self.precache_phrase_len]);
+            self.mutex.unlock(self.io);
+            if (!scanned_phrase or !std.math.isFinite(pts) or pts > scanned_until) return null;
+            return try cachedQuery(self.allocator, image, phrase);
         }
         self.model_mutex.lock(self.io) catch return error.ModelLockFailed;
         defer self.model_mutex.unlock(self.io);
@@ -1764,26 +1760,6 @@ fn queryArgs(allocator: std.mem.Allocator, image: sam3.RgbImage, phrase: []const
         phrase,
         @as(f32, 0.5),
     };
-}
-
-fn cachedQueryIfPresent(allocator: std.mem.Allocator, io: std.Io, image: sam3.RgbImage, phrase: []const u8) !?[]f32 {
-    const key = zimo.keyFor(here.id(.computeQuery), queryArgs(allocator, image, phrase));
-    const dir = std.Io.Dir.cwd().openDir(io, ".sam3-zimo", .{}) catch return null;
-    defer dir.close(io);
-    const file = dir.openFile(io, &key, .{}) catch return null;
-    defer file.close(io);
-    const stat = file.stat(io) catch return null;
-    if (stat.size < 17 or stat.size > 256 * 1024 * 1024 or (stat.size - 1) % @sizeOf(f32) != 0) return null;
-    var tag: [1]u8 = undefined;
-    if ((file.readPositionalAll(io, &tag, 0) catch return null) != 1 or tag[0] != 1) return null;
-    const len: usize = @intCast((stat.size - 1) / @sizeOf(f32));
-    const values = try allocator.alloc(f32, len);
-    const bytes = std.mem.sliceAsBytes(values);
-    if ((file.readPositionalAll(io, bytes, 1) catch 0) != bytes.len) {
-        allocator.free(values);
-        return null;
-    }
-    return values;
 }
 
 pub fn computeTextFeatures(
