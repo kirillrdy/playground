@@ -5,7 +5,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const backend = b.option(Backend, "backend", "Inference backend: OpenCL, Metal, or CUDA");
+    const default_backend: Backend = blk: {
+        if (target.result.os.tag.isDarwin()) break :blk .metal;
+        if (target.result.os.tag == .linux) {
+            if (std.Io.Dir.accessAbsolute(b.graph.io, "/dev/nvidia0", .{})) |_| {
+                break :blk .cuda;
+            } else |_| {}
+        }
+        break :blk .opencl;
+    };
+
+    const backend = b.option(Backend, "backend", "Inference backend: OpenCL, Metal, or CUDA") orelse default_backend;
     const cuda_arch = b.option([]const u8, "sm", "CUDA compute capability");
     const half = b.option(bool, "half", "Store float tensors on the device as halves");
 
