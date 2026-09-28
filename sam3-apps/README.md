@@ -6,13 +6,13 @@ Use Zig 0.16.0 or newer from this directory.
 On macOS:
 
 ```sh
-zig build run-macos --release=fast
+zig build run --release=fast
 ```
 
 On Linux with Wayland:
 
 ```sh
-zig build run-linux --release=fast -Dbackend=cuda
+zig build run --release=fast -Dbackend=cuda
 ```
 
 The default backend is Metal on macOS and OpenCL on Linux. Pass `-Dbackend=cuda`

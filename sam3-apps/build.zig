@@ -37,6 +37,8 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const run_step = b.step("run", "Run the native app");
+
     if (target.result.os.tag.isDarwin()) {
         const macos_mod = b.createModule(.{
             .root_source_file = b.path("macos/main.zig"),
@@ -65,10 +67,14 @@ pub fn build(b: *std.Build) void {
 
         const exe = b.addExecutable(.{ .name = "sam3-macos", .root_module = macos_mod });
         b.installArtifact(exe);
-        const run = b.step("run-macos", "Run the native macOS UI");
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.setCwd(b.path("."));
-        run.dependOn(&run_cmd.step);
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+        run_step.dependOn(&run_cmd.step);
+        b.step("run-macos", "Run the native macOS UI").dependOn(&run_cmd.step);
+        b.step("run-darwin", "Alias for run-macos").dependOn(&run_cmd.step);
     }
 
     if (target.result.os.tag == .linux) {
@@ -90,10 +96,13 @@ pub fn build(b: *std.Build) void {
 
         const exe = b.addExecutable(.{ .name = "sam3-linux", .root_module = linux_mod });
         b.installArtifact(exe);
-        const run = b.step("run-linux", "Run the native Linux Wayland UI");
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.setCwd(b.path("."));
-        run.dependOn(&run_cmd.step);
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+        run_step.dependOn(&run_cmd.step);
+        b.step("run-linux", "Run the native Linux Wayland UI").dependOn(&run_cmd.step);
         b.step("run-wayland", "Alias for run-linux").dependOn(&run_cmd.step);
     }
 
