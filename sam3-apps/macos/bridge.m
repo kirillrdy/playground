@@ -288,15 +288,16 @@ static SamAppDelegate *g_delegate = nil;
 
     _clearBtn = [NSButton buttonWithTitle:@"Clear Points" target:self action:@selector(clearClick:)];
 
-    NSStackView *row1 = [NSStackView stackViewWithViews:@[_openBtn, _sampleBtn, _modeSeg, _clearBtn]];
+    NSStackView *row1 = [NSStackView stackViewWithViews:@[_openBtn, _openVideoBtn, _sampleBtn, _modeSeg, _clearBtn]];
     row1.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     row1.spacing = 8.0;
     row1.alignment = NSLayoutAttributeCenterY;
 
-    NSStackView *videoRow = [NSStackView stackViewWithViews:@[_openVideoBtn, _restartBtn, _playBtn, _stepBtn, _seekSlider, _timeLabel]];
+    NSStackView *videoRow = [NSStackView stackViewWithViews:@[_playBtn, _restartBtn, _stepBtn, _seekSlider, _timeLabel]];
     videoRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     videoRow.spacing = 8.0;
     videoRow.alignment = NSLayoutAttributeCenterY;
+    [_seekSlider setContentHuggingPriority:NSLayoutPriorityDefaultLow - 10 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     // Row 2
     _conceptField = [[NSTextField alloc] init];
@@ -358,7 +359,7 @@ static SamAppDelegate *g_delegate = nil;
     _masksScrollView.documentView = _masksStackView;
 
     // Layout
-    for (NSView *v in @[row1, videoRow, row2, cacheRow, _statusLabel, _canvasView, _masksScrollView]) {
+    for (NSView *v in @[row1, row2, cacheRow, _statusLabel, _canvasView, videoRow, _masksScrollView]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [contentView addSubview:v];
     }
@@ -370,12 +371,7 @@ static SamAppDelegate *g_delegate = nil;
         [row1.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
 
         // Row 2
-        [videoRow.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:8.0],
-        [videoRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
-        [videoRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [_seekSlider.widthAnchor constraintGreaterThanOrEqualToConstant:120.0],
-
-        [row2.topAnchor constraintEqualToAnchor:videoRow.bottomAnchor constant:8.0],
+        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:8.0],
         [row2.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [row2.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_conceptField.widthAnchor constraintGreaterThanOrEqualToConstant:280.0],
@@ -395,7 +391,14 @@ static SamAppDelegate *g_delegate = nil;
         [_canvasView.topAnchor constraintEqualToAnchor:_statusLabel.bottomAnchor constant:10.0],
         [_canvasView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [_canvasView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [_canvasView.bottomAnchor constraintEqualToAnchor:_masksScrollView.topAnchor constant:-10.0],
+        [_canvasView.bottomAnchor constraintEqualToAnchor:videoRow.topAnchor constant:-10.0],
+
+        // Video Controls (directly under video canvas)
+        [videoRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+        [videoRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [videoRow.bottomAnchor constraintEqualToAnchor:_masksScrollView.topAnchor constant:-8.0],
+        [_seekSlider.widthAnchor constraintGreaterThanOrEqualToConstant:120.0],
+        [_playBtn.widthAnchor constraintGreaterThanOrEqualToConstant:70.0],
 
         // Masks Scroll View
         [_masksScrollView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
