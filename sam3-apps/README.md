@@ -12,12 +12,12 @@ zig build run --release=fast
 On Linux with Wayland:
 
 ```sh
-zig build run --release=fast -Dbackend=cuda
+zig build run --release=fast
 ```
 
-The default backend is Metal on macOS and OpenCL on Linux. Pass `-Dbackend=cuda`
-and optionally `-Dsm=sm_61` for CUDA. `zig build` installs the app executable
-under `zig-out/bin`. `zig build test` runs the Linux font tests on Linux.
+The default backend is Metal on macOS, and on Linux it defaults to CUDA if `/dev/nvidia0`
+is detected (otherwise OpenCL). Pass `-Dbackend=cuda` and optionally `-Dsm=sm_61` for CUDA.
+`zig build` installs the app executable under `zig-out/bin`. `zig build test` runs the Linux font tests on Linux.
 
 Both apps cache image-and-text query results and text features by phrase
 in `.sam3-zimo` under the working directory. Repeating a query for the same
