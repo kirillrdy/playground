@@ -35,7 +35,27 @@ pub const Database = struct {
     }
 
     pub fn getIndex(self: *const Database, video_path: []const u8) ?*const index.InvertedIndex {
-        return self.indexes.getPtr(video_path);
+        if (self.indexes.getPtr(video_path)) |idx| return idx;
+
+        var it = self.indexes.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (std.mem.endsWith(u8, key, video_path) or std.mem.endsWith(u8, video_path, key)) {
+                return entry.value_ptr;
+            }
+            const key_base = std.fs.path.basename(key);
+            const path_base = std.fs.path.basename(video_path);
+            if (std.ascii.eqlIgnoreCase(key_base, path_base)) {
+                return entry.value_ptr;
+            }
+        }
+
+        if (self.indexes.count() == 1) {
+            var it1 = self.indexes.iterator();
+            if (it1.next()) |entry| return entry.value_ptr;
+        }
+
+        return null;
     }
 
     pub fn executeQuery(
@@ -354,4 +374,121 @@ test "vdb: streaming row callback" {
 
     try std.testing.expectEqual(@as(usize, 3), counter.count);
     try std.testing.expectEqual(@as(?usize, 0), counter.first_frame);
+}
+
+test "vdb: create index parser test" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ally = arena.allocator();
+
+    const q1 = "CREATE INDEX ON \"video.mp4\" USING sam3(\"person\") WITH (conf = 0.5);";
+    var p1 = parser.Parser.init(ally, q1);
+    const stmt1 = try p1.parse();
+    try std.testing.expectEqualStrings("video.mp4", stmt1.create_index.source_file);
+    try std.testing.expectEqualStrings("sam3", stmt1.create_index.model_name);
+    try std.testing.expectEqualStrings("person", stmt1.create_index.prompt.?);
+    try std.testing.expectEqual(@as(f32, 0.5), stmt1.create_index.min_conf);
+
+    const q2 = "CREATE INDEX person_idx ON \"video.mp4\" (sam3(frame, \"person\")) WITH (conf = 0.6, step = 2);";
+    var p2 = parser.Parser.init(ally, q2);
+    const stmt2 = try p2.parse();
+    try std.testing.expectEqualStrings("person_idx", stmt2.create_index.name);
+    try std.testing.expectEqualStrings("video.mp4", stmt2.create_index.source_file);
+    try std.testing.expectEqualStrings("person", stmt2.create_index.prompt.?);
+    try std.testing.expectEqual(@as(f32, 0.6), stmt2.create_index.min_conf);
+    try std.testing.expectEqual(@as(usize, 2), stmt2.create_index.sample_step);
+}
+
+test "vdb: sam3 index pushdown with confidence threshold" {
+    const ally = std.testing.allocator;
+
+    var db = Database.init(ally);
+    defer db.deinit();
+
+    var builder = index.IndexBuilder.init(ally);
+    defer builder.deinit();
+
+    // Add person detections at frames 5, 10, 15 with varying confidence
+    try builder.addDetection(5, 165, "person", 0.45, .{ .x = 0.1, .y = 0.1, .w = 0.2, .h = 0.2 });
+    try builder.addDetection(10, 330, "person", 0.85, .{ .x = 0.1, .y = 0.1, .w = 0.2, .h = 0.2 });
+    try builder.addDetection(15, 495, "person", 0.92, .{ .x = 0.1, .y = 0.1, .w = 0.2, .h = 0.2 });
+
+    try db.registerIndex("test_sam3.mp4", try builder.build());
+
+    var mock = MockReader{ .frames_total = 1000 };
+
+    // Query with WHERE sam3(frame, "person") > 0.5 should only evaluate frames 10 and 15
+    var result = try db.executeQuery(
+        "SELECT frame FROM \"test_sam3.mp4\" WHERE sam3(frame, \"person\") > 0.5",
+        mock.reader(),
+        null,
+        null,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 10), result.rows[0].values[0].frame_type.index);
+    try std.testing.expectEqual(@as(usize, 15), result.rows[1].values[0].frame_type.index);
+}
+
+test "vdb: sam3 index pushdown in projections without WHERE clause" {
+    const ally = std.testing.allocator;
+
+    var db = Database.init(ally);
+    defer db.deinit();
+
+    var builder = index.IndexBuilder.init(ally);
+    defer builder.deinit();
+
+    try builder.addDetection(42, 1386, "person", 0.88, .{ .x = 0.1, .y = 0.1, .w = 0.2, .h = 0.2 });
+    try db.registerIndex("test_sam3.mp4", try builder.build());
+
+    var mock = MockReader{ .frames_total = 10000 };
+
+    // Query without WHERE clause should use index pushdown from projection sam3(frame, "person")
+    var result = try db.executeQuery(
+        "SELECT frame, sam3(frame, \"person\") FROM \"test_sam3.mp4\"",
+        mock.reader(),
+        null,
+        null,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 42), result.rows[0].values[0].frame_type.index);
+}
+
+test "vdb: sam3 index serialization and file load/save roundtrip" {
+    const ally = std.testing.allocator;
+
+    var builder = index.IndexBuilder.init(ally);
+    defer builder.deinit();
+
+    try builder.addDetection(10, 330, "person", 0.95, .{ .x = 0.1, .y = 0.2, .w = 0.3, .h = 0.4 });
+    try builder.addDetection(20, 660, "car", 0.85, .{ .x = 0.5, .y = 0.5, .w = 0.2, .h = 0.2 });
+
+    const idx = try builder.build();
+    defer {
+        var mutable_idx = idx;
+        mutable_idx.deinit();
+    }
+
+    const tmp_path = "test_index_roundtrip.vdb";
+    try idx.saveToFile(tmp_path);
+    defer index.InvertedIndex.deleteFile(ally, tmp_path) catch {};
+
+    var loaded = try index.InvertedIndex.loadFromFile(ally, tmp_path);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(u32, 21), loaded.frame_count);
+    const person_postings = loaded.lookup("person");
+    try std.testing.expect(person_postings != null);
+    try std.testing.expectEqual(@as(usize, 1), person_postings.?.len);
+    try std.testing.expectEqual(@as(u32, 10), person_postings.?[0].frame_idx);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.95), person_postings.?[0].conf, 0.001);
+
+    const car_postings = loaded.lookup("car");
+    try std.testing.expect(car_postings != null);
+    try std.testing.expectEqual(@as(usize, 1), car_postings.?.len);
+    try std.testing.expectEqual(@as(u32, 20), car_postings.?[0].frame_idx);
 }

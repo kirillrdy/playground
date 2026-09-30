@@ -86,6 +86,15 @@ pub const Planner = struct {
                     }
                 }
             }
+            // If no explicit frame(N), check if sam3_prompt is present and indexed
+            if (candidate_frames == null and available_index != null and sam3_prompt != null) {
+                const matches = try available_index.?.getMatchingFrames(self.allocator, sam3_prompt.?, 0.4);
+                if (matches.len > 0) {
+                    candidate_frames = matches;
+                } else {
+                    self.allocator.free(matches);
+                }
+            }
         }
 
         const strategy: ScanStrategy = if (candidate_frames) |frames|
@@ -143,6 +152,13 @@ pub const Planner = struct {
         idx: ?*const index_mod.InvertedIndex,
     ) !?[]u32 {
         switch (expr.*) {
+            .call => {
+                if (isSam3Call(expr)) |prompt| {
+                    if (idx) |sam_idx| {
+                        return try sam_idx.getMatchingFrames(self.allocator, prompt, 0.4);
+                    }
+                }
+            },
             .binary => |b| {
                 // Check frame_id = 10000 or 10000 = frame_id
                 if (b.op == .eq) {
@@ -159,13 +175,45 @@ pub const Planner = struct {
                     }
                 }
 
+                if (b.op == .gt or b.op == .gte) {
+                    if (isSam3Call(b.left)) |prompt| {
+                        if (idx) |sam_idx| {
+                            var min_conf: f32 = 0.4;
+                            if (b.right.* == .literal_float) min_conf = @floatCast(b.right.literal_float);
+                            if (b.right.* == .literal_int) min_conf = @floatFromInt(b.right.literal_int);
+                            return try sam_idx.getMatchingFrames(self.allocator, prompt, min_conf);
+                        }
+                    } else if (isSam3Call(b.right)) |prompt| {
+                        if (idx) |sam_idx| {
+                            var min_conf: f32 = 0.4;
+                            if (b.left.* == .literal_float) min_conf = @floatCast(b.left.literal_float);
+                            if (b.left.* == .literal_int) min_conf = @floatFromInt(b.left.literal_int);
+                            return try sam_idx.getMatchingFrames(self.allocator, prompt, min_conf);
+                        }
+                    }
+                }
+
+                if (b.op == .lt or b.op == .lte) {
+                    if (isSam3Call(b.right)) |prompt| {
+                        if (idx) |sam_idx| {
+                            var min_conf: f32 = 0.4;
+                            if (b.left.* == .literal_float) min_conf = @floatCast(b.left.literal_float);
+                            if (b.left.* == .literal_int) min_conf = @floatFromInt(b.left.literal_int);
+                            return try sam_idx.getMatchingFrames(self.allocator, prompt, min_conf);
+                        }
+                    }
+                }
+
                 if (b.op == .contains) {
-                    // Check if left is yolov8(...) and right is a string literal
-                    if (isYoloCall(b.left) and b.right.* == .literal_string) {
+                    if (isSam3Call(b.left)) |prompt| {
+                        if (idx) |sam_idx| {
+                            const target_label = if (b.right.* == .literal_string) b.right.literal_string else prompt;
+                            return try sam_idx.getMatchingFrames(self.allocator, target_label, 0.25);
+                        }
+                    } else if (isYoloCall(b.left) and b.right.* == .literal_string) {
                         if (idx) |yolo_idx| {
                             const target_label = b.right.literal_string;
-                            const frames = try yolo_idx.getMatchingFrames(self.allocator, target_label, 0.25);
-                            return frames;
+                            return try yolo_idx.getMatchingFrames(self.allocator, target_label, 0.25);
                         }
                     }
                 } else if (b.op == .and_op) {
@@ -211,6 +259,22 @@ pub const Planner = struct {
         return switch (expr.*) {
             .call => |c| std.ascii.eqlIgnoreCase(c.name, "yolov8"),
             else => false,
+        };
+    }
+
+    fn isSam3Call(expr: *ast.Expr) ?[]const u8 {
+        return switch (expr.*) {
+            .call => |c| {
+                if (std.ascii.eqlIgnoreCase(c.name, "sam3")) {
+                    if (c.args.len >= 2 and c.args[1].* == .literal_string) {
+                        return c.args[1].literal_string;
+                    } else if (c.args.len >= 1 and c.args[0].* == .literal_string) {
+                        return c.args[0].literal_string;
+                    }
+                }
+                return null;
+            },
+            else => null,
         };
     }
 

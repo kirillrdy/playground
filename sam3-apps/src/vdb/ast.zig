@@ -63,9 +63,10 @@ pub const SelectStmt = struct {
 };
 
 pub const CreateIndexStmt = struct {
-    name: []const u8,
-    source_file: []const u8,
-    model_name: []const u8,
+    name: []const u8 = "default_idx",
+    source_file: []const u8 = "",
+    model_name: []const u8 = "sam3",
+    prompt: ?[]const u8 = null,
     min_conf: f32 = 0.25,
     sample_step: usize = 1,
 };

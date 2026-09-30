@@ -154,37 +154,119 @@ pub const Parser = struct {
         _ = try self.expect(.kw_index);
 
         var name: []const u8 = "default_idx";
-        if (self.tok.tag == .identifier) {
+        if (self.tok.tag == .identifier and self.tok.tag != .kw_on) {
             name = self.tok.text;
             self.advance();
         }
 
         _ = try self.expect(.kw_on);
 
-        const file_tok = if (self.tok.tag == .string_lit or self.tok.tag == .identifier)
-            self.tok
-        else
-            return ParseError.ExpectedString;
-        self.advance();
-
-        _ = try self.expect(.kw_using);
-
-        const model_tok = try self.expect(.identifier);
-
+        var source_file: []const u8 = "";
+        var model_name: []const u8 = "sam3";
+        var prompt: ?[]const u8 = null;
         var min_conf: f32 = 0.25;
         var sample_step: usize = 1;
+
+        if (self.tok.tag == .string_lit) {
+            source_file = self.tok.text;
+            self.advance();
+
+            if (self.eat(.kw_using)) {
+                const model_tok = try self.expect(.identifier);
+                model_name = model_tok.text;
+                if (self.eat(.lparen)) {
+                    while (self.tok.tag != .rparen and self.tok.tag != .eof) {
+                        if (self.tok.tag == .string_lit) {
+                            prompt = self.tok.text;
+                        }
+                        self.advance();
+                    }
+                    _ = try self.expect(.rparen);
+                }
+            } else if (self.eat(.lparen)) {
+                if (self.tok.tag == .identifier) {
+                    model_name = self.tok.text;
+                    self.advance();
+                    if (self.eat(.lparen)) {
+                        while (self.tok.tag != .rparen and self.tok.tag != .eof) {
+                            if (self.tok.tag == .string_lit) {
+                                prompt = self.tok.text;
+                            }
+                            self.advance();
+                        }
+                        _ = try self.expect(.rparen);
+                    }
+                }
+                _ = try self.expect(.rparen);
+            }
+        } else if (self.tok.tag == .identifier) {
+            if (std.ascii.eqlIgnoreCase(self.tok.text, "sam3") or std.ascii.eqlIgnoreCase(self.tok.text, "yolov8")) {
+                model_name = self.tok.text;
+                self.advance();
+                if (self.eat(.lparen)) {
+                    while (self.tok.tag != .rparen and self.tok.tag != .eof) {
+                        if (self.tok.tag == .string_lit) {
+                            prompt = self.tok.text;
+                        }
+                        self.advance();
+                    }
+                    _ = try self.expect(.rparen);
+                }
+            } else {
+                source_file = self.tok.text;
+                self.advance();
+                if (self.eat(.kw_using)) {
+                    const model_tok = try self.expect(.identifier);
+                    model_name = model_tok.text;
+                    if (self.eat(.lparen)) {
+                        while (self.tok.tag != .rparen and self.tok.tag != .eof) {
+                            if (self.tok.tag == .string_lit) {
+                                prompt = self.tok.text;
+                            }
+                            self.advance();
+                        }
+                        _ = try self.expect(.rparen);
+                    }
+                }
+            }
+        } else if (self.eat(.lparen)) {
+            if (self.tok.tag == .identifier) {
+                model_name = self.tok.text;
+                self.advance();
+                if (self.eat(.lparen)) {
+                    while (self.tok.tag != .rparen and self.tok.tag != .eof) {
+                        if (self.tok.tag == .string_lit) {
+                            prompt = self.tok.text;
+                        }
+                        self.advance();
+                    }
+                    _ = try self.expect(.rparen);
+                }
+            }
+            _ = try self.expect(.rparen);
+        } else {
+            return ParseError.ExpectedString;
+        }
 
         if (self.eat(.kw_with)) {
             _ = try self.expect(.lparen);
             while (true) {
                 const key = try self.expect(.identifier);
                 _ = try self.expect(.eq);
-                if (std.ascii.eqlIgnoreCase(key.text, "conf")) {
-                    const val = try self.expect(.float_lit);
-                    min_conf = try std.fmt.parseFloat(f32, val.text);
-                } else if (std.ascii.eqlIgnoreCase(key.text, "step")) {
+                if (std.ascii.eqlIgnoreCase(key.text, "conf") or std.ascii.eqlIgnoreCase(key.text, "min_conf")) {
+                    if (self.tok.tag == .float_lit) {
+                        min_conf = try std.fmt.parseFloat(f32, self.tok.text);
+                        self.advance();
+                    } else if (self.tok.tag == .int_lit) {
+                        min_conf = @floatFromInt(try std.fmt.parseInt(i64, self.tok.text, 10));
+                        self.advance();
+                    }
+                } else if (std.ascii.eqlIgnoreCase(key.text, "step") or std.ascii.eqlIgnoreCase(key.text, "sample_step")) {
                     const val = try self.expect(.int_lit);
                     sample_step = try std.fmt.parseInt(usize, val.text, 10);
+                } else if (std.ascii.eqlIgnoreCase(key.text, "prompt")) {
+                    const val = try self.expect(.string_lit);
+                    prompt = val.text;
                 }
                 if (!self.eat(.comma)) break;
             }
@@ -195,8 +277,9 @@ pub const Parser = struct {
 
         return .{
             .name = name,
-            .source_file = file_tok.text,
-            .model_name = model_tok.text,
+            .source_file = source_file,
+            .model_name = model_name,
+            .prompt = prompt,
             .min_conf = min_conf,
             .sample_step = sample_step,
         };
