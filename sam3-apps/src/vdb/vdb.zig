@@ -8,9 +8,11 @@ pub const index = @import("index.zig");
 pub const planner = @import("planner.zig");
 pub const engine = @import("engine.zig");
 pub const overlay = @import("overlay.zig");
+pub const query_input = @import("query_input.zig");
 
 test {
     _ = overlay;
+    _ = query_input;
 }
 
 pub const Database = struct {
