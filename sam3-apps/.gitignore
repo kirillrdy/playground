@@ -4,3 +4,5 @@ zig-pkg/
 cat_mask*.bmp
 vendor/
 .sam3-zimo/
+*.mp4
+*.vdb

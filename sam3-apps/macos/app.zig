@@ -408,15 +408,20 @@ pub const App = struct {
         if (!self.video_active) return;
         self.mutex.lock(self.io) catch return;
         const has_phrase = self.video_phrase_len > 0;
+        const has_matches = self.query_matches.items.len > 0;
         self.mutex.unlock(self.io);
-        if (!has_phrase) {
-            sam_macos_set_status("Enter a word and press Find before playing video.");
+        if (!has_phrase and !has_matches) {
+            sam_macos_set_status("Enter a visual query or concept before playing video.");
             return;
         }
         const playing = !self.video_playing.load(.acquire);
         self.video_playing.store(playing, .release);
         sam_macos_set_video_mode(1, @intFromBool(playing));
-        if (!playing) sam_macos_set_status("Video paused.");
+        if (!playing) {
+            sam_macos_set_status("Video paused.");
+        } else if (has_matches) {
+            sam_macos_set_status("Playing query matches…");
+        }
     }
 
     fn handleVideoSeek(self: *App, seconds: f64) void {
@@ -475,7 +480,7 @@ pub const App = struct {
         if (!self.video_active) return;
         if (self.precache_active.load(.acquire)) {
             self.precache_cancel.store(true, .release);
-            sam_macos_set_status("Cancelling pre-cache after this frame…");
+            sam_macos_set_status("Cancelling indexing after this frame…");
             return;
         }
         if (self.precache_thread) |thread| {
@@ -484,7 +489,7 @@ pub const App = struct {
         }
         const phrase = std.mem.span(text);
         if (phrase.len == 0) {
-            sam_macos_set_status("Enter a word to pre-cache this video.");
+            sam_macos_set_status("Enter a visual concept to create index for this video.");
             return;
         }
         self.mutex.lock(self.io) catch return;
@@ -497,11 +502,11 @@ pub const App = struct {
         self.precache_active.store(true, .release);
         self.mutex.unlock(self.io);
         sam_macos_set_precache_progress(1, 0, 0);
-        sam_macos_set_status("Pre-caching video frames…");
+        sam_macos_set_status("Creating visual index for video frames…");
         self.precache_thread = std.Thread.spawn(.{}, runPrecacheWorker, .{self}) catch {
             self.precache_active.store(false, .release);
             sam_macos_set_precache_progress(0, 0, 0);
-            sam_macos_set_status("Could not start video pre-cache.");
+            sam_macos_set_status("Could not start visual index creation.");
             return;
         };
     }
@@ -707,6 +712,35 @@ pub const App = struct {
             if (self.masks != null) log.info(self.io, "at {s}: \"{s}\" -> {d} object(s) in {f}", .{
                 timecode, phrase, mask_count, lookup_elapsed,
             });
+
+            // If video playback is running and query results exist, advance through matched frames!
+            if (self.video_playing.load(.acquire)) {
+                self.mutex.lock(self.io) catch return;
+                const total_matches = self.query_matches.items.len;
+                if (total_matches > 0) {
+                    if (self.query_match_idx + 1 < total_matches) {
+                        self.query_match_idx += 1;
+                    } else {
+                        self.query_match_idx = 0;
+                    }
+                    const next_match_frame = self.query_matches.items[self.query_match_idx];
+                    const next_sec = @as(f64, @floatFromInt(next_match_frame)) * 0.0333;
+                    self.video_seek_target = next_sec;
+                    self.video_step_requested = true;
+                    const cur_num = self.query_match_idx + 1;
+                    self.mutex.unlock(self.io);
+
+                    std.Io.sleep(self.io, .fromMilliseconds(250), .awake) catch {};
+
+                    var match_buf: [160]u8 = undefined;
+                    const match_msg = std.fmt.bufPrintZ(&match_buf, "Playing query match {d} of {d} (Frame #{d} at {d:.2}s)", .{
+                        cur_num, total_matches, next_match_frame, next_sec,
+                    }) catch "Playing query match.";
+                    sam_macos_set_status(match_msg);
+                    continue;
+                }
+                self.mutex.unlock(self.io);
+            }
         }
     }
 

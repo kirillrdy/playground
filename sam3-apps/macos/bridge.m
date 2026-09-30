@@ -267,11 +267,23 @@ static SamAppDelegate *g_delegate = nil;
     NSView *contentView = _window.contentView;
 
     // Row 1
-    _openBtn = [NSButton buttonWithTitle:@"Open Image…" target:self action:@selector(openFile:)];
+    // Video & File Buttons
     _openVideoBtn = [NSButton buttonWithTitle:@"Open Video…" target:self action:@selector(openVideo:)];
+    _openBtn = [NSButton buttonWithTitle:@"Open Image…" target:self action:@selector(openFile:)];
+    _sampleBtn = [NSButton buttonWithTitle:@"Sample Image" target:self action:@selector(sampleClick:)];
+
+    _modeSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Add to mask", @"Cut from mask"]
+                                                trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                      target:self
+                                                      action:@selector(modeChanged:)];
+    _modeSeg.selectedSegment = 0;
+
+    _clearBtn = [NSButton buttonWithTitle:@"Clear Points" target:self action:@selector(clearClick:)];
+
+    // Playback Controls (below canvas)
     _playBtn = [NSButton buttonWithTitle:@"Play" target:self action:@selector(playPause:)];
     _playBtn.enabled = NO;
-    _stepBtn = [NSButton buttonWithTitle:@"Next Frame" target:self action:@selector(stepFrame:)];
+    _stepBtn = [NSButton buttonWithTitle:@"Next Match" target:self action:@selector(stepFrame:)];
     _stepBtn.enabled = NO;
     _restartBtn = [NSButton buttonWithTitle:@"Restart" target:self action:@selector(restartVideo:)];
     _restartBtn.enabled = NO;
@@ -280,20 +292,6 @@ static SamAppDelegate *g_delegate = nil;
     _seekSlider.enabled = NO;
     _timeLabel = [NSTextField labelWithString:@"0:00 / 0:00"];
     _timeLabel.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
-    _sampleBtn = [NSButton buttonWithTitle:@"Sample Image" target:self action:@selector(sampleClick:)];
-
-    _modeSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Clicks add to mask", @"Clicks cut from mask"]
-                                                trackingMode:NSSegmentSwitchTrackingSelectOne
-                                                      target:self
-                                                      action:@selector(modeChanged:)];
-    _modeSeg.selectedSegment = 0;
-
-    _clearBtn = [NSButton buttonWithTitle:@"Clear Points" target:self action:@selector(clearClick:)];
-
-    NSStackView *row1 = [NSStackView stackViewWithViews:@[_openBtn, _openVideoBtn, _sampleBtn, _modeSeg, _clearBtn]];
-    row1.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    row1.spacing = 8.0;
-    row1.alignment = NSLayoutAttributeCenterY;
 
     NSStackView *videoRow = [NSStackView stackViewWithViews:@[_playBtn, _restartBtn, _stepBtn, _seekSlider, _timeLabel]];
     videoRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
@@ -301,9 +299,9 @@ static SamAppDelegate *g_delegate = nil;
     videoRow.alignment = NSLayoutAttributeCenterY;
     [_seekSlider setContentHuggingPriority:NSLayoutPriorityDefaultLow - 10 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    // Row 2 (Query Text Area)
+    // TOP HERO: Visual SQL Query Field & Run Button
     _conceptField = [[NSTextField alloc] init];
-    _conceptField.placeholderString = @"Find objects (e.g. cat) or SQL: SELECT frame, sam3(frame, 'cat') WHERE yolov8(frame) CONTAINS 'cat'";
+    _conceptField.placeholderString = @"Visual SQL query (e.g. SELECT frame, sam3(frame, 'person') WHERE sam3(frame, 'person') > 0.5) or concept word";
     _conceptField.target = self;
     _conceptField.action = @selector(findClick:);
     _conceptField.delegate = self;
@@ -315,7 +313,9 @@ static SamAppDelegate *g_delegate = nil;
     _conceptField.lineBreakMode = NSLineBreakByWordWrapping;
     [_conceptField setContentHuggingPriority:NSLayoutPriorityDefaultLow - 10 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    _findBtn = [NSButton buttonWithTitle:@"Find / Query" target:self action:@selector(findClick:)];
+    _findBtn = [NSButton buttonWithTitle:@"Run Query" target:self action:@selector(findClick:)];
+    _findBtn.bezelStyle = NSBezelStylePush;
+    _findBtn.toolTip = @"Run visual SQL query (Return to execute, Shift+Return for newline)";
     [_findBtn setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     _spinner = [[NSProgressIndicator alloc] init];
@@ -324,12 +324,14 @@ static SamAppDelegate *g_delegate = nil;
     _spinner.displayedWhenStopped = NO;
     [_spinner setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    NSStackView *row2 = [NSStackView stackViewWithViews:@[_conceptField, _findBtn, _spinner]];
-    row2.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    row2.spacing = 8.0;
-    row2.alignment = NSLayoutAttributeCenterY;
+    NSStackView *queryRow = [NSStackView stackViewWithViews:@[_conceptField, _findBtn, _spinner]];
+    queryRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    queryRow.spacing = 8.0;
+    queryRow.alignment = NSLayoutAttributeCenterY;
 
-    _precacheBtn = [NSButton buttonWithTitle:@"Pre-cache Video" target:self action:@selector(precacheVideo:)];
+    // Index Creation Controls
+    _precacheBtn = [NSButton buttonWithTitle:@"Create Index" target:self action:@selector(precacheVideo:)];
+    _precacheBtn.toolTip = @"Build and save a visual index on this video for instant sub-millisecond queries";
     _precacheBtn.enabled = NO;
     _precacheProgress = [[NSProgressIndicator alloc] init];
     _precacheProgress.style = NSProgressIndicatorStyleBar;
@@ -338,16 +340,27 @@ static SamAppDelegate *g_delegate = nil;
     _precacheProgress.maxValue = 100;
     _precacheProgress.doubleValue = 0;
     _precacheProgress.hidden = YES;
-    _precachePercent = [NSTextField labelWithString:@"0 frames · 0.00%"];
+    _precachePercent = [NSTextField labelWithString:@"0 frames · 0.0%"];
     _precachePercent.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
     _precachePercent.hidden = YES;
-    NSStackView *cacheRow = [NSStackView stackViewWithViews:@[_precacheBtn, _precacheProgress, _precachePercent]];
-    cacheRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    cacheRow.spacing = 8.0;
-    cacheRow.alignment = NSLayoutAttributeCenterY;
 
-    // Row 3 (Status)
-    _statusLabel = [NSTextField labelWithString:@"Initializing SAM 3…"];
+    // Clean Toolbar Row: [Open Video] [Open Image] | [Create Index] [Progress] | [Mode] [Clear] [Sample]
+    NSStackView *toolbarRow = [NSStackView stackViewWithViews:@[
+        _openVideoBtn,
+        _openBtn,
+        _precacheBtn,
+        _precacheProgress,
+        _precachePercent,
+        _modeSeg,
+        _clearBtn,
+        _sampleBtn
+    ]];
+    toolbarRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    toolbarRow.spacing = 8.0;
+    toolbarRow.alignment = NSLayoutAttributeCenterY;
+
+    // Status Label
+    _statusLabel = [NSTextField labelWithString:@"Ready. Open a video or enter a visual query."];
     _statusLabel.textColor = [NSColor colorWithCalibratedRed:0.59 green:0.61 blue:0.65 alpha:1.0];
     _statusLabel.font = [NSFont systemFontOfSize:13];
 
@@ -369,48 +382,44 @@ static SamAppDelegate *g_delegate = nil;
     _masksScrollView.documentView = _masksStackView;
 
     // Layout
-    for (NSView *v in @[row1, row2, cacheRow, _statusLabel, _canvasView, videoRow, _masksScrollView]) {
+    for (NSView *v in @[queryRow, toolbarRow, _statusLabel, _canvasView, videoRow, _masksScrollView]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [contentView addSubview:v];
     }
 
     [NSLayoutConstraint activateConstraints:@[
-        // Row 1
-        [row1.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:14.0],
-        [row1.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
-        [row1.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        // 1. Top Hero: Main Visual Query Console
+        [queryRow.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:12.0],
+        [queryRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+        [queryRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [_conceptField.heightAnchor constraintEqualToConstant:54.0],
 
-        // Row 2 (Query Area: wide and tall)
-        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:8.0],
-        [row2.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
-        [row2.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [_conceptField.heightAnchor constraintEqualToConstant:56.0],
+        // 2. Action Toolbar: Open, Index, Segmentation Tools
+        [toolbarRow.topAnchor constraintEqualToAnchor:queryRow.bottomAnchor constant:10.0],
+        [toolbarRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+        [toolbarRow.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [_precacheProgress.widthAnchor constraintEqualToConstant:180.0],
 
-        [cacheRow.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:8.0],
-        [cacheRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
-        [cacheRow.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [_precacheProgress.widthAnchor constraintEqualToConstant:240.0],
-
-        // Status
-        [_statusLabel.topAnchor constraintEqualToAnchor:cacheRow.bottomAnchor constant:8.0],
+        // 3. Status Label
+        [_statusLabel.topAnchor constraintEqualToAnchor:toolbarRow.bottomAnchor constant:8.0],
         [_statusLabel.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [_statusLabel.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_statusLabel.heightAnchor constraintEqualToConstant:20.0],
 
-        // Canvas
+        // 4. Video/Image Canvas
         [_canvasView.topAnchor constraintEqualToAnchor:_statusLabel.bottomAnchor constant:10.0],
         [_canvasView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [_canvasView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_canvasView.bottomAnchor constraintEqualToAnchor:videoRow.topAnchor constant:-10.0],
 
-        // Video Controls (directly under video canvas)
+        // 5. Video Playback Controls (directly under canvas)
         [videoRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [videoRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [videoRow.bottomAnchor constraintEqualToAnchor:_masksScrollView.topAnchor constant:-8.0],
         [_seekSlider.widthAnchor constraintGreaterThanOrEqualToConstant:120.0],
         [_playBtn.widthAnchor constraintGreaterThanOrEqualToConstant:70.0],
 
-        // Masks Scroll View
+        // 6. Masks Scroll View
         [_masksScrollView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [_masksScrollView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_masksScrollView.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor constant:-12.0],
@@ -575,7 +584,7 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)setQueryActive:(BOOL)active {
     _queryActive = active;
-    _findBtn.title = active ? @"Cancel Query" : @"Find / Query";
+    _findBtn.title = active ? @"Cancel Query" : @"Run Query";
     _findBtn.enabled = !_canvasView.isBusy || active;
 }
 
@@ -626,13 +635,13 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)setPrecacheProgressState:(int)state fraction:(double)fraction frames:(size_t)frames {
     _precacheActive = state == 1;
-    _precacheBtn.title = _precacheActive ? @"Cancel Pre-cache" : @"Pre-cache Video";
+    _precacheBtn.title = _precacheActive ? @"Cancel Indexing" : @"Create Index";
     _precacheProgress.hidden = state == 0;
     _precachePercent.hidden = state == 0;
     if (state != 2) {
         double percent = isfinite(fraction) ? fmax(0, fmin(100, fraction * 100)) : 0;
         _precacheProgress.doubleValue = percent;
-        _precachePercent.stringValue = [NSString stringWithFormat:@"%zu frames · %.2f%%", frames, percent];
+        _precachePercent.stringValue = [NSString stringWithFormat:@"Indexing %zu frames · %.1f%%", frames, percent];
     }
     [self setVideoMode:_videoMode playing:_videoPlaying];
     [self setBusy:_canvasView.isBusy];
