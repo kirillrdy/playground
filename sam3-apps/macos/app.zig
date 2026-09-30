@@ -56,10 +56,13 @@ const VideoFrame = extern struct {
 
 extern fn sam_macos_init(callbacks: *const SamCallbacks) c_int;
 extern fn sam_macos_run() void;
+extern fn sam_macos_set_window_title(title: [*:0]const u8) void;
 extern fn sam_macos_set_status(text: [*:0]const u8) void;
 extern fn sam_macos_set_image(rgba_pixels: ?[*]const u8, width: c_int, height: c_int) void;
 extern fn sam_macos_set_masks(count: c_int, masks: ?[*]const SamMaskInfo, best_index: c_int, selected_index: c_int) void;
 extern fn sam_macos_set_busy(is_busy: c_int) void;
+extern fn sam_macos_file_exists(path: [*:0]const u8) c_int;
+extern fn sam_macos_get_home() ?[*:0]const u8;
 extern fn sam_macos_set_video_mode(active: c_int, playing: c_int) void;
 extern fn sam_macos_set_video_timeline(duration: f64, position: f64) void;
 extern fn sam_macos_set_precache_progress(state: c_int, fraction: f64, frames: usize) void;
@@ -344,6 +347,7 @@ pub const App = struct {
         sam_macos_set_video_timeline(0, 0);
         sam_macos_set_precache_progress(0, 0, 0);
         sam_macos_set_query_active(0);
+        sam_macos_set_window_title("SAM 3 — Visual Database");
     }
 
     fn openVideoFromPath(self: *App, path: []const u8) void {
@@ -371,6 +375,12 @@ pub const App = struct {
         sam_macos_set_image(null, 0, 0);
         sam_macos_set_masks(0, null, 0, -1);
         sam_macos_set_video_mode(1, 0);
+
+        // Update window title with video file name
+        const basename = std.fs.path.basename(path);
+        var title_buf: [256]u8 = undefined;
+        const title_str = std.fmt.bufPrintZ(&title_buf, "SAM 3 — Visual Database — {s}", .{basename}) catch "SAM 3 — Visual Database";
+        sam_macos_set_window_title(title_str);
 
         // Try auto-loading sidecar index if exists
         var index_loaded = false;
@@ -1062,9 +1072,108 @@ pub const App = struct {
         }
     }
 
+    fn resolveVideoPath(allocator: std.mem.Allocator, input_path: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, input_path, " \t\r\n'\"");
+        if (trimmed.len == 0) return null;
+
+        // 1. Direct check
+        if (allocator.dupeZ(u8, trimmed)) |zpath| {
+            defer allocator.free(zpath);
+            if (sam_macos_file_exists(zpath.ptr) != 0) {
+                return allocator.dupe(u8, trimmed) catch null;
+            }
+        } else |_| {}
+
+        // 2. Expand ~/
+        const maybe_home = if (sam_macos_get_home()) |h| std.mem.span(h) else null;
+        if (std.mem.startsWith(u8, trimmed, "~/")) {
+            if (maybe_home) |home| {
+                if (std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, trimmed[2..] })) |expanded| {
+                    if (allocator.dupeZ(u8, expanded)) |zpath| {
+                        defer allocator.free(zpath);
+                        if (sam_macos_file_exists(zpath.ptr) != 0) {
+                            return expanded;
+                        }
+                    } else |_| {}
+                    allocator.free(expanded);
+                } else |_| {}
+            }
+        }
+
+        // 3. Check in home directory (~/<trimmed>)
+        if (maybe_home) |home| {
+            if (std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, trimmed })) |in_home| {
+                if (allocator.dupeZ(u8, in_home)) |zpath| {
+                    defer allocator.free(zpath);
+                    if (sam_macos_file_exists(zpath.ptr) != 0) {
+                        return in_home;
+                    }
+                } else |_| {}
+                allocator.free(in_home);
+            } else |_| {}
+        }
+
+        // 4. Check in current working directory (./<trimmed>)
+        if (std.fmt.allocPrint(allocator, "./{s}", .{trimmed})) |in_cwd| {
+            if (allocator.dupeZ(u8, in_cwd)) |zpath| {
+                defer allocator.free(zpath);
+                if (sam_macos_file_exists(zpath.ptr) != 0) {
+                    return in_cwd;
+                }
+            } else |_| {}
+            allocator.free(in_cwd);
+        } else |_| {}
+
+        return null;
+    }
+
     fn handleQuery(self: *App, raw_query: []const u8) void {
+        const trimmed = std.mem.trim(u8, raw_query, " \t\r\n");
+
+        // Attempt to extract source video path if specified in query
+        var parsed_source_path: ?[]const u8 = null;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        var p = vdb.parser.Parser.init(arena.allocator(), trimmed);
+        if (p.parse()) |stmt| {
+            switch (stmt) {
+                .select_stmt => |sel| {
+                    switch (sel.source) {
+                        .file_path => |fp| parsed_source_path = fp,
+                        .call => |c| parsed_source_path = c.path,
+                    }
+                },
+                .create_index => |ci| {
+                    if (ci.source_file.len > 0) {
+                        parsed_source_path = ci.source_file;
+                    }
+                },
+            }
+        } else |_| {}
+
+        // If a video path is specified in the query, resolve and open it
+        if (parsed_source_path) |source_file| {
+            if (resolveVideoPath(self.allocator, source_file)) |resolved| {
+                defer self.allocator.free(resolved);
+                const is_same_video = if (self.video_active and self.video_path != null)
+                    std.mem.eql(u8, self.video_path.?, resolved)
+                else
+                    false;
+
+                if (!is_same_video) {
+                    self.openVideoFromPath(resolved);
+                }
+            } else {
+                var err_buf: [256]u8 = undefined;
+                const err_msg = std.fmt.bufPrintZ(&err_buf, "Could not find video file: “{s}”", .{source_file}) catch "Video not found.";
+                sam_macos_set_status(err_msg);
+                return;
+            }
+        }
+
         if (!self.video_active or self.video_path == null) {
-            sam_macos_set_status("Open a video first before executing visual SQL queries.");
+            sam_macos_set_status("Specify a video in FROM 'video.mp4' or open a video first.");
             return;
         }
         if (self.query_active.load(.acquire)) {
