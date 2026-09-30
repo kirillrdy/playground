@@ -278,7 +278,7 @@ static SamAppDelegate *g_delegate = nil;
                                                       action:@selector(modeChanged:)];
     _modeSeg.selectedSegment = 0;
 
-    _clearBtn = [NSButton buttonWithTitle:@"Clear Points" target:self action:@selector(clearClick:)];
+    _clearBtn = [NSButton buttonWithTitle:@"Hide/Clear Masks" target:self action:@selector(clearClick:)];
 
     // Playback Controls (below canvas)
     _playBtn = [NSButton buttonWithTitle:@"Play" target:self action:@selector(playPause:)];
@@ -545,11 +545,13 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)maskClicked:(NSButton *)sender {
     int index = (int)sender.tag;
+    BOOL isNowOn = (sender.state == NSControlStateValueOn);
     for (NSButton *button in _maskButtons) {
-        button.state = button == sender ? NSControlStateValueOn : NSControlStateValueOff;
+        if (button != sender) button.state = NSControlStateValueOff;
     }
+    int selected = isNowOn ? index : -1;
     if (_callbacks && _callbacks->on_select_mask) {
-        _callbacks->on_select_mask(index);
+        _callbacks->on_select_mask(selected);
     }
 }
 
@@ -620,7 +622,7 @@ static SamAppDelegate *g_delegate = nil;
     _seekSlider.enabled = active && (!_canvasView.isBusy || _queryActive) && _seekSlider.maxValue > 0;
     _precacheBtn.enabled = _precacheActive || (active && !_canvasView.isBusy);
     _playBtn.title = playing ? @"Pause" : @"Play";
-    _clearBtn.enabled = !active && !_canvasView.isBusy;
+    _clearBtn.enabled = !_canvasView.isBusy;
     _modeSeg.enabled = !active;
 }
 
