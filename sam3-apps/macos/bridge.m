@@ -585,21 +585,23 @@ static SamAppDelegate *g_delegate = nil;
 - (void)setQueryActive:(BOOL)active {
     _queryActive = active;
     _findBtn.title = active ? @"Cancel Query" : @"Run Query";
-    _findBtn.enabled = !_canvasView.isBusy || active;
+    _findBtn.enabled = YES;
+    [self setVideoMode:_videoMode playing:_videoPlaying];
+    [self setBusy:_canvasView.isBusy];
 }
 
 - (void)setBusy:(BOOL)busy {
     _canvasView.isBusy = busy;
     _openBtn.enabled = !busy;
     _openVideoBtn.enabled = !busy;
-    _playBtn.enabled = !busy && _videoMode;
-    _stepBtn.enabled = !busy && _videoMode && !_videoPlaying;
-    _restartBtn.enabled = !busy && _videoMode;
-    _seekSlider.enabled = !busy && _videoMode && _seekSlider.maxValue > 0;
+    _playBtn.enabled = (!busy || _queryActive) && _videoMode;
+    _stepBtn.enabled = (!busy || _queryActive) && _videoMode && !_videoPlaying;
+    _restartBtn.enabled = (!busy || _queryActive) && _videoMode;
+    _seekSlider.enabled = (!busy || _queryActive) && _videoMode && _seekSlider.maxValue > 0;
     _sampleBtn.enabled = !busy;
     _clearBtn.enabled = !busy;
     _findBtn.enabled = !busy || _queryActive;
-    _conceptField.enabled = !busy;
+    _conceptField.enabled = YES;
     _precacheBtn.enabled = _precacheActive || (_videoMode && !busy);
 
     if (busy) {
@@ -612,10 +614,10 @@ static SamAppDelegate *g_delegate = nil;
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing {
     _videoMode = active;
     _videoPlaying = playing;
-    _playBtn.enabled = active && !_canvasView.isBusy;
-    _stepBtn.enabled = active && !playing && !_canvasView.isBusy;
-    _restartBtn.enabled = active && !_canvasView.isBusy;
-    _seekSlider.enabled = active && !_canvasView.isBusy && _seekSlider.maxValue > 0;
+    _playBtn.enabled = active && (!_canvasView.isBusy || _queryActive);
+    _stepBtn.enabled = active && !playing && (!_canvasView.isBusy || _queryActive);
+    _restartBtn.enabled = active && (!_canvasView.isBusy || _queryActive);
+    _seekSlider.enabled = active && (!_canvasView.isBusy || _queryActive) && _seekSlider.maxValue > 0;
     _precacheBtn.enabled = _precacheActive || (active && !_canvasView.isBusy);
     _playBtn.title = playing ? @"Pause" : @"Play";
     _clearBtn.enabled = !active && !_canvasView.isBusy;
@@ -627,7 +629,7 @@ static SamAppDelegate *g_delegate = nil;
     double safePosition = isfinite(position) ? fmax(0, fmin(position, safeDuration)) : 0;
     _seekSlider.maxValue = safeDuration > 0 ? safeDuration : 1;
     _seekSlider.doubleValue = safePosition;
-    _seekSlider.enabled = _videoMode && !_canvasView.isBusy && safeDuration > 0;
+    _seekSlider.enabled = _videoMode && (!_canvasView.isBusy || _queryActive) && safeDuration > 0;
     _timeLabel.stringValue = [NSString stringWithFormat:@"%d:%02d / %d:%02d",
                               (int)safePosition / 60, (int)safePosition % 60,
                               (int)safeDuration / 60, (int)safeDuration % 60];

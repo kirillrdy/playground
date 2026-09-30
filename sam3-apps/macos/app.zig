@@ -443,7 +443,22 @@ pub const App = struct {
         const target = std.math.clamp(seconds, 0, self.video_duration);
         const duration = self.video_duration;
         self.video_seek_target = target;
-        self.video_step_requested = self.video_phrase_len > 0;
+        self.video_step_requested = true;
+
+        if (self.query_matches.items.len > 0) {
+            var closest_idx: usize = 0;
+            var closest_diff: f64 = 1e9;
+            for (self.query_matches.items, 0..) |f, i| {
+                const f_sec = @as(f64, @floatFromInt(f)) * 0.0333;
+                const diff = @abs(f_sec - target);
+                if (diff < closest_diff) {
+                    closest_diff = diff;
+                    closest_idx = i;
+                }
+            }
+            self.query_match_idx = closest_idx;
+        }
+
         self.mutex.unlock(self.io);
         sam_macos_set_video_timeline(duration, target);
     }
