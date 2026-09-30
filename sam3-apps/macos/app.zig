@@ -247,6 +247,7 @@ pub const App = struct {
             .on_clear_points = &cClearPoints,
             .on_find_text = &cFindText,
             .on_cancel_query = &cCancelQuery,
+            .on_clear_query = &cClearQuery,
             .on_canvas_click = &cCanvasClick,
             .on_select_mask = &cSelectMask,
         };
@@ -1101,6 +1102,30 @@ pub const App = struct {
         }
     }
 
+    fn handleClearQuery(self: *App) void {
+        if (self.query_active.load(.acquire)) {
+            self.handleCancelQuery();
+        }
+        self.mutex.lock(self.io) catch return;
+        self.query_matches.clearRetainingCapacity();
+        self.query_match_idx = 0;
+        self.video_overlay_prompts = .{};
+        self.video_phrase_len = 0;
+        if (self.masks) |*m| {
+            m.deinit();
+            self.masks = null;
+        }
+        self.selected_mask = -1;
+        self.best_mask_idx = -1;
+        self.renderComposite(-1);
+        self.mutex.unlock(self.io);
+        if (self.image) |img| {
+            sam_macos_set_image(self.frame.ptr, @intCast(img.width), @intCast(img.height));
+        }
+        sam_macos_set_masks(0, null, 0, -1);
+        sam_macos_set_status("Query cleared.");
+    }
+
     fn resolveVideoPath(allocator: std.mem.Allocator, input_path: []const u8) ?[]const u8 {
         const trimmed = std.mem.trim(u8, input_path, " \t\r\n'\"");
         if (trimmed.len == 0) return null;
@@ -1854,6 +1879,12 @@ fn cFindText(text: [*:0]const u8) callconv(.c) void {
 fn cCancelQuery() callconv(.c) void {
     if (g_app) |app| {
         app.handleCancelQuery();
+    }
+}
+
+fn cClearQuery() callconv(.c) void {
+    if (g_app) |app| {
+        app.handleClearQuery();
     }
 }
 

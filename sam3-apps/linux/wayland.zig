@@ -715,10 +715,17 @@ pub const WaylandClient = struct {
         _ = std.posix.system.send(self.socket_fd, @ptrCast(&words), words.len * 4, 0);
     }
 
+    pub fn setTitle(self: *WaylandClient, title: []const u8) !void {
+        if (self.xdg_toplevel_id == 0) return;
+        const truncated = if (title.len > 240) title[0..240] else title;
+        try self.sendToplevelString(self.xdg_toplevel_id, 2, truncated);
+    }
+
     fn sendToplevelString(self: *WaylandClient, toplevel_id: u32, opcode: u16, str: []const u8) !void {
         const str_padded = ((str.len + 1 + 3) / 4) * 4;
         const total = 8 + 4 + str_padded;
-        var buf: [64]u8 = undefined;
+        var buf: [256]u8 = undefined;
+        if (total > buf.len) return;
         std.mem.writeInt(u32, buf[0..4], toplevel_id, .little);
         std.mem.writeInt(u32, buf[4..8], (@as(u32, @intCast(total)) << 16) | opcode, .little);
         std.mem.writeInt(u32, buf[8..12], @intCast(str.len + 1), .little);

@@ -5,14 +5,119 @@ const wayland = @import("wayland.zig");
 const font = @import("font.zig");
 const zimo = @import("zimo");
 const log = @import("log");
+const vdb = @import("vdb");
 const here = zimo.bind(@This(), @embedFile("app.zig"));
 
 const VideoFrame = extern struct { rgb: ?[*]u8, width: c_int, height: c_int, pts_seconds: f64 };
 extern fn sam_linux_video_open(path: [*:0]const u8, start: f64) ?*anyopaque;
 extern fn sam_linux_video_duration(reader: *anyopaque) f64;
+extern fn sam_linux_video_fps(reader: *anyopaque) f64;
 extern fn sam_linux_video_next(reader: *anyopaque, frame: *VideoFrame) c_int;
 extern fn sam_linux_video_free_frame(frame: *VideoFrame) void;
 extern fn sam_linux_video_close(reader: *anyopaque) void;
+
+const LinuxVideoReader = struct {
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    duration: f64,
+    fps: f64,
+    reader: ?*anyopaque = null,
+    current_index: usize = 0,
+    current_frame: ?VideoFrame = null,
+
+    pub fn init(allocator: std.mem.Allocator, path: [:0]const u8) LinuxVideoReader {
+        const owned = allocator.dupeZ(u8, path) catch path;
+        const handle = sam_linux_video_open(owned.ptr, 0);
+        const dur = if (handle) |h| sam_linux_video_duration(h) else 0;
+        const fps = if (handle) |h| sam_linux_video_fps(h) else 30.0;
+        return .{
+            .allocator = allocator,
+            .path = owned,
+            .duration = dur,
+            .fps = fps,
+            .reader = handle,
+            .current_index = 0,
+            .current_frame = null,
+        };
+    }
+
+    pub fn deinit(self: *LinuxVideoReader) void {
+        if (self.current_frame) |*vf| {
+            sam_linux_video_free_frame(vf);
+            self.current_frame = null;
+        }
+        if (self.reader) |r| {
+            sam_linux_video_close(r);
+            self.reader = null;
+        }
+        self.allocator.free(self.path);
+    }
+
+    pub fn asReader(self: *LinuxVideoReader) vdb.engine.VideoReader {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .totalFrames = totalFramesImpl,
+                .seekToFrame = seekToFrameImpl,
+                .nextFrame = nextFrameImpl,
+            },
+        };
+    }
+
+    fn totalFramesImpl(ctx: *anyopaque) usize {
+        const self: *LinuxVideoReader = @ptrCast(@alignCast(ctx));
+        return @intFromFloat(@max(self.duration * self.fps, 1.0));
+    }
+
+    fn seekToFrameImpl(ctx: *anyopaque, frame_idx: usize) anyerror!void {
+        const self: *LinuxVideoReader = @ptrCast(@alignCast(ctx));
+        if (self.current_frame) |*vf| {
+            sam_linux_video_free_frame(vf);
+            self.current_frame = null;
+        }
+        if (self.reader) |r| {
+            sam_linux_video_close(r);
+            self.reader = null;
+        }
+        const frame_time = 1.0 / @max(self.fps, 1.0);
+        const pts = @as(f64, @floatFromInt(frame_idx)) * frame_time;
+        self.reader = sam_linux_video_open(self.path.ptr, pts);
+        self.current_index = frame_idx;
+    }
+
+    fn nextFrameImpl(ctx: *anyopaque) anyerror!?vdb.types.FrameRef {
+        const self: *LinuxVideoReader = @ptrCast(@alignCast(ctx));
+        if (self.reader == null) return null;
+        if (self.current_frame) |*vf| {
+            sam_linux_video_free_frame(vf);
+            self.current_frame = null;
+        }
+
+        var vf: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
+        const ret = sam_linux_video_next(self.reader.?, &vf);
+        if (ret <= 0) return null;
+
+        self.current_frame = vf;
+        const idx = self.current_index;
+        self.current_index += 1;
+
+        return vdb.types.FrameRef{
+            .index = idx,
+            .pts_seconds = vf.pts_seconds,
+            .width = @intCast(vf.width),
+            .height = @intCast(vf.height),
+            .rgb = vf.rgb,
+        };
+    }
+};
+
+fn isQuerySql(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (std.ascii.startsWithIgnoreCase(trimmed, "SELECT")) return true;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "CREATE")) return true;
+    if (std.ascii.startsWithIgnoreCase(trimmed, "WHERE")) return true;
+    return false;
+}
 
 const render = sam3.render;
 const max_points = 32;
@@ -63,8 +168,9 @@ pub const App = struct {
     video_active: bool = false,
     video_stop: std.atomic.Value(bool) = .init(false),
     video_playing: std.atomic.Value(bool) = .init(false),
-    video_phrase: [160]u8 = undefined,
+    video_phrase: [256]u8 = undefined,
     video_phrase_len: usize = 0,
+    video_overlay_prompts: vdb.overlay.Prompts = .{},
     video_duration: f64 = 0,
     video_position: f64 = 0,
     video_seek_target: ?f64 = null,
@@ -72,15 +178,25 @@ pub const App = struct {
     precache_thread: ?std.Thread = null,
     precache_active: std.atomic.Value(bool) = .init(false),
     precache_cancel: std.atomic.Value(bool) = .init(false),
-    precache_phrase: [160]u8 = undefined,
+    precache_phrase: [256]u8 = undefined,
     precache_phrase_len: usize = 0,
     precache_progress: f64 = 0,
     precache_scanned_until: f64 = -1,
 
+    vdb_database: vdb.Database,
+    query_matches: std.ArrayList(u32) = .empty,
+    query_match_idx: usize = 0,
+    query_thread: ?std.Thread = null,
+    query_active: std.atomic.Value(bool) = .init(false),
+    query_cancel: std.atomic.Value(bool) = .init(false),
+
+    window_title: [256]u8 = undefined,
+    window_title_len: usize = 0,
+
     status_text: [256]u8 = undefined,
     status_len: usize = 0,
 
-    search_text: [160]u8 = undefined,
+    search_text: [1024]u8 = undefined,
     search_len: usize = 0,
     search_focused: bool = true,
     search_caret: usize = 0,
@@ -94,6 +210,7 @@ pub const App = struct {
     browser_scroll: usize = 0,
     shift_down: bool = false,
     ctrl_down: bool = false,
+    alt_down: bool = false,
     caps_lock: bool = false,
 
     // Window state
@@ -106,9 +223,9 @@ pub const App = struct {
 
     // Layout geometry
     canvas_x: usize = 16,
-    canvas_y: usize = 180,
+    canvas_y: usize = 162,
     canvas_w: usize = 968,
-    canvas_h: usize = 510,
+    canvas_h: usize = 460,
 
     img_rect_x: usize = 0,
     img_rect_y: usize = 0,
@@ -135,14 +252,23 @@ pub const App = struct {
             .pending_height = height,
             .unmaximized_width = width,
             .unmaximized_height = height,
+            .vdb_database = vdb.Database.init(allocator),
         };
 
-        app.setStatus("Initializing SAM 3…");
+        app.setWindowTitle("SAM 3 — Visual Database");
+        app.setStatus("Ready. Open a video or enter a visual query.");
         return app;
     }
 
     pub fn deinit(self: *App) void {
         self.stopVideo();
+        if (self.query_thread) |t| {
+            self.query_cancel.store(true, .release);
+            t.join();
+            self.query_thread = null;
+        }
+        self.vdb_database.deinit();
+        self.query_matches.deinit(self.allocator);
         g_app = null;
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
@@ -155,6 +281,14 @@ pub const App = struct {
         self.browser_entries.deinit(self.allocator);
         if (self.browser_dir.len > 0) self.allocator.free(self.browser_dir);
         self.client.deinit();
+    }
+
+    fn setWindowTitle(self: *App, title: []const u8) void {
+        const len = @min(title.len, self.window_title.len);
+        @memcpy(self.window_title[0..len], title[0..len]);
+        self.window_title_len = len;
+        self.client.setTitle(self.window_title[0..len]) catch {};
+        self.redraw_pending.store(true, .release);
     }
 
     fn setStatus(self: *App, text: []const u8) void {
@@ -468,76 +602,119 @@ pub const App = struct {
             return false;
         }
 
-        if (x >= 16 and x < 376 and y >= 78 and y < 106 and button == 0x110) {
+        if (button != 0x110 and button != 0x111) return false;
+
+        // 1. Top Hero: Visual SQL Query input box (y: 40..94)
+        const q_x: usize = 16;
+        const q_y: usize = 40;
+        const q_h: usize = 54;
+        const btn_gap: usize = 8;
+        const run_btn_w: usize = 124;
+        const clear_btn_w: usize = 114;
+        const total_btns_w: usize = run_btn_w + btn_gap + clear_btn_w;
+        const q_w: usize = stride -| (q_x + total_btns_w + 24);
+        const run_btn_x: usize = stride -| (total_btns_w + 16);
+        const clear_btn_x: usize = run_btn_x + run_btn_w + btn_gap;
+
+        if (x >= q_x and x < q_x + q_w and y >= q_y and y < q_y + q_h and button == 0x110) {
             self.search_focused = true;
-            const visible = (x -| 24) / font.font_width;
-            self.search_caret = @min(self.search_len, self.search_scroll + visible);
+            const max_cols = if (q_w > 20) (q_w - 20) / font.font_width else 10;
+            const char_col = (x -| (q_x + 10)) / font.font_width;
+            const row: usize = if (y < q_y + 26) 0 else 1;
+            self.search_caret = @min(self.search_len, row * max_cols + char_col);
             self.search_anchor = null;
-            self.adjustSearchScroll();
-            return false;
-        }
-        self.search_focused = false;
-        self.search_anchor = null;
-        if (self.is_busy) return false;
-
-        // Top row buttons:
-        if (x >= 526 and x < 656 and y >= 42 and y <= 70) {
-            self.openBrowser();
-            return false;
-        }
-        // [Sample Image] (16, 42, 130, 28)
-        if (x >= 16 and x <= 146 and y >= 42 and y <= 70) {
-            _ = self.openImageFromPath(self.example_path);
             return false;
         }
 
-        // [Mode toggle] (156, 42, 220, 28)
-        if (x >= 156 and x <= 376 and y >= 42 and y <= 70) {
-            self.click_mode_add = !self.click_mode_add;
-            return false;
-        }
-
-        // [Clear Points] (386, 42, 130, 28)
-        if (x >= 386 and x <= 516 and y >= 42 and y <= 70) {
-            self.handleClearPoints();
-            return false;
-        }
-
-        // Row 2:
-        // [Find by Word button] (386, 78, 130, 28)
-        if (x >= 386 and x <= 516 and y >= 78 and y <= 106) {
-            self.triggerFind();
-            return false;
-        }
-        if (x >= 526 and x < 656 and y >= 78 and y < 106) {
-            self.openBrowser();
-            return false;
-        }
-        if (self.video_active and y >= 140 and y < 168 and button == 0x110) {
-            if (x >= 16 and x < 96) {
-                self.toggleVideoPlay();
-            } else if (x >= 104 and x < 184) {
-                self.seekVideo(0);
-            } else if (x >= 192 and x < 292) {
-                self.stepVideo();
-            } else if (x >= 300 and x < 460) {
-                self.togglePrecache();
-            } else if (x >= 470 and x < stride -| 16) {
-                const width = stride -| 486;
-                if (width > 0) self.seekVideo(self.video_duration * @as(f64, @floatFromInt(x - 470)) / @as(f64, @floatFromInt(width)));
+        // 2. Run Query / Cancel Query button (y: 40..94)
+        if (x >= run_btn_x and x < run_btn_x + run_btn_w and y >= q_y and y < q_y + q_h and button == 0x110) {
+            if (self.query_active.load(.acquire)) {
+                self.handleCancelQuery();
+            } else {
+                self.triggerFind();
             }
             return false;
         }
 
-        // Bottom row: mask candidate buttons
-        if (y >= self.client.height -| 44 and y <= self.client.height -| 12) {
+        // 3. Clear Query button (y: 40..94)
+        if (x >= clear_btn_x and x < clear_btn_x + clear_btn_w and y >= q_y and y < q_y + q_h and button == 0x110) {
+            self.handleClearQuery();
+            return false;
+        }
+
+        self.search_focused = false;
+        self.search_anchor = null;
+
+        // 3. Action Toolbar (y: 102..130)
+        const tb_y: usize = 102;
+        if (y >= tb_y and y <= tb_y + 28 and button == 0x110) {
+            if (x >= 16 and x <= 132) {
+                self.openBrowser();
+                return false;
+            }
+            if (x >= 140 and x <= 256) {
+                self.openBrowser();
+                return false;
+            }
+            if (x >= 264 and x <= 394) {
+                self.togglePrecache();
+                return false;
+            }
+            const tool_x: usize = if (self.precache_active.load(.acquire)) 642 else 402;
+            if (x >= tool_x and x <= tool_x + 140) {
+                self.click_mode_add = !self.click_mode_add;
+                return false;
+            }
+            if (x >= tool_x + 148 and x <= tool_x + 298) {
+                self.handleClearPoints();
+                return false;
+            }
+            if (x >= tool_x + 306 and x <= tool_x + 426) {
+                _ = self.openImageFromPath(self.example_path);
+                return false;
+            }
+        }
+
+        // 4. Video Playback Controls (below canvas)
+        const video_bar_y: usize = self.client.height -| 82;
+        if (self.video_active and y >= video_bar_y and y < video_bar_y + 28 and button == 0x110) {
+            if (x >= 16 and x < 86) {
+                self.toggleVideoPlay();
+                return false;
+            }
+            if (x >= 94 and x < 174) {
+                self.seekVideo(0);
+                return false;
+            }
+            if (x >= 182 and x < 286) {
+                self.stepVideo();
+                return false;
+            }
+            const s_x: usize = 294;
+            const time_w: usize = 120;
+            const s_w = stride -| (s_x + time_w + 16);
+            if (s_w > 0 and x >= s_x and x < s_x + s_w) {
+                const target = self.video_duration * @as(f64, @floatFromInt(x - s_x)) / @as(f64, @floatFromInt(s_w));
+                self.seekVideo(target);
+                return false;
+            }
+        }
+
+        // 5. Masks bar (bottom)
+        const mask_bar_y: usize = self.client.height -| 44;
+        if (y >= mask_bar_y and y <= mask_bar_y + 28 and button == 0x110) {
             self.mutex.lock(self.io) catch return false;
             defer self.mutex.unlock(self.io);
             if (self.masks) |m| {
                 var cur_btn_x: usize = 16;
                 for (0..m.count) |i| {
                     if (x >= cur_btn_x and x <= cur_btn_x + 160) {
-                        self.selected_mask = @intCast(i);
+                        const target_idx: i32 = @intCast(i);
+                        if (self.selected_mask == target_idx) {
+                            self.selected_mask = -1;
+                        } else {
+                            self.selected_mask = target_idx;
+                        }
                         self.renderComposite(self.selected_mask);
                         return false;
                     }
@@ -546,7 +723,7 @@ pub const App = struct {
             }
         }
 
-        // Canvas click
+        // 6. Canvas click for point prompt
         if (self.image != null and self.img_rect_w > 0 and self.img_rect_h > 0) {
             if (x >= self.img_rect_x and x < self.img_rect_x + self.img_rect_w and
                 y >= self.img_rect_y and y < self.img_rect_y + self.img_rect_h)
@@ -554,7 +731,6 @@ pub const App = struct {
                 const norm_x = @as(f32, @floatFromInt(x - self.img_rect_x)) / @as(f32, @floatFromInt(self.img_rect_w));
                 const norm_y = @as(f32, @floatFromInt(y - self.img_rect_y)) / @as(f32, @floatFromInt(self.img_rect_h));
 
-                // button 0x111 is right click -> cut point
                 const is_pos: c_int = if (button == 0x111) 0 else if (self.click_mode_add) 1 else 0;
                 self.handleCanvasClick(norm_x, norm_y, is_pos);
             }
@@ -566,9 +742,10 @@ pub const App = struct {
         const x: usize = @intFromFloat(@max(0, px));
         const y: usize = @intFromFloat(@max(0, py));
         const edges = self.getResizeEdge(x, y);
+        const q_w = self.client.width -| 176;
         const kind: wayland.Cursor = if (getResizeCursor(edges)) |c|
             c
-        else if (x >= 16 and x < 376 and y >= 78 and y < 106)
+        else if (x >= 16 and x < 16 + q_w and y >= 40 and y < 94)
             .text
         else if (self.image != null and x >= self.img_rect_x and x < self.img_rect_x + self.img_rect_w and
             y >= self.img_rect_y and y < self.img_rect_y + self.img_rect_h)
@@ -621,9 +798,17 @@ pub const App = struct {
             self.ctrl_down = state == 1;
             return;
         }
+        if (key == 56 or key == 100) {
+            self.alt_down = state == 1;
+            return;
+        }
         if (state != 1) return;
         if (key == 58) {
             self.caps_lock = !self.caps_lock;
+            return;
+        }
+        if (self.ctrl_down and key == 24) { // Ctrl+O: Open file
+            self.openBrowser();
             return;
         }
         if (self.browser_open) {
@@ -652,7 +837,37 @@ pub const App = struct {
             }
             return;
         }
-        if (!self.search_focused) return;
+        if (!self.search_focused) {
+            if (key == 57) { // Space: Play/Pause video
+                if (self.video_active) {
+                    self.toggleVideoPlay();
+                    return;
+                }
+            } else if (key == 19) { // R: Restart video
+                if (self.video_active) {
+                    self.seekVideo(0);
+                    return;
+                }
+            } else if (key == 49 or key == 106) { // N or Right Arrow: Next match / Next frame
+                if (self.video_active) {
+                    self.stepVideo();
+                    return;
+                }
+            } else if (key == 46) { // C: Hide/Clear masks
+                self.handleClearPoints();
+                return;
+            } else if (key == 1) { // Escape
+                if (self.query_active.load(.acquire)) {
+                    self.handleCancelQuery();
+                    return;
+                }
+            } else if (key == 53) { // /: Focus search
+                self.search_focused = true;
+                self.redraw_pending.store(true, .release);
+                return;
+            }
+            return;
+        }
 
         if (self.ctrl_down) {
             if (key == 30) { // Ctrl+A
@@ -664,7 +879,20 @@ pub const App = struct {
         }
 
         switch (key) {
-            28 => self.triggerFind(), // Enter
+            28 => { // Enter
+                if (self.shift_down or self.alt_down) {
+                    if (self.search_len < self.search_text.len) {
+                        _ = self.deleteSelection();
+                        const pos = self.search_caret;
+                        std.mem.copyBackwards(u8, self.search_text[pos + 1 .. self.search_len + 1], self.search_text[pos..self.search_len]);
+                        self.search_text[pos] = '\n';
+                        self.search_len += 1;
+                        self.search_caret = pos + 1;
+                    }
+                } else {
+                    self.triggerFind();
+                }
+            },
             1 => self.search_focused = false, // Escape
             105 => self.moveSearchCaret(self.search_caret -| 1), // Left
             106 => self.moveSearchCaret(self.search_caret + 1), // Right
@@ -700,8 +928,17 @@ pub const App = struct {
     }
 
     fn triggerFind(self: *App) void {
-        if (self.search_len == 0 or self.is_busy or (self.image == null and !self.video_active)) return;
+        if (self.query_active.load(.acquire)) {
+            self.handleCancelQuery();
+            return;
+        }
+        if (self.search_len == 0) return;
         const phrase = self.search_text[0..self.search_len];
+        if (isQuerySql(phrase)) {
+            self.handleQuery(phrase);
+            return;
+        }
+        if (self.image == null and !self.video_active) return;
         self.handleFindText(phrase);
     }
 
@@ -781,11 +1018,420 @@ pub const App = struct {
         self.is_busy = false;
     }
 
+    fn resolveVideoPath(allocator: std.mem.Allocator, input_path: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, input_path, " \t\r\n'\"");
+        if (trimmed.len == 0) return null;
+
+        // 1. Direct check
+        if (allocator.dupeZ(u8, trimmed)) |zpath| {
+            defer allocator.free(zpath);
+            if (std.c.access(zpath.ptr, 0) == 0) {
+                return allocator.dupe(u8, trimmed) catch null;
+            }
+        } else |_| {}
+
+        // 2. Expand ~/
+        const maybe_home = std.c.getenv("HOME");
+        if (std.mem.startsWith(u8, trimmed, "~/")) {
+            if (maybe_home) |h| {
+                const home = std.mem.span(h);
+                if (std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, trimmed[2..] })) |expanded| {
+                    if (allocator.dupeZ(u8, expanded)) |zpath| {
+                        defer allocator.free(zpath);
+                        if (std.c.access(zpath.ptr, 0) == 0) {
+                            return expanded;
+                        }
+                    } else |_| {}
+                    allocator.free(expanded);
+                } else |_| {}
+            }
+        }
+
+        // 3. Check in home directory (~/<trimmed>)
+        if (maybe_home) |h| {
+            const home = std.mem.span(h);
+            if (std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, trimmed })) |in_home| {
+                if (allocator.dupeZ(u8, in_home)) |zpath| {
+                    defer allocator.free(zpath);
+                    if (std.c.access(zpath.ptr, 0) == 0) {
+                        return in_home;
+                    }
+                } else |_| {}
+                allocator.free(in_home);
+            } else |_| {}
+        }
+
+        // 4. Check in current working directory (./<trimmed>)
+        if (std.fmt.allocPrint(allocator, "./{s}", .{trimmed})) |in_cwd| {
+            if (allocator.dupeZ(u8, in_cwd)) |zpath| {
+                defer allocator.free(zpath);
+                if (std.c.access(zpath.ptr, 0) == 0) {
+                    return in_cwd;
+                }
+            } else |_| {}
+            allocator.free(in_cwd);
+        } else |_| {}
+
+        return null;
+    }
+
+    fn sam3SegmentBridge(ctx: *anyopaque, allocator: std.mem.Allocator, frame: vdb.types.FrameRef, prompt: []const u8) anyerror!vdb.types.MaskRef {
+        _ = allocator;
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.evaluateSam3Frame(frame, prompt);
+    }
+
+    fn evaluateSam3Frame(self: *App, frame: vdb.types.FrameRef, prompt: []const u8) !vdb.types.MaskRef {
+        if (frame.rgb == null or frame.width == 0 or frame.height == 0) {
+            return .{ .score = 0, .coverage = 0, .width = frame.width, .height = frame.height };
+        }
+        const pixel_count = std.math.mul(usize, frame.width, frame.height) catch return .{ .score = 0, .coverage = 0, .width = frame.width, .height = frame.height };
+        const bytes_len = std.math.mul(usize, pixel_count, 3) catch return .{ .score = 0, .coverage = 0, .width = frame.width, .height = frame.height };
+        const rgb_img = sam3.RgbImage{
+            .pixels = frame.rgb.?[0..bytes_len],
+            .width = frame.width,
+            .height = frame.height,
+        };
+        const maybe_vals = try self.videoQuery(rgb_img, prompt, frame.pts_seconds);
+        if (maybe_vals) |vals| {
+            defer self.allocator.free(vals);
+            if (vals.len >= 4) {
+                const count: usize = @as(u32, @bitCast(vals[0]));
+                if (count > 0) {
+                    const obj_score = vals[3];
+                    const best_score = if (vals.len >= 5) @max(obj_score, vals[4]) else obj_score;
+                    return .{
+                        .score = best_score,
+                        .coverage = 0.2,
+                        .width = frame.width,
+                        .height = frame.height,
+                    };
+                }
+            }
+        }
+        return .{ .score = 0, .coverage = 0, .width = frame.width, .height = frame.height };
+    }
+
+    fn handleCancelQuery(self: *App) void {
+        if (self.query_active.load(.acquire)) {
+            self.query_cancel.store(true, .release);
+            self.setStatus("Cancelling visual query…");
+        }
+    }
+
+    fn handleClearQuery(self: *App) void {
+        if (self.query_active.load(.acquire)) {
+            self.handleCancelQuery();
+        }
+        self.search_len = 0;
+        self.search_caret = 0;
+        self.search_anchor = null;
+        self.search_scroll = 0;
+
+        self.mutex.lock(self.io) catch return;
+        self.query_matches.clearRetainingCapacity();
+        self.query_match_idx = 0;
+        self.video_overlay_prompts = .{};
+        self.video_phrase_len = 0;
+        if (self.masks) |*m| {
+            m.deinit();
+            self.masks = null;
+        }
+        self.selected_mask = -1;
+        self.best_mask_idx = -1;
+        self.renderComposite(-1);
+        self.mutex.unlock(self.io);
+
+        self.setStatus("Query cleared.");
+        self.redraw_pending.store(true, .release);
+    }
+
+    fn handleQuery(self: *App, raw_query: []const u8) void {
+        const trimmed = std.mem.trim(u8, raw_query, " \t\r\n");
+
+        var parsed_source_path: ?[]const u8 = null;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        var p = vdb.parser.Parser.init(arena.allocator(), trimmed);
+        if (p.parse()) |stmt| {
+            switch (stmt) {
+                .select_stmt => |sel| {
+                    switch (sel.source) {
+                        .file_path => |fp| parsed_source_path = fp,
+                        .call => |c| parsed_source_path = c.path,
+                    }
+                },
+                .create_index => |ci| {
+                    if (ci.source_file.len > 0) {
+                        parsed_source_path = ci.source_file;
+                    }
+                },
+            }
+        } else |_| {}
+
+        if (parsed_source_path) |source_file| {
+            if (resolveVideoPath(self.allocator, source_file)) |resolved| {
+                defer self.allocator.free(resolved);
+                const is_same_video = if (self.video_active and self.video_path != null)
+                    std.mem.eql(u8, self.video_path.?, resolved)
+                else
+                    false;
+
+                if (!is_same_video) {
+                    _ = self.openVideoFromPath(resolved);
+                }
+            } else {
+                var err_buf: [256]u8 = undefined;
+                const err_msg = std.fmt.bufPrint(&err_buf, "Could not find video file: “{s}”", .{source_file}) catch "Video not found.";
+                self.setStatus(err_msg);
+                return;
+            }
+        }
+
+        if (!self.video_active or self.video_path == null) {
+            self.setStatus("Specify a video in FROM 'video.mp4' or open a video first.");
+            return;
+        }
+        if (self.query_active.load(.acquire)) {
+            self.setStatus("A visual query is already executing.");
+            return;
+        }
+
+        const QueryThreadContext = struct {
+            app: *App,
+            query: []const u8,
+        };
+        const ctx = self.allocator.create(QueryThreadContext) catch return;
+        const query_copy = self.allocator.dupe(u8, trimmed) catch {
+            self.allocator.destroy(ctx);
+            return;
+        };
+        ctx.* = .{
+            .app = self,
+            .query = query_copy,
+        };
+
+        if (self.query_thread) |t| {
+            t.join();
+            self.query_thread = null;
+        }
+
+        self.query_active.store(true, .release);
+        self.query_cancel.store(false, .release);
+        self.is_busy = true;
+
+        var status_buf: [160]u8 = undefined;
+        const status_msg = std.fmt.bufPrint(&status_buf, "Executing visual query: “{s}”…", .{trimmed}) catch "Executing visual query…";
+        self.setStatus(status_msg);
+
+        self.query_thread = std.Thread.spawn(.{}, runQueryWorker, .{ctx}) catch {
+            self.allocator.free(query_copy);
+            self.allocator.destroy(ctx);
+            self.query_active.store(false, .release);
+            self.is_busy = false;
+            self.setStatus("Could not spawn query thread.");
+            return;
+        };
+    }
+
+    fn runQueryWorker(ctx: anytype) void {
+        defer {
+            ctx.app.query_active.store(false, .release);
+            ctx.app.is_busy = false;
+            ctx.app.allocator.free(ctx.query);
+            ctx.app.allocator.destroy(ctx);
+            ctx.app.redraw_pending.store(true, .release);
+        }
+        const self = ctx.app;
+        const query = ctx.query;
+        const started = std.Io.Timestamp.now(self.io, .awake);
+
+        const trimmed = std.mem.trim(u8, query, " \t\r\n");
+
+        if (std.ascii.startsWithIgnoreCase(trimmed, "CREATE")) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var p = vdb.parser.Parser.init(arena.allocator(), trimmed);
+            if (p.parse()) |stmt| {
+                if (stmt == .create_index) {
+                    const target_prompt = stmt.create_index.prompt orelse stmt.create_index.model_name;
+                    log.info(self.io, "Executing visual CREATE INDEX on concept \"{s}\"", .{target_prompt});
+                    var status_buf: [160]u8 = undefined;
+                    const status_msg = std.fmt.bufPrint(&status_buf, "Creating visual index for “{s}”…", .{target_prompt}) catch "Creating visual index…";
+                    self.setStatus(status_msg);
+                    self.runPrecache(target_prompt);
+                    return;
+                }
+            } else |err| {
+                log.info(self.io, "Failed to parse CREATE INDEX: {t}", .{err});
+                var err_buf: [160]u8 = undefined;
+                const err_msg = std.fmt.bufPrint(&err_buf, "CREATE INDEX syntax error: {t}", .{err}) catch "Syntax error.";
+                self.setStatus(err_msg);
+                return;
+            }
+        }
+
+        const final_query = vdb.query_input.normalize(self.allocator, trimmed, self.video_path.?) catch |err| {
+            log.info(self.io, "Query normalization failed: {t}", .{err});
+            var err_buf: [160]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Query syntax error: {t}", .{err}) catch "Query syntax error.";
+            self.setStatus(err_msg);
+            return;
+        };
+        defer self.allocator.free(final_query);
+
+        log.info(self.io, "Executing visual query: {s}", .{final_query});
+
+        const overlay_prompts = vdb.overlay.Prompts.fromSql(self.allocator, final_query) catch |err| {
+            log.info(self.io, "Query overlay planning failed: {t}", .{err});
+            self.setStatus("Could not parse query overlay prompts.");
+            return;
+        };
+        self.mutex.lock(self.io) catch return;
+        self.video_overlay_prompts = overlay_prompts;
+        self.video_phrase_len = 0;
+        if (overlay_prompts.count > 0) {
+            const prompt = overlay_prompts.get(0);
+            self.video_phrase_len = prompt.len;
+            @memcpy(self.video_phrase[0..prompt.len], prompt);
+        }
+        self.mutex.unlock(self.io);
+
+        self.mutex.lock(self.io) catch return;
+        self.query_matches.clearRetainingCapacity();
+        self.query_match_idx = 0;
+        self.mutex.unlock(self.io);
+
+        const QueryStreamer = struct {
+            app: *App,
+            first_match_emitted: bool = false,
+            last_ui_update: std.Io.Timestamp,
+
+            pub fn onRow(streamer_ctx: *anyopaque, row: *const vdb.types.Row) anyerror!void {
+                const streamer: *@This() = @ptrCast(@alignCast(streamer_ctx));
+                const app = streamer.app;
+
+                var match_idx: ?usize = null;
+                var match_pts: f64 = 0;
+                for (row.values) |v| {
+                    if (v == .frame_type) {
+                        match_idx = v.frame_type.index;
+                        match_pts = v.frame_type.pts_seconds;
+                        break;
+                    }
+                }
+                const idx = match_idx orelse return;
+
+                app.mutex.lock(app.io) catch return;
+                app.query_matches.append(app.allocator, @intCast(idx)) catch {};
+                const total = app.query_matches.items.len;
+
+                if (!streamer.first_match_emitted) {
+                    streamer.first_match_emitted = true;
+                    app.query_match_idx = 0;
+                    app.video_seek_target = match_pts;
+                    app.video_step_requested = true;
+                    app.mutex.unlock(app.io);
+
+                    var status_buf: [256]u8 = undefined;
+                    const status_msg = std.fmt.bufPrint(&status_buf, "First match found instantly! Frame #{d} at {d:.2}s. Streaming visual query results…", .{
+                        idx,
+                        match_pts,
+                    }) catch "First frame matched!";
+                    app.setStatus(status_msg);
+                    log.info(app.io, "Instantly streamed first match: Frame #{d} at {d:.2}s", .{ idx, match_pts });
+                } else {
+                    app.mutex.unlock(app.io);
+
+                    const now = std.Io.Timestamp.now(app.io, .awake);
+                    if (streamer.last_ui_update.untilNow(app.io, .awake).nanoseconds > 200_000_000 or total % 50 == 0) {
+                        streamer.last_ui_update = now;
+                        var status_buf: [160]u8 = undefined;
+                        const status_msg = std.fmt.bufPrint(&status_buf, "Streaming query: {d} matches found… scanning… Press Cancel Query to stop.", .{total}) catch "Streaming query…";
+                        app.setStatus(status_msg);
+                    }
+                }
+            }
+        };
+
+        var streamer = QueryStreamer{
+            .app = self,
+            .last_ui_update = started,
+        };
+        const stream_cb: vdb.engine.RowCallback = .{
+            .ctx = &streamer,
+            .onRow = QueryStreamer.onRow,
+        };
+
+        var video_adapter = LinuxVideoReader.init(self.allocator, self.video_path.?);
+        defer video_adapter.deinit();
+
+        self.vdb_database.engine_inst.sam3 = .{
+            .ptr = self,
+            .segmentFn = sam3SegmentBridge,
+        };
+
+        var result = self.vdb_database.executeQuery(final_query, video_adapter.asReader(), &self.query_cancel, stream_cb) catch |err| {
+            if (err == error.QueryCancelled) {
+                log.info(self.io, "Visual database query cancelled.", .{});
+                self.mutex.lock(self.io) catch return;
+                const matches_so_far = self.query_matches.items.len;
+                self.mutex.unlock(self.io);
+                var cancel_buf: [160]u8 = undefined;
+                const cancel_msg = if (matches_so_far > 0)
+                    std.fmt.bufPrint(&cancel_buf, "Query cancelled. Kept {d} matches found so far.", .{matches_so_far}) catch "Query cancelled."
+                else
+                    "Visual query cancelled.";
+                self.setStatus(cancel_msg);
+                return;
+            }
+            log.info(self.io, "Query execution error: {t}", .{err});
+            var err_buf: [160]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Query error: {t}", .{err}) catch "Query execution failed.";
+            self.setStatus(err_msg);
+            return;
+        };
+        defer result.deinit();
+
+        const elapsed = started.untilNow(self.io, .awake);
+
+        self.mutex.lock(self.io) catch return;
+        const total_matches = self.query_matches.items.len;
+        const first_frame_target = if (total_matches > 0) @as(f64, @floatFromInt(self.query_matches.items[0])) * 0.0333 else null;
+        self.mutex.unlock(self.io);
+
+        if (total_matches > 0) {
+            var status_buf: [256]u8 = undefined;
+            const first_sec = first_frame_target.?;
+            const status_msg = std.fmt.bufPrint(&status_buf, "Query complete: {d} match(es) in {f}. Showing match 1 (Frame #{d} at {d:.2}s). Press Next Match to step.", .{
+                total_matches,
+                elapsed,
+                self.query_matches.items[0],
+                first_sec,
+            }) catch "Query completed.";
+            self.setStatus(status_msg);
+        } else {
+            var status_buf: [160]u8 = undefined;
+            const status_msg = std.fmt.bufPrint(&status_buf, "Query returned 0 matching frames in {f}.", .{elapsed}) catch "0 matches.";
+            self.setStatus(status_msg);
+        }
+    }
+
     fn handleFindText(self: *App, phrase: []const u8) void {
+        const trimmed = std.mem.trim(u8, phrase, " \t\r\n");
+        if (trimmed.len == 0) return;
+
+        if (isQuerySql(trimmed)) {
+            self.handleQuery(trimmed);
+            return;
+        }
+
         if (self.video_active) {
             self.mutex.lock(self.io) catch return;
-            self.video_phrase_len = @min(phrase.len, self.video_phrase.len);
-            @memcpy(self.video_phrase[0..self.video_phrase_len], phrase[0..self.video_phrase_len]);
+            self.video_overlay_prompts = .{};
+            self.video_phrase_len = @min(trimmed.len, self.video_phrase.len);
+            @memcpy(self.video_phrase[0..self.video_phrase_len], trimmed[0..self.video_phrase_len]);
             const playing = self.video_playing.load(.acquire);
             if (!playing) {
                 self.video_seek_target = self.video_position;
@@ -798,7 +1444,7 @@ pub const App = struct {
         self.is_busy = true;
 
         var status_buf: [256]u8 = undefined;
-        const status = std.fmt.bufPrint(&status_buf, "Looking for “{s}”…", .{phrase}) catch "Searching…";
+        const status = std.fmt.bufPrint(&status_buf, "Looking for “{s}”…", .{trimmed}) catch "Searching…";
         self.setStatus(status);
 
         const PhraseContext = struct {
@@ -809,7 +1455,7 @@ pub const App = struct {
             self.is_busy = false;
             return;
         };
-        const phrase_copy = self.allocator.dupe(u8, phrase) catch {
+        const phrase_copy = self.allocator.dupe(u8, trimmed) catch {
             self.allocator.destroy(ctx);
             self.is_busy = false;
             return;
@@ -903,21 +1549,26 @@ pub const App = struct {
         self.selected_mask = -1;
         self.best_mask_idx = -1;
         self.renderComposite(-1);
-        self.setStatus("Points cleared.");
+        self.setStatus("Points and masks cleared.");
+        self.redraw_pending.store(true, .release);
     }
 
     fn stopVideo(self: *App) void {
         self.video_stop.store(true, .release);
         self.precache_cancel.store(true, .release);
+        self.query_cancel.store(true, .release);
         if (self.video_thread) |thread| thread.join();
         if (self.precache_thread) |thread| thread.join();
+        if (self.query_thread) |thread| thread.join();
         self.video_thread = null;
         self.precache_thread = null;
+        self.query_thread = null;
         if (self.video_path) |path| self.allocator.free(path);
         self.video_path = null;
         self.video_active = false;
         self.video_playing.store(false, .release);
         self.video_phrase_len = 0;
+        self.video_overlay_prompts = .{};
         self.video_duration = 0;
         self.video_position = 0;
         self.video_seek_target = null;
@@ -926,6 +1577,8 @@ pub const App = struct {
         self.precache_phrase_len = 0;
         self.precache_progress = 0;
         self.precache_scanned_until = -1;
+        self.query_active.store(false, .release);
+        self.setWindowTitle("SAM 3 — Visual Database");
         self.redraw_pending.store(true, .release);
     }
 
@@ -948,8 +1601,39 @@ pub const App = struct {
         self.points_len = 0;
         self.selected_mask = -1;
         self.best_mask_idx = -1;
+        self.query_matches.clearRetainingCapacity();
+        self.query_match_idx = 0;
         self.mutex.unlock(self.io);
-        self.setStatus("Video opened. Enter a word and press Find.");
+
+        // Update window title with video file name
+        const basename = std.fs.path.basename(path);
+        var title_buf: [256]u8 = undefined;
+        const title_str = std.fmt.bufPrint(&title_buf, "SAM 3 — Visual Database — {s}", .{basename}) catch "SAM 3 — Visual Database";
+        self.setWindowTitle(title_str);
+
+        // Try auto-loading sidecar index if exists
+        var index_loaded = false;
+        var indexed_concepts_count: usize = 0;
+        if (std.fmt.allocPrint(self.allocator, "{s}.vdb", .{path})) |sidecar| {
+            defer self.allocator.free(sidecar);
+            if (vdb.index.InvertedIndex.loadFromFile(self.allocator, sidecar)) |loaded_idx| {
+                indexed_concepts_count = loaded_idx.classes.count();
+                self.vdb_database.registerIndex(path, loaded_idx) catch |err| {
+                    log.info(self.io, "Failed to register loaded index: {t}", .{err});
+                };
+                index_loaded = true;
+                log.info(self.io, "Auto-loaded visual index for \"{s}\" ({d} concepts) from {s}", .{ path, indexed_concepts_count, sidecar });
+            } else |_| {}
+        } else |_| {}
+
+        if (index_loaded) {
+            var sbuf: [160]u8 = undefined;
+            const smsg = std.fmt.bufPrint(&sbuf, "Video opened. Loaded visual index with {d} concept(s) from .vdb sidecar.", .{indexed_concepts_count}) catch "Video opened with index.";
+            self.setStatus(smsg);
+        } else {
+            self.setStatus("Video opened. Enter a word or SQL query and press Run Query.");
+        }
+
         self.video_thread = std.Thread.spawn(.{}, runVideoWorker, .{self}) catch {
             self.stopVideo();
             self.setStatus("Could not start video decoder.");
@@ -969,14 +1653,28 @@ pub const App = struct {
         if (!self.video_active or !std.math.isFinite(seconds)) return;
         self.mutex.lock(self.io) catch return;
         self.video_seek_target = std.math.clamp(seconds, 0, self.video_duration);
-        self.video_step_requested = self.video_phrase_len > 0;
+        self.video_step_requested = true;
         self.mutex.unlock(self.io);
         self.redraw_pending.store(true, .release);
     }
 
     fn stepVideo(self: *App) void {
-        if (self.video_playing.load(.acquire)) return;
+        if (!self.video_active) return;
         self.mutex.lock(self.io) catch return;
+        if (self.query_matches.items.len > 0) {
+            self.query_match_idx = (self.query_match_idx + 1) % self.query_matches.items.len;
+            const target_frame = self.query_matches.items[self.query_match_idx];
+            const target_sec = @as(f64, @floatFromInt(target_frame)) * 0.0333;
+            self.video_seek_target = target_sec;
+            self.video_step_requested = true;
+            const cur = self.query_match_idx + 1;
+            const total = self.query_matches.items.len;
+            self.mutex.unlock(self.io);
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Showing match {d} of {d} (Frame #{d} at {d:.2}s).", .{ cur, total, target_frame, target_sec }) catch "Next match.";
+            self.setStatus(msg);
+            return;
+        }
         self.video_step_requested = true;
         self.mutex.unlock(self.io);
     }
@@ -984,7 +1682,7 @@ pub const App = struct {
     fn togglePrecache(self: *App) void {
         if (self.precache_active.load(.acquire)) {
             self.precache_cancel.store(true, .release);
-            self.setStatus("Cancelling pre-cache after this frame…");
+            self.setStatus("Cancelling indexing after this frame…");
             return;
         }
         if (self.precache_thread) |thread| {
@@ -992,37 +1690,33 @@ pub const App = struct {
             self.precache_thread = null;
         }
         if (self.search_len == 0) {
-            self.setStatus("Enter a word to pre-cache this video.");
+            self.setStatus("Enter a concept or word to index on this video.");
             return;
         }
         self.mutex.lock(self.io) catch return;
         self.precache_phrase_len = @min(self.search_len, self.precache_phrase.len);
         @memcpy(self.precache_phrase[0..self.precache_phrase_len], self.search_text[0..self.precache_phrase_len]);
+        self.video_overlay_prompts = .{};
         self.video_phrase_len = self.precache_phrase_len;
         @memcpy(self.video_phrase[0..self.video_phrase_len], self.precache_phrase[0..self.precache_phrase_len]);
-        self.precache_cancel.store(false, .release);
-        self.precache_active.store(true, .release);
         self.precache_progress = 0;
         self.precache_scanned_until = -1;
+        self.precache_cancel.store(false, .release);
+        self.precache_active.store(true, .release);
         self.mutex.unlock(self.io);
-        self.setStatus("Pre-caching video frames…");
-        self.precache_thread = std.Thread.spawn(.{}, runPrecacheWorker, .{self}) catch {
+        self.precache_thread = std.Thread.spawn(.{}, runPrecacheWorker, .{ self, self.precache_phrase[0..self.precache_phrase_len] }) catch {
             self.precache_active.store(false, .release);
-            self.setStatus("Could not start video pre-cache.");
+            self.setStatus("Could not start video indexing.");
             return;
         };
+        var status_buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrint(&status_buf, "Creating visual index for “{s}”…", .{self.precache_phrase[0..self.precache_phrase_len]}) catch "Creating visual index…";
+        self.setStatus(msg);
     }
 
-    fn runPrecacheWorker(self: *App) void {
-        self.runPrecache(self.precache_phrase[0..self.precache_phrase_len]);
-        self.precache_active.store(false, .release);
-        self.redraw_pending.store(true, .release);
-        if (!self.video_stop.load(.acquire) and !self.video_playing.load(.acquire)) {
-            self.mutex.lock(self.io) catch return;
-            self.video_seek_target = self.video_position;
-            self.video_step_requested = true;
-            self.mutex.unlock(self.io);
-        }
+    fn runPrecacheWorker(self: *App, phrase: []const u8) void {
+        defer self.precache_active.store(false, .release);
+        self.runPrecache(phrase);
     }
 
     fn runVideoWorker(self: *App) void {
@@ -1040,10 +1734,13 @@ pub const App = struct {
             self.video_seek_target = null;
             const step = self.video_step_requested;
             self.video_step_requested = false;
-            var phrase_buf: [160]u8 = undefined;
+            var phrase_buf: [256]u8 = undefined;
+            const overlay_prompts = self.video_overlay_prompts;
             const phrase_len = self.video_phrase_len;
             @memcpy(phrase_buf[0..phrase_len], self.video_phrase[0..phrase_len]);
             self.mutex.unlock(self.io);
+            if (phrase_len == 0 and overlay_prompts.count == 0 and !step and seek == null) continue;
+            const phrase = phrase_buf[0..phrase_len];
             if (seek) |target| {
                 if (reader) |r| sam_linux_video_close(r);
                 reader = null;
@@ -1091,7 +1788,7 @@ pub const App = struct {
                 playback_start = null;
                 continue;
             }
-            if (phrase_len == 0 and self.video_playing.load(.acquire) and !step and std.math.isFinite(raw.pts_seconds)) {
+            if (phrase_len == 0 and overlay_prompts.count == 0 and self.video_playing.load(.acquire) and !step and std.math.isFinite(raw.pts_seconds)) {
                 if (playback_start == null) {
                     playback_start = std.Io.Timestamp.now(self.io, .awake);
                     playback_first_pts = raw.pts_seconds;
@@ -1119,7 +1816,7 @@ pub const App = struct {
             };
             var decoded_owned = true;
             defer if (decoded_owned) decoded.deinit(self.allocator);
-            const show_preview = phrase_len == 0 or step or seek != null;
+            const show_preview = (phrase_len == 0 and overlay_prompts.count == 0) or step or seek != null;
             if (self.video_stop.load(.acquire)) break;
             if (show_preview) {
                 const frame_len = std.math.mul(usize, std.math.mul(usize, width, height) catch continue, 4) catch continue;
@@ -1148,7 +1845,7 @@ pub const App = struct {
                 self.redraw_pending.store(true, .release);
                 self.mutex.unlock(self.io);
             }
-            if (phrase_len == 0) {
+            if (phrase_len == 0 and overlay_prompts.count == 0) {
                 previous_mask_pts = null;
                 previous_mask_display = null;
                 var preview_status: [96]u8 = undefined;
@@ -1158,24 +1855,15 @@ pub const App = struct {
             playback_start = null;
             if (show_preview) self.setStatus("Processing current video frame…");
             var masks: ?sam3.Masks = null;
-            var mask_result_valid = false;
             defer if (masks) |*m| m.deinit();
             const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase_buf[0..phrase_len], raw.pts_seconds) catch |err| {
+            masks = self.videoOverlayMasks(sam3.RgbImage.fromImage(decoded), phrase, &overlay_prompts, raw.pts_seconds) catch |err| {
                 log.info(self.io, "Video frame lookup failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
                 self.video_playing.store(false, .release);
                 self.setStatus("Video frame inference failed.");
                 continue;
             };
-            defer if (maybe_values) |values| self.allocator.free(values);
-            if (maybe_values) |values| {
-                masks = unpackMasks(self.allocator, values) catch blk: {
-                    if (self.precache_active.load(.acquire) or self.video_playing.load(.acquire)) break :blk null;
-                    self.setStatus("Cached video frame is invalid.");
-                    continue;
-                };
-                mask_result_valid = masks != null;
-            }
+            const mask_result_valid = masks != null;
             const lookup_elapsed = lookup_started.untilNow(self.io, .awake);
             if (self.video_playing.load(.acquire) and !step and std.math.isFinite(raw.pts_seconds)) {
                 if (previous_mask_pts) |pts| {
@@ -1238,14 +1926,45 @@ pub const App = struct {
                 position_ms % 1_000,
             }) catch "0:00.000";
             var status_buf: [256]u8 = undefined;
+            const prompt_display = if (overlay_prompts.count > 1) "query concepts" else phrase;
             const status = if (mask_result_valid)
-                std.fmt.bufPrint(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{ timecode, mask_count, phrase_buf[0..phrase_len], lookup_elapsed }) catch "Video frame processed."
+                std.fmt.bufPrint(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{ timecode, mask_count, prompt_display, lookup_elapsed }) catch "Video frame processed."
             else
-                std.fmt.bufPrint(&status_buf, "At {s}: waiting for cached “{s}” result.", .{ timecode, phrase_buf[0..phrase_len] }) catch "Frame shown without a cached result.";
+                std.fmt.bufPrint(&status_buf, "At {s}: waiting for cached “{s}” result.", .{ timecode, prompt_display }) catch "Frame shown without a cached result.";
             self.setStatus(status);
             if (mask_result_valid) log.info(self.io, "at {s}: \"{s}\" -> {d} object(s) in {f}", .{
-                timecode, phrase_buf[0..phrase_len], mask_count, lookup_elapsed,
+                timecode, prompt_display, mask_count, lookup_elapsed,
             });
+
+            // If video playback is running and query results exist, advance through matched frames!
+            if (self.video_playing.load(.acquire)) {
+                self.mutex.lock(self.io) catch return;
+                const total_matches = self.query_matches.items.len;
+                if (total_matches > 0) {
+                    if (self.query_match_idx + 1 < total_matches) {
+                        self.query_match_idx += 1;
+                    } else {
+                        self.query_match_idx = 0;
+                    }
+                    const next_match_frame = self.query_matches.items[self.query_match_idx];
+                    const next_sec = @as(f64, @floatFromInt(next_match_frame)) * 0.0333;
+                    self.video_seek_target = next_sec;
+                    self.video_step_requested = true;
+                    const cur_num = self.query_match_idx + 1;
+                    self.mutex.unlock(self.io);
+                    var match_buf: [160]u8 = undefined;
+                    const match_status = std.fmt.bufPrint(&match_buf, "Match {d}/{d}: Frame #{d} ({d:.2}s)", .{
+                        cur_num,
+                        total_matches,
+                        next_match_frame,
+                        next_sec,
+                    }) catch "Advancing matches…";
+                    self.setStatus(match_status);
+                    std.Io.sleep(self.io, .fromMilliseconds(250), .awake) catch {};
+                    continue;
+                }
+                self.mutex.unlock(self.io);
+            }
         }
     }
 
@@ -1263,9 +1982,44 @@ pub const App = struct {
         return try cachedQuery(self.allocator, image, phrase);
     }
 
+    fn videoOverlayMasks(self: *App, image: sam3.RgbImage, phrase: []const u8, prompts: *const vdb.overlay.Prompts, pts: f64) !?sam3.Masks {
+        var combined: ?sam3.Masks = null;
+        errdefer if (combined) |*m| m.deinit();
+        const count = if (prompts.count > 0) prompts.count else @as(usize, if (phrase.len > 0) 1 else 0);
+        for (0..count) |i| {
+            const prompt = if (prompts.count > 0) prompts.get(i) else phrase;
+            const values = (try self.videoQuery(image, prompt, pts)) orelse continue;
+            defer self.allocator.free(values);
+            var masks = unpackMasks(self.allocator, values) catch |err| {
+                if (self.precache_active.load(.acquire)) continue;
+                return err;
+            };
+            if (combined) |*existing| {
+                defer masks.deinit();
+                if (existing.width != masks.width or existing.height != masks.height) return error.IncompatibleMaskDimensions;
+                const scores = try self.allocator.alloc(f32, existing.scores.len + masks.scores.len);
+                errdefer self.allocator.free(scores);
+                const logits = try self.allocator.alloc(f32, existing.logits.len + masks.logits.len);
+                @memcpy(scores[0..existing.scores.len], existing.scores);
+                @memcpy(scores[existing.scores.len..], masks.scores);
+                @memcpy(logits[0..existing.logits.len], existing.logits);
+                @memcpy(logits[existing.logits.len..], masks.logits);
+                self.allocator.free(existing.scores);
+                self.allocator.free(existing.logits);
+                existing.scores = scores;
+                existing.logits = logits;
+                existing.count += masks.count;
+                existing.object_score = @max(existing.object_score, masks.object_score);
+            } else {
+                combined = masks;
+            }
+        }
+        return combined;
+    }
+
     fn runPrecache(self: *App, phrase: []const u8) void {
         const reader = sam_linux_video_open(self.video_path.?.ptr, 0) orelse {
-            self.setStatus("Could not decode video for pre-cache.");
+            self.setStatus("Could not decode video for indexing.");
             return;
         };
         defer sam_linux_video_close(reader);
@@ -1275,19 +2029,44 @@ pub const App = struct {
         var last_ui_update = started;
         var last_log = started;
         var fraction: f64 = 0;
-        log.info(self.io, "pre-caching video for \"{s}\" ({d:.2} s)", .{ phrase, duration });
+
+        var index_builder = vdb.index.IndexBuilder.init(self.allocator);
+        defer index_builder.deinit();
+
+        if (self.vdb_database.getIndex(self.video_path.?)) |existing| {
+            index_builder.importIndex(existing) catch |err| {
+                log.info(self.io, "Could not import existing index: {t}", .{err});
+            };
+        }
+
+        log.info(self.io, "pre-caching and indexing video for \"{s}\" ({d:.2} s)", .{ phrase, duration });
         while (!self.video_stop.load(.acquire) and !self.precache_cancel.load(.acquire)) {
             var raw: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
             const result = sam_linux_video_next(reader, &raw);
             if (result <= 0) {
                 if (result == 0) {
+                    if (index_builder.build()) |built_idx| {
+                        self.vdb_database.registerIndex(self.video_path.?, built_idx) catch |err| {
+                            log.info(self.io, "Failed to register index in database: {t}", .{err});
+                        };
+                        if (std.fmt.allocPrint(self.allocator, "{s}.vdb", .{self.video_path.?})) |sidecar| {
+                            defer self.allocator.free(sidecar);
+                            if (self.vdb_database.getIndex(self.video_path.?)) |reg_idx| {
+                                reg_idx.saveToFile(sidecar) catch |err| {
+                                    log.info(self.io, "Failed to save index to {s}: {t}", .{ sidecar, err });
+                                };
+                            }
+                        } else |_| {}
+                    } else |err| {
+                        log.info(self.io, "Failed to build inverted index: {t}", .{err});
+                    }
                     self.mutex.lock(self.io) catch return;
                     self.precache_progress = 1;
                     self.mutex.unlock(self.io);
                     var msg: [160]u8 = undefined;
-                    self.setStatus(std.fmt.bufPrint(&msg, "Pre-cached {d} frames for {s}.", .{ frames, phrase }) catch "Video pre-cache complete.");
-                    log.info(self.io, "pre-cached {d} frames for \"{s}\" in {f}", .{ frames, phrase, started.untilNow(self.io, .awake) });
-                } else self.setStatus("Video decoding failed during pre-cache.");
+                    self.setStatus(std.fmt.bufPrint(&msg, "Indexed {d} frames for “{s}”. Saved to .vdb sidecar.", .{ frames, phrase }) catch "Video indexing complete.");
+                    log.info(self.io, "indexed {d} frames for \"{s}\" in {f}", .{ frames, phrase, started.untilNow(self.io, .awake) });
+                } else self.setStatus("Video decoding failed during indexing.");
                 return;
             }
             defer sam_linux_video_free_frame(&raw);
@@ -1305,11 +2084,33 @@ pub const App = struct {
             const result_query = cachedQuery(self.allocator, sam3.RgbImage.fromImage(decoded), phrase);
             self.model_mutex.unlock(self.io);
             const values = result_query catch |err| {
-                log.info(self.io, "Video pre-cache failed at frame {d}: {t}: {s}", .{ frames, err, sam3.onnx.lastError() });
-                self.setStatus("Video pre-cache inference failed.");
+                log.info(self.io, "Video indexing failed at frame {d}: {t}: {s}", .{ frames, err, sam3.onnx.lastError() });
+                self.setStatus("Video indexing inference failed.");
                 return;
             };
-            self.allocator.free(values);
+            defer self.allocator.free(values);
+
+            if (values.len >= 4) {
+                const count: usize = @as(u32, @bitCast(values[0]));
+                if (count > 0) {
+                    const obj_score = values[3];
+                    const best_score = if (values.len >= 5) @max(obj_score, values[4]) else obj_score;
+                    const pts_ms: u32 = if (std.math.isFinite(raw.pts_seconds) and raw.pts_seconds >= 0)
+                        @intFromFloat(raw.pts_seconds * 1000.0)
+                    else
+                        @intCast(frames * 33);
+                    index_builder.addDetection(
+                        @intCast(frames),
+                        pts_ms,
+                        phrase,
+                        best_score,
+                        .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+                    ) catch |err| {
+                        log.info(self.io, "Failed to add detection to index: {t}", .{err});
+                    };
+                }
+            }
+
             frames += 1;
             if (std.math.isFinite(raw.pts_seconds)) {
                 self.mutex.lock(self.io) catch return;
@@ -1328,15 +2129,15 @@ pub const App = struct {
                 last_ui_update = now;
             }
             if (frames == 1 or last_log.untilNow(self.io, .awake).nanoseconds >= 1_000_000_000) {
-                log.info(self.io, "pre-cache frame {d} at {d:.2}/{d:.2} s ({d:.2}%) in {f}", .{
+                log.info(self.io, "indexing frame {d} at {d:.2}/{d:.2} s ({d:.2}%) in {f}", .{
                     frames, raw.pts_seconds, duration, fraction * 100, frame_started.untilNow(self.io, .awake),
                 });
                 last_log = now;
             }
         }
         if (!self.video_stop.load(.acquire)) {
-            self.setStatus("Video pre-cache cancelled.");
-            log.info(self.io, "pre-cache cancelled after {d} frames", .{frames});
+            self.setStatus("Video indexing cancelled.");
+            log.info(self.io, "indexing cancelled after {d} frames", .{frames});
         }
     }
 
@@ -1372,9 +2173,9 @@ pub const App = struct {
             const masks = self.masks.?;
             const selected: usize = @intCast(mask_index);
             for (0..masks.count) |i| {
-                if (i != selected) self.overlayMask(img, masks, i, 0.35);
+                if (i != selected) self.overlayMask(img, masks, i, 0.25);
             }
-            if (selected < masks.count) self.overlayMask(img, masks, selected, 0.6);
+            if (selected < masks.count) self.overlayMask(img, masks, selected, 0.5);
             self.drawPointMarkers(img);
         }
         self.redraw_pending.store(true, .release);
@@ -1444,10 +2245,11 @@ pub const App = struct {
             font.strokeRect(pixels, stride, 0, 0, stride, h, 0x00323742);
         }
 
-        // Header / Title bar (y: 0..32)
+        // 1. Header / Title bar (y: 0..32)
         font.fillRect(pixels, stride, 0, 0, stride, 32, 0x0017191e);
         font.fillRect(pixels, stride, 0, 31, stride, 1, 0x002c3038);
-        font.drawText(pixels, stride, "SAM 3", 16, 7, 0x00d0d4dc);
+        const title = if (self.window_title_len > 0) self.window_title[0..self.window_title_len] else "SAM 3 — Visual Database";
+        font.drawText(pixels, stride, title, 16, 7, 0x00d0d4dc);
 
         if (stride >= 110) {
             // Minimize [-]
@@ -1458,66 +2260,141 @@ pub const App = struct {
             font.drawButton(pixels, stride, stride - 36, 5, 26, 22, "x", false, false, 0x00e05555);
         }
 
-        // Row 1 Buttons:
-        // [Sample Image]
-        font.drawButton(pixels, stride, 16, 42, 130, 28, "Sample Image", false, false, 0x0000dc64);
+        // 2. Top Hero: Visual SQL Query Console (y: 40..94, h: 54)
+        const q_x: usize = 16;
+        const q_y: usize = 40;
+        const q_h: usize = 54;
+        const btn_gap: usize = 8;
+        const run_btn_w: usize = 124;
+        const clear_btn_w: usize = 114;
+        const total_btns_w: usize = run_btn_w + btn_gap + clear_btn_w;
+        const q_w: usize = stride -| (q_x + total_btns_w + 24);
+        const run_btn_x: usize = stride -| (total_btns_w + 16);
+        const clear_btn_x: usize = run_btn_x + run_btn_w + btn_gap;
 
-        // [Clicks add / cut]
-        const mode_text = if (self.click_mode_add) "Clicks add to mask" else "Clicks cut from mask";
-        font.drawButton(pixels, stride, 156, 42, 220, 28, mode_text, false, !self.click_mode_add, 0x0000dc64);
+        font.fillRect(pixels, stride, q_x, q_y, q_w, q_h, if (self.search_focused) 0x0023272e else 0x001c1f25);
+        font.strokeRect(pixels, stride, q_x, q_y, q_w, q_h, if (self.search_focused) 0x0000dc64 else 0x00323742);
 
-        // [Clear Points]
-        font.drawButton(pixels, stride, 386, 42, 130, 28, "Clear Points", false, false, 0x0000dc64);
-        font.drawButton(pixels, stride, 526, 42, 130, 28, "Open File", false, false, 0x0000dc64);
-
-        // Row 2: Search field + Find button
-        font.fillRect(pixels, stride, 16, 78, 360, 28, if (self.search_focused) 0x0023272e else 0x001c1f25);
-        font.strokeRect(pixels, stride, 16, 78, 360, 28, if (self.search_focused) 0x0000dc64 else 0x00383d45);
-        if (self.search_len > 0) {
-            const end = @min(self.search_len, self.search_scroll + 37);
-            if (self.selection()) |selected| {
-                const start = @max(selected.start, self.search_scroll);
-                const stop = @min(selected.end, end);
-                if (start < stop) {
-                    font.fillRect(pixels, stride, 24 + (start - self.search_scroll) * font.font_width, 81, (stop - start) * font.font_width, 22, 0x00335d50);
-                }
-            }
-            font.drawText(pixels, stride, self.search_text[self.search_scroll..end], 24, 83, 0x00f2f4f6);
+        const max_cols = if (q_w > 20) (q_w - 20) / font.font_width else 10;
+        if (self.search_len == 0) {
+            font.drawText(pixels, stride, "Visual SQL query (e.g. SELECT frame FROM 'video.mp4' WHERE sam3(frame, 'person') > 0.5)", q_x + 10, q_y + 10, 0x0068707c);
+            font.drawText(pixels, stride, "or enter a concept word to find/segment", q_x + 10, q_y + 30, 0x0068707c);
         } else {
-            font.drawText(pixels, stride, "Find objects, e.g. cat or red car", 24, 83, 0x008e949e);
+            var line1_end: usize = 0;
+            var line2_start: usize = 0;
+            if (std.mem.indexOfScalar(u8, self.search_text[0..self.search_len], '\n')) |nl| {
+                line1_end = @min(nl, max_cols);
+                line2_start = nl + 1;
+            } else {
+                line1_end = @min(self.search_len, max_cols);
+                line2_start = line1_end;
+            }
+            font.drawText(pixels, stride, self.search_text[0..line1_end], q_x + 10, q_y + 10, 0x00f2f4f6);
+            if (line2_start < self.search_len) {
+                var line2_end = self.search_len;
+                if (std.mem.indexOfScalar(u8, self.search_text[line2_start..self.search_len], '\n')) |nl2| {
+                    line2_end = line2_start + nl2;
+                }
+                const l2_len = @min(line2_end - line2_start, max_cols);
+                font.drawText(pixels, stride, self.search_text[line2_start .. line2_start + l2_len], q_x + 10, q_y + 30, 0x00f2f4f6);
+            }
         }
         if (self.search_focused) {
-            const caret_x = 24 + (self.search_caret - self.search_scroll) * font.font_width;
-            font.fillRect(pixels, stride, caret_x, 82, 1, 20, 0x0000dc64);
-        }
-
-        font.drawButton(pixels, stride, 386, 78, 130, 28, "Find by Word", false, false, 0x0000dc64);
-        font.drawButton(pixels, stride, 526, 78, 130, 28, "Open Video", false, false, 0x0000dc64);
-
-        // Status text
-        font.drawText(pixels, stride, self.status_text[0..self.status_len], 16, 116, 0x00969ba5);
-
-        // Canvas Area
-        const cx = self.canvas_x;
-        if (self.video_active) {
-            font.drawButton(pixels, stride, 16, 140, 80, 28, if (self.video_playing.load(.acquire)) "Pause" else "Play", false, false, 0x0000dc64);
-            font.drawButton(pixels, stride, 104, 140, 80, 28, "Restart", false, false, 0x0000dc64);
-            font.drawButton(pixels, stride, 192, 140, 100, 28, "Next Frame", false, false, 0x0000dc64);
-            font.drawButton(pixels, stride, 300, 140, 160, 28, if (self.precache_active.load(.acquire)) "Cancel Pre-cache" else "Pre-cache Video", false, false, 0x0000dc64);
-            const timeline_w = stride -| 486;
-            if (timeline_w > 0) {
-                font.fillRect(pixels, stride, 470, 151, timeline_w, 6, 0x00383d45);
-                const fraction = if (self.video_duration > 0) std.math.clamp(self.video_position / self.video_duration, 0, 1) else 0;
-                font.fillRect(pixels, stride, 470, 151, @intFromFloat(@as(f64, @floatFromInt(timeline_w)) * fraction), 6, 0x0000dc64);
-                if (self.precache_active.load(.acquire)) font.fillRect(pixels, stride, 470, 161, @intFromFloat(@as(f64, @floatFromInt(timeline_w)) * self.precache_progress), 3, 0x0000b8ff);
+            var caret_row: usize = 0;
+            var caret_col: usize = self.search_caret;
+            if (std.mem.indexOfScalar(u8, self.search_text[0..self.search_len], '\n')) |nl| {
+                if (self.search_caret > nl) {
+                    caret_row = 1;
+                    caret_col = self.search_caret - (nl + 1);
+                }
+            } else if (self.search_caret > max_cols) {
+                caret_row = 1;
+                caret_col = self.search_caret - max_cols;
             }
+            caret_col = @min(caret_col, max_cols);
+            const caret_x = q_x + 10 + caret_col * font.font_width;
+            const caret_y = if (caret_row == 0) q_y + 8 else q_y + 28;
+            font.fillRect(pixels, stride, caret_x, caret_y, 1, 18, 0x0000dc64);
         }
-        const cy = if (self.video_active) self.canvas_y else 140;
+
+        const is_querying = self.query_active.load(.acquire);
+        const btn_label = if (is_querying) "Cancel Query" else "Run Query";
+        font.drawButton(pixels, stride, run_btn_x, q_y, run_btn_w, q_h, btn_label, false, is_querying, if (is_querying) 0x00e05555 else 0x0000dc64);
+        font.drawButton(pixels, stride, clear_btn_x, q_y, clear_btn_w, q_h, "Clear Query", false, false, 0x008892a0);
+
+        // 3. Action Toolbar (y: 102..130, h: 28)
+        const tb_y: usize = 102;
+        font.drawButton(pixels, stride, 16, tb_y, 116, 28, "Open Video…", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, 140, tb_y, 116, 28, "Open Image…", false, false, 0x0000dc64);
+
+        const precaching = self.precache_active.load(.acquire);
+        const precache_label = if (precaching) "Cancel Indexing" else "Create Index";
+        font.drawButton(pixels, stride, 264, tb_y, 130, 28, precache_label, false, precaching, 0x0000dc64);
+
+        var tool_x: usize = 402;
+        if (precaching) {
+            font.fillRect(pixels, stride, tool_x, tb_y + 11, 100, 6, 0x002c3038);
+            font.fillRect(pixels, stride, tool_x, tb_y + 11, @intFromFloat(100.0 * self.precache_progress), 6, 0x0000b8ff);
+            var pct_buf: [32]u8 = undefined;
+            const pct_str = std.fmt.bufPrint(&pct_buf, "Indexing {d:.1}%", .{self.precache_progress * 100.0}) catch "Indexing…";
+            font.drawText(pixels, stride, pct_str, tool_x + 108, tb_y + 6, 0x0000b8ff);
+            tool_x += 240;
+        }
+
+        const mode_text = if (self.click_mode_add) "Add to mask" else "Cut from mask";
+        font.drawButton(pixels, stride, tool_x, tb_y, 140, 28, mode_text, false, !self.click_mode_add, 0x0000dc64);
+        tool_x += 148;
+        font.drawButton(pixels, stride, tool_x, tb_y, 150, 28, "Hide/Clear Masks", false, false, 0x0000dc64);
+        tool_x += 158;
+        font.drawButton(pixels, stride, tool_x, tb_y, 120, 28, "Sample Image", false, false, 0x0000dc64);
+
+        // 4. Status Bar (y: 136..154)
+        font.drawText(pixels, stride, self.status_text[0..self.status_len], 16, 136, 0x00969ba5);
+
+        // 5. Layout geometry for Canvas and Controls Below Canvas
+        const mask_bar_y: usize = h -| 44;
+        const video_bar_y: usize = h -| 82;
+        const cy: usize = 158;
+        const canvas_bottom: usize = if (self.video_active) video_bar_y -| 8 else mask_bar_y -| 8;
+        const ch = if (canvas_bottom > cy) canvas_bottom - cy else 100;
         const cw = if (stride > 32) stride - 32 else 100;
-        const ch = if (h > cy + 60) h - cy - 60 else 100;
+        self.canvas_x = 16;
+        self.canvas_y = cy;
         self.canvas_w = cw;
         self.canvas_h = ch;
 
+        // 6. Video Playback Controls (Directly below canvas)
+        if (self.video_active) {
+            font.drawButton(pixels, stride, 16, video_bar_y, 70, 28, if (self.video_playing.load(.acquire)) "Pause" else "Play", false, false, 0x0000dc64);
+            font.drawButton(pixels, stride, 94, video_bar_y, 80, 28, "Restart", false, false, 0x0000dc64);
+
+            const next_label = if (self.query_matches.items.len > 0) "Next Match" else "Next Frame";
+            font.drawButton(pixels, stride, 182, video_bar_y, 104, 28, next_label, false, false, 0x0000dc64);
+
+            const s_x: usize = 294;
+            const time_w: usize = 120;
+            const s_w = stride -| (s_x + time_w + 16);
+            const s_y = video_bar_y + 10;
+            if (s_w > 20) {
+                font.fillRect(pixels, stride, s_x, s_y, s_w, 8, 0x002c3038);
+                const frac = if (self.video_duration > 0) std.math.clamp(self.video_position / self.video_duration, 0, 1) else 0;
+                font.fillRect(pixels, stride, s_x, s_y, @intFromFloat(@as(f64, @floatFromInt(s_w)) * frac), 8, 0x0000dc64);
+                const knob_x = s_x + @as(usize, @intFromFloat(@as(f64, @floatFromInt(s_w -| 8)) * frac));
+                font.fillRect(pixels, stride, knob_x, s_y - 3, 8, 14, 0x00ffffff);
+                if (precaching) {
+                    font.fillRect(pixels, stride, s_x, s_y + 10, @intFromFloat(@as(f64, @floatFromInt(s_w)) * self.precache_progress), 3, 0x0000b8ff);
+                }
+
+                const cur_sec = @as(u32, @intFromFloat(@max(self.video_position, 0)));
+                const dur_sec = @as(u32, @intFromFloat(@max(self.video_duration, 0)));
+                var time_buf: [32]u8 = undefined;
+                const time_str = std.fmt.bufPrint(&time_buf, "{d}:{d:0>2} / {d}:{d:0>2}", .{ cur_sec / 60, cur_sec % 60, dur_sec / 60, dur_sec % 60 }) catch "0:00 / 0:00";
+                font.drawText(pixels, stride, time_str, s_x + s_w + 12, video_bar_y + 5, 0x00d0d4dc);
+            }
+        }
+
+        // 7. Canvas Area
+        const cx = self.canvas_x;
         font.fillRect(pixels, stride, cx, cy, cw, ch, 0x001c1f25);
         font.strokeRect(pixels, stride, cx, cy, cw, ch, 0x002c3038);
 
@@ -1555,18 +2432,17 @@ pub const App = struct {
             }
         }
 
-        // Bottom row: mask selection buttons
+        // 8. Bottom Masks Bar
         if (self.masks) |m| {
-            const btn_y = h - 44;
             var cur_btn_x: usize = 16;
             for (0..m.count) |i| {
                 var title_buf: [64]u8 = undefined;
                 const star = if (@as(i32, @intCast(i)) == self.best_mask_idx) "*" else "";
                 const cov = if (self.coverages.len > i) self.coverages[i] * 100.0 else 0;
-                const title = std.fmt.bufPrint(&title_buf, "Mask {d}{s} ({d:.2}%)", .{ i, star, cov }) catch "Mask";
+                const mtitle = std.fmt.bufPrint(&title_buf, "Mask {d}{s} ({d:.2}%)", .{ i, star, cov }) catch "Mask";
                 const is_active = (@as(i32, @intCast(i)) == self.selected_mask);
 
-                font.drawButton(pixels, stride, cur_btn_x, btn_y, 160, 28, title, false, is_active, 0x0000dc64);
+                font.drawButton(pixels, stride, cur_btn_x, mask_bar_y, 160, 28, mtitle, false, is_active, 0x0000dc64);
                 cur_btn_x += 168;
             }
         }
