@@ -19,6 +19,7 @@ typedef struct {
     void (*on_mode_change)(int mode); // 1 = add, 0 = cut
     void (*on_clear_points)(void);
     void (*on_find_text)(const char *text);
+    void (*on_cancel_query)(void);
     void (*on_canvas_click)(float norm_x, float norm_y, int is_positive);
     void (*on_select_mask)(int mask_index);
 } SamCallbacks;
@@ -47,6 +48,7 @@ void sam_macos_set_busy(int is_busy);
 void sam_macos_set_video_mode(int active, int playing);
 void sam_macos_set_video_timeline(double duration, double position);
 void sam_macos_set_precache_progress(int state, double fraction, size_t frames);
+void sam_macos_set_query_active(int active);
 void *sam_macos_video_open(const char *path, double start_seconds);
 double sam_macos_video_duration(void *reader);
 int sam_macos_video_next(void *reader, SamVideoFrame *frame);

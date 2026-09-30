@@ -47,6 +47,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const vdb = b.createModule(.{
+        .root_source_file = b.path("src/vdb/vdb.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const run_step = b.step("run", "Run the native app");
 
     if (target.result.os.tag.isDarwin()) {
@@ -61,6 +67,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zimo", .module = zimo.module("zimo") },
                 .{ .name = "native_main", .module = native_main },
                 .{ .name = "log", .module = log },
+                .{ .name = "vdb", .module = vdb },
             },
         });
         macos_mod.addIncludePath(b.path("macos"));
@@ -99,6 +106,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zimo", .module = zimo.module("zimo") },
                 .{ .name = "native_main", .module = native_main },
                 .{ .name = "log", .module = log },
+                .{ .name = "vdb", .module = vdb },
             },
         });
         linux_mod.link_libc = true;
@@ -117,6 +125,11 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run app tests");
+    const vdb_test = b.addTest(.{
+        .root_module = vdb,
+    });
+    test_step.dependOn(&b.addRunArtifact(vdb_test).step);
+
     if (target.result.os.tag == .linux) {
         const font_test = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("linux/font.zig"),

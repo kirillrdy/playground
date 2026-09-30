@@ -191,7 +191,7 @@
 
 @end
 
-@interface SamAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@interface SamAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate>
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) SamCanvasView *canvasView;
 @property (nonatomic, strong) NSTextField *statusLabel;
@@ -218,6 +218,7 @@
 @property (nonatomic, assign) BOOL videoMode;
 @property (nonatomic, assign) BOOL videoPlaying;
 @property (nonatomic, assign) BOOL precacheActive;
+@property (nonatomic, assign) BOOL queryActive;
 
 - (instancetype)initWithCallbacks:(const SamCallbacks *)callbacks;
 - (void)createWindow;
@@ -226,6 +227,7 @@
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing;
 - (void)setVideoTimelineDuration:(double)duration position:(double)position;
 - (void)setPrecacheProgressState:(int)state fraction:(double)fraction frames:(size_t)frames;
+- (void)setQueryActive:(BOOL)active;
 @end
 
 static SamAppDelegate *g_delegate = nil;
@@ -299,20 +301,28 @@ static SamAppDelegate *g_delegate = nil;
     videoRow.alignment = NSLayoutAttributeCenterY;
     [_seekSlider setContentHuggingPriority:NSLayoutPriorityDefaultLow - 10 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    // Row 2
+    // Row 2 (Query Text Area)
     _conceptField = [[NSTextField alloc] init];
-    _conceptField.placeholderString = @"Find objects, e.g. cat or red car";
+    _conceptField.placeholderString = @"Find objects (e.g. cat) or SQL: SELECT frame, sam3(frame, 'cat') WHERE yolov8(frame) CONTAINS 'cat'";
     _conceptField.target = self;
     _conceptField.action = @selector(findClick:);
-    _conceptField.maximumNumberOfLines = 1;
+    _conceptField.delegate = self;
     _conceptField.font = [NSFont systemFontOfSize:13];
+    _conceptField.usesSingleLineMode = NO;
+    _conceptField.maximumNumberOfLines = 0;
+    _conceptField.cell.wraps = YES;
+    _conceptField.cell.scrollable = NO;
+    _conceptField.lineBreakMode = NSLineBreakByWordWrapping;
+    [_conceptField setContentHuggingPriority:NSLayoutPriorityDefaultLow - 10 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    _findBtn = [NSButton buttonWithTitle:@"Find by Word" target:self action:@selector(findClick:)];
+    _findBtn = [NSButton buttonWithTitle:@"Find / Query" target:self action:@selector(findClick:)];
+    [_findBtn setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     _spinner = [[NSProgressIndicator alloc] init];
     _spinner.style = NSProgressIndicatorStyleSpinning;
     _spinner.controlSize = NSControlSizeSmall;
     _spinner.displayedWhenStopped = NO;
+    [_spinner setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     NSStackView *row2 = [NSStackView stackViewWithViews:@[_conceptField, _findBtn, _spinner]];
     row2.orientation = NSUserInterfaceLayoutOrientationHorizontal;
@@ -370,11 +380,11 @@ static SamAppDelegate *g_delegate = nil;
         [row1.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [row1.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
 
-        // Row 2
+        // Row 2 (Query Area: wide and tall)
         [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:8.0],
         [row2.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
-        [row2.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [_conceptField.widthAnchor constraintGreaterThanOrEqualToConstant:280.0],
+        [row2.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [_conceptField.heightAnchor constraintEqualToConstant:56.0],
 
         [cacheRow.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:8.0],
         [cacheRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
@@ -496,7 +506,28 @@ static SamAppDelegate *g_delegate = nil;
     }
 }
 
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
+    if (control == _conceptField) {
+        if (commandSelector == @selector(insertNewline:) || commandSelector == @selector(insertLineBreak:)) {
+            NSEventModifierFlags flags = [NSEvent modifierFlags];
+            if ((flags & NSEventModifierFlagShift) || (flags & NSEventModifierFlagOption)) {
+                [textView insertNewlineIgnoringFieldEditor:nil];
+                return YES;
+            }
+            [self findClick:_findBtn];
+            return YES;
+        }
+    }
+    return NO;
+}
+
 - (void)findClick:(id)sender {
+    if (_queryActive) {
+        if (_callbacks && _callbacks->on_cancel_query) {
+            _callbacks->on_cancel_query();
+        }
+        return;
+    }
     NSString *text = [_conceptField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (text.length > 0 && _callbacks && _callbacks->on_find_text) {
         _callbacks->on_find_text([text UTF8String]);
@@ -542,6 +573,12 @@ static SamAppDelegate *g_delegate = nil;
     }
 }
 
+- (void)setQueryActive:(BOOL)active {
+    _queryActive = active;
+    _findBtn.title = active ? @"Cancel Query" : @"Find / Query";
+    _findBtn.enabled = !_canvasView.isBusy || active;
+}
+
 - (void)setBusy:(BOOL)busy {
     _canvasView.isBusy = busy;
     _openBtn.enabled = !busy;
@@ -552,7 +589,7 @@ static SamAppDelegate *g_delegate = nil;
     _seekSlider.enabled = !busy && _videoMode && _seekSlider.maxValue > 0;
     _sampleBtn.enabled = !busy;
     _clearBtn.enabled = !busy;
-    _findBtn.enabled = !busy;
+    _findBtn.enabled = !busy || _queryActive;
     _conceptField.enabled = !busy;
     _precacheBtn.enabled = _precacheActive || (_videoMode && !busy);
 
@@ -764,6 +801,14 @@ void sam_macos_set_video_timeline(double duration, double position) {
 void sam_macos_set_precache_progress(int state, double fraction, size_t frames) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_delegate setPrecacheProgressState:state fraction:fraction frames:frames];
+    });
+}
+
+void sam_macos_set_query_active(int active) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_delegate) {
+            [g_delegate setQueryActive:(active != 0)];
+        }
     });
 }
 
