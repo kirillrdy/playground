@@ -4,6 +4,7 @@ const BBox = types.BBox;
 const Detection = types.Detection;
 
 pub const IndexMagic = "VDB_YOLO";
+pub const IndexMagicSam = "VDB_SAM3";
 pub const IndexVersion: u32 = 1;
 
 pub const Posting = struct {
@@ -155,7 +156,7 @@ pub const InvertedIndex = struct {
     /// Deserializes index from a byte slice
     pub fn deserialize(allocator: std.mem.Allocator, bytes: []const u8) !InvertedIndex {
         if (bytes.len < 24) return error.UnexpectedEof;
-        if (!std.mem.eql(u8, bytes[0..8], IndexMagic)) {
+        if (!std.mem.eql(u8, bytes[0..8], IndexMagic) and !std.mem.eql(u8, bytes[0..8], IndexMagicSam)) {
             return error.InvalidIndexMagic;
         }
 
@@ -250,6 +251,73 @@ pub const InvertedIndex = struct {
 
         return index;
     }
+
+const c_io = struct {
+    extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+    extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+    extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
+    extern "c" fn unlink(path: [*:0]const u8) c_int;
+};
+
+    pub fn saveToFile(self: *const InvertedIndex, path: []const u8) !void {
+        const bytes = try self.serialize(self.allocator);
+        defer self.allocator.free(bytes);
+
+        const path_z = try self.allocator.dupeZ(u8, path);
+        defer self.allocator.free(path_z);
+
+        const O_WRONLY: c_int = 0x0001;
+        const O_CREAT: c_int = 0x0200;
+        const O_TRUNC: c_int = 0x0400;
+
+        const fd = c_io.open(path_z.ptr, O_WRONLY | O_CREAT | O_TRUNC, @as(c_uint, 0o644));
+        if (fd < 0) return error.CannotCreateFile;
+        defer _ = c_io.close(fd);
+
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const ret = c_io.write(fd, bytes.ptr + written, bytes.len - written);
+            if (ret <= 0) return error.WriteFailed;
+            written += @intCast(ret);
+        }
+    }
+
+    pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !InvertedIndex {
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        const O_RDONLY: c_int = 0x0000;
+        const fd = c_io.open(path_z.ptr, O_RDONLY, @as(c_uint, 0));
+        if (fd < 0) return error.FileNotFound;
+        defer _ = c_io.close(fd);
+
+        const SEEK_END: c_int = 2;
+        const SEEK_SET: c_int = 0;
+        const size_i64 = c_io.lseek(fd, 0, SEEK_END);
+        if (size_i64 < 0) return error.SeekFailed;
+        const size: usize = @intCast(size_i64);
+        _ = c_io.lseek(fd, 0, SEEK_SET);
+
+        const bytes = try allocator.alloc(u8, size);
+        defer allocator.free(bytes);
+
+        var total_read: usize = 0;
+        while (total_read < size) {
+            const ret = c_io.read(fd, bytes.ptr + total_read, size - total_read);
+            if (ret <= 0) return error.ReadFailed;
+            total_read += @intCast(ret);
+        }
+
+        return try deserialize(allocator, bytes);
+    }
+
+    pub fn deleteFile(allocator: std.mem.Allocator, path: []const u8) !void {
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+        if (c_io.unlink(path_z.ptr) != 0) return error.DeleteFailed;
+    }
 };
 
 pub const IndexBuilder = struct {
@@ -272,6 +340,18 @@ pub const IndexBuilder = struct {
             list.deinit(self.allocator);
         }
         self.classes.deinit(self.allocator);
+    }
+
+    pub fn importIndex(self: *IndexBuilder, existing: *const InvertedIndex) !void {
+        var it = existing.classes.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.postings) |p| {
+                try self.addDetection(p.frame_idx, p.pts_ms, entry.key_ptr.*, p.conf, p.bbox);
+            }
+        }
+        if (existing.frame_count > self.frame_count) {
+            self.frame_count = existing.frame_count;
+        }
     }
 
     pub fn addDetection(

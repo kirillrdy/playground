@@ -371,7 +371,29 @@ pub const App = struct {
         sam_macos_set_image(null, 0, 0);
         sam_macos_set_masks(0, null, 0, -1);
         sam_macos_set_video_mode(1, 0);
-        sam_macos_set_status("Video opened. Enter a word or SQL query and press Find/Query.");
+
+        // Try auto-loading sidecar index if exists
+        var index_loaded = false;
+        var indexed_concepts_count: usize = 0;
+        if (std.fmt.allocPrint(self.allocator, "{s}.vdb", .{path})) |sidecar| {
+            defer self.allocator.free(sidecar);
+            if (vdb.index.InvertedIndex.loadFromFile(self.allocator, sidecar)) |loaded_idx| {
+                indexed_concepts_count = loaded_idx.classes.count();
+                self.vdb_database.registerIndex(path, loaded_idx) catch |err| {
+                    log.info(self.io, "Failed to register loaded index: {t}", .{err});
+                };
+                index_loaded = true;
+                log.info(self.io, "Auto-loaded visual index for \"{s}\" ({d} concepts) from {s}", .{ path, indexed_concepts_count, sidecar });
+            } else |_| {}
+        } else |_| {}
+
+        if (index_loaded) {
+            var sbuf: [160]u8 = undefined;
+            const smsg = std.fmt.bufPrintZ(&sbuf, "Video opened. Loaded visual index with {d} concept(s) from .vdb sidecar.", .{indexed_concepts_count}) catch "Video opened with index.";
+            sam_macos_set_status(smsg);
+        } else {
+            sam_macos_set_status("Video opened. Enter a word or SQL query and press Find/Query.");
+        }
         self.video_thread = std.Thread.spawn(.{}, runVideoWorker, .{self}) catch {
             self.allocator.free(self.video_path.?);
             self.video_path = null;
@@ -765,7 +787,17 @@ pub const App = struct {
         var last_ui_update = started;
         var last_log = started;
         var fraction: f64 = 0;
-        log.info(self.io, "pre-caching video for \"{s}\" ({d:.2} s)", .{ phrase, duration });
+
+        var index_builder = vdb.index.IndexBuilder.init(self.allocator);
+        defer index_builder.deinit();
+
+        if (self.vdb_database.getIndex(self.video_path.?)) |existing| {
+            index_builder.importIndex(existing) catch |err| {
+                log.info(self.io, "Could not import existing index: {t}", .{err});
+            };
+        }
+
+        log.info(self.io, "pre-caching and indexing video for \"{s}\" ({d:.2} s)", .{ phrase, duration });
         while (!self.video_stop.load(.acquire) and !self.precache_cancel.load(.acquire)) {
             var frame: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
             const next = sam_macos_video_next(reader, &frame);
@@ -773,11 +805,26 @@ pub const App = struct {
                 if (next < 0) {
                     sam_macos_set_status("Video decoding failed during pre-cache.");
                 } else {
+                    if (index_builder.build()) |built_idx| {
+                        self.vdb_database.registerIndex(self.video_path.?, built_idx) catch |err| {
+                            log.info(self.io, "Failed to register index in database: {t}", .{err});
+                        };
+                        if (std.fmt.allocPrint(self.allocator, "{s}.vdb", .{self.video_path.?})) |sidecar| {
+                            defer self.allocator.free(sidecar);
+                            if (self.vdb_database.getIndex(self.video_path.?)) |reg_idx| {
+                                reg_idx.saveToFile(sidecar) catch |err| {
+                                    log.info(self.io, "Failed to save index to {s}: {t}", .{ sidecar, err });
+                                };
+                            }
+                        } else |_| {}
+                    } else |err| {
+                        log.info(self.io, "Failed to build inverted index: {t}", .{err});
+                    }
                     sam_macos_set_precache_progress(1, 1, frames);
-                    var status_buf: [160]u8 = undefined;
-                    const status = std.fmt.bufPrintZ(&status_buf, "Pre-cached {d} frames for “{s}”.", .{ frames, phrase }) catch "Video pre-cache complete.";
+                    var status_buf: [200]u8 = undefined;
+                    const status = std.fmt.bufPrintZ(&status_buf, "Pre-cached and indexed {d} frames for “{s}”. Saved to .vdb sidecar.", .{ frames, phrase }) catch "Video pre-cache complete.";
                     sam_macos_set_status(status);
-                    log.info(self.io, "pre-cached {d} frames for \"{s}\" in {f}", .{ frames, phrase, started.untilNow(self.io, .awake) });
+                    log.info(self.io, "pre-cached and indexed {d} frames for \"{s}\" in {f}", .{ frames, phrase, started.untilNow(self.io, .awake) });
                 }
                 return;
             }
@@ -819,7 +866,26 @@ pub const App = struct {
                 sam_macos_set_status("Video pre-cache inference failed.");
                 return;
             };
-            self.allocator.free(values);
+            defer self.allocator.free(values);
+
+            if (values.len >= 4) {
+                const count: usize = @as(u32, @bitCast(values[0]));
+                if (count > 0) {
+                    const obj_score = values[3];
+                    const best_score = if (values.len >= 5) @max(obj_score, values[4]) else obj_score;
+                    const pts_ms: u32 = if (std.math.isFinite(frame.pts_seconds) and frame.pts_seconds >= 0)
+                        @intFromFloat(frame.pts_seconds * 1000.0)
+                    else
+                        @intCast(frames * 33);
+                    index_builder.addDetection(
+                        @intCast(frames),
+                        pts_ms,
+                        phrase,
+                        best_score,
+                        .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+                    ) catch {};
+                }
+            }
             frames += 1;
             if (std.math.isFinite(frame.pts_seconds)) {
                 self.mutex.lock(self.io) catch return;
@@ -1021,6 +1087,29 @@ pub const App = struct {
         var query_buf: [2048]u8 = undefined;
         var final_query: []const u8 = query;
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
+
+        if (std.ascii.startsWithIgnoreCase(trimmed, "CREATE")) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var p = vdb.parser.Parser.init(arena.allocator(), trimmed);
+            if (p.parse()) |stmt| {
+                if (stmt == .create_index) {
+                    const target_prompt = stmt.create_index.prompt orelse stmt.create_index.model_name;
+                    log.info(self.io, "Executing visual CREATE INDEX on concept \"{s}\"", .{target_prompt});
+                    var status_buf: [160]u8 = undefined;
+                    const status_msg = std.fmt.bufPrintZ(&status_buf, "Creating visual index for “{s}”…", .{target_prompt}) catch "Creating visual index…";
+                    sam_macos_set_status(status_msg);
+                    self.runPrecache(target_prompt);
+                    return;
+                }
+            } else |err| {
+                log.info(self.io, "Failed to parse CREATE INDEX: {t}", .{err});
+                var err_buf: [160]u8 = undefined;
+                const err_msg = std.fmt.bufPrintZ(&err_buf, "CREATE INDEX syntax error: {t}", .{err}) catch "Syntax error.";
+                sam_macos_set_status(err_msg);
+                return;
+            }
+        }
 
         if (std.ascii.startsWithIgnoreCase(trimmed, "WHERE")) {
             final_query = std.fmt.bufPrint(&query_buf, "SELECT frame, sam3(frame, \"matched\") FROM \"{s}\" {s}", .{
