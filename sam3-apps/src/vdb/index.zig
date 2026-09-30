@@ -268,9 +268,10 @@ const c_io = struct {
         const path_z = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_z);
 
+        const builtin = @import("builtin");
         const O_WRONLY: c_int = 0x0001;
-        const O_CREAT: c_int = 0x0200;
-        const O_TRUNC: c_int = 0x0400;
+        const O_CREAT: c_int = if (builtin.os.tag.isDarwin()) 0x0200 else 0x0040;
+        const O_TRUNC: c_int = if (builtin.os.tag.isDarwin()) 0x0400 else 0x0200;
 
         const fd = c_io.open(path_z.ptr, O_WRONLY | O_CREAT | O_TRUNC, @as(c_uint, 0o644));
         if (fd < 0) return error.CannotCreateFile;

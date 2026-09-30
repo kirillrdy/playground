@@ -46,3 +46,6 @@ the playback query. Playback and seeking stay available during the scan: cached
 frames show masks, while frames still waiting for inference show the plain video.
 All returned masks appear together in distinct colors. Select a mask in the bar
 to make it more prominent while keeping the others visible.
+
+For an original PyTorch SAM 3 comparison on Intel GPUs, see the
+[Python benchmark and Nix environment](benchmarks/sam3-python/README.md).

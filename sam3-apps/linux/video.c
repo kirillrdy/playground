@@ -20,12 +20,9 @@ typedef struct {
 
 typedef struct {
     int fd, width, height;
-    pid_t pid, pts_pid;
+    pid_t pid;
     double duration, fps, start;
     size_t index;
-    FILE *pts_file;
-    double pts_buffer[64];
-    size_t pts_len;
 } SamVideoReader;
 
 extern char **environ;
@@ -79,8 +76,6 @@ void sam_linux_video_close(SamVideoReader *r) {
     if (!r) return;
     if (r->fd >= 0) close(r->fd);
     if (r->pid > 0) { kill(r->pid, SIGTERM); waitpid(r->pid, NULL, 0); }
-    if (r->pts_file) fclose(r->pts_file);
-    if (r->pts_pid > 0) { kill(r->pts_pid, SIGTERM); waitpid(r->pts_pid, NULL, 0); }
     free(r);
 }
 
@@ -103,49 +98,28 @@ SamVideoReader *sam_linux_video_open(const char *path, double start) {
     }
     free(meta);
     if (r->width <= 0 || r->height <= 0 || (uint64_t)r->width * (uint64_t)r->height > 100000000) { sam_linux_video_close(r); return NULL; }
+    if (r->fps <= 0 || !isfinite(r->fps)) r->fps = 30;
     r->start = start > 0 && isfinite(start) ? start : 0;
-    char interval_buf[64];
-    snprintf(interval_buf, sizeof(interval_buf), "%.9f%%", r->start);
-    char *pts_argv[] = {"ffprobe", "-v", "error", "-read_intervals", interval_buf, "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", (char *)path, NULL};
-    int pts_fd;
-    r->pts_pid = launch(pts_argv, &pts_fd);
-    if (r->pts_pid > 0) {
-        r->pts_file = fdopen(pts_fd, "r");
-        if (!r->pts_file) { close(pts_fd); kill(r->pts_pid, SIGTERM); waitpid(r->pts_pid, NULL, 0); r->pts_pid = 0; }
-    } else r->pts_pid = 0;
     char seek_buf[64];
-    snprintf(seek_buf, sizeof(seek_buf), "%.9f", r->start);
-    char *ffmpeg_argv[] = {"ffmpeg", "-v", "error", "-nostdin", "-ss", seek_buf, "-i", (char *)path, "-map", "0:v:0", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", NULL};
-    r->pid = launch(ffmpeg_argv, &r->fd);
+    if (r->start > 0.0001) {
+        snprintf(seek_buf, sizeof(seek_buf), "%.6f", r->start);
+        char *ffmpeg_argv[] = {"ffmpeg", "-v", "error", "-nostdin", "-ss", seek_buf, "-i", (char *)path, "-map", "0:v:0", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", NULL};
+        r->pid = launch(ffmpeg_argv, &r->fd);
+    } else {
+        r->start = 0;
+        char *ffmpeg_argv[] = {"ffmpeg", "-v", "error", "-nostdin", "-i", (char *)path, "-map", "0:v:0", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", NULL};
+        r->pid = launch(ffmpeg_argv, &r->fd);
+    }
     if (r->pid < 0) { r->pid = 0; sam_linux_video_close(r); return NULL; }
     return r;
 }
 
-double sam_linux_video_duration(SamVideoReader *r) { return r->duration; }
+double sam_linux_video_duration(SamVideoReader *r) { return r ? r->duration : 0; }
 
-static double next_pts(SamVideoReader *r) {
-    if (r->pts_file) {
-        char line[128];
-        while (r->pts_len < 64 && fgets(line, sizeof(line), r->pts_file)) {
-            char *end;
-            double pts = strtod(line, &end);
-            if (end == line || !isfinite(pts) || pts + 0.000001 < r->start) continue;
-            r->pts_buffer[r->pts_len++] = pts;
-        }
-        if (r->pts_len) {
-            size_t first = 0;
-            for (size_t i = 1; i < r->pts_len; i++) {
-                if (r->pts_buffer[i] < r->pts_buffer[first]) first = i;
-            }
-            double pts = r->pts_buffer[first];
-            r->pts_buffer[first] = r->pts_buffer[--r->pts_len];
-            return pts;
-        }
-    }
-    return r->start + (double)r->index / r->fps;
-}
+double sam_linux_video_fps(SamVideoReader *r) { return r && r->fps > 0 ? r->fps : 30.0; }
 
 int sam_linux_video_next(SamVideoReader *r, SamVideoFrame *frame) {
+    if (!r || r->fd < 0 || !frame) return -1;
     size_t size = (size_t)r->width * (size_t)r->height * 3;
     unsigned char *rgb = malloc(size);
     if (!rgb) return -1;
@@ -159,8 +133,13 @@ int sam_linux_video_next(SamVideoReader *r, SamVideoFrame *frame) {
     frame->rgb = rgb;
     frame->width = r->width;
     frame->height = r->height;
-    frame->pts_seconds = next_pts(r);
+    frame->pts_seconds = r->start + (double)r->index / r->fps;
     r->index++;
     return 1;
 }
-void sam_linux_video_free_frame(SamVideoFrame *frame) { free(frame->rgb); frame->rgb = NULL; }
+
+void sam_linux_video_free_frame(SamVideoFrame *frame) {
+    if (!frame) return;
+    free(frame->rgb);
+    frame->rgb = NULL;
+}

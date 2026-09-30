@@ -207,6 +207,7 @@
 @property (nonatomic, strong) NSSegmentedControl *modeSeg;
 @property (nonatomic, strong) NSButton *clearBtn;
 @property (nonatomic, strong) NSButton *findBtn;
+@property (nonatomic, strong) NSButton *clearQueryBtn;
 @property (nonatomic, strong) NSButton *precacheBtn;
 @property (nonatomic, strong) NSProgressIndicator *precacheProgress;
 @property (nonatomic, strong) NSTextField *precachePercent;
@@ -318,13 +319,18 @@ static SamAppDelegate *g_delegate = nil;
     _findBtn.toolTip = @"Run visual SQL query (Return to execute, Shift+Return for newline)";
     [_findBtn setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
+    _clearQueryBtn = [NSButton buttonWithTitle:@"Clear Query" target:self action:@selector(clearQueryClick:)];
+    _clearQueryBtn.bezelStyle = NSBezelStylePush;
+    _clearQueryBtn.toolTip = @"Clear the query input and active query matches";
+    [_clearQueryBtn setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+
     _spinner = [[NSProgressIndicator alloc] init];
     _spinner.style = NSProgressIndicatorStyleSpinning;
     _spinner.controlSize = NSControlSizeSmall;
     _spinner.displayedWhenStopped = NO;
     [_spinner setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    NSStackView *queryRow = [NSStackView stackViewWithViews:@[_conceptField, _findBtn, _spinner]];
+    NSStackView *queryRow = [NSStackView stackViewWithViews:@[_conceptField, _findBtn, _clearQueryBtn, _spinner]];
     queryRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     queryRow.spacing = 8.0;
     queryRow.alignment = NSLayoutAttributeCenterY;
@@ -515,6 +521,13 @@ static SamAppDelegate *g_delegate = nil;
     }
 }
 
+- (void)clearQueryClick:(id)sender {
+    _conceptField.stringValue = @"";
+    if (_callbacks && _callbacks->on_clear_query) {
+        _callbacks->on_clear_query();
+    }
+}
+
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
     if (control == _conceptField) {
         if (commandSelector == @selector(insertNewline:) || commandSelector == @selector(insertLineBreak:)) {
@@ -603,6 +616,7 @@ static SamAppDelegate *g_delegate = nil;
     _sampleBtn.enabled = !busy;
     _clearBtn.enabled = !busy;
     _findBtn.enabled = !busy || _queryActive;
+    _clearQueryBtn.enabled = !busy || _queryActive;
     _conceptField.enabled = YES;
     _precacheBtn.enabled = _precacheActive || (_videoMode && !busy);
 

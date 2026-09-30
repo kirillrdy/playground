@@ -20,6 +20,7 @@ typedef struct {
     void (*on_clear_points)(void);
     void (*on_find_text)(const char *text);
     void (*on_cancel_query)(void);
+    void (*on_clear_query)(void);
     void (*on_canvas_click)(float norm_x, float norm_y, int is_positive);
     void (*on_select_mask)(int mask_index);
 } SamCallbacks;
