@@ -1270,9 +1270,6 @@ pub const App = struct {
         const query = ctx.query;
         const started = std.Io.Timestamp.now(self.io, .awake);
 
-        // Normalize query if needed
-        var query_buf: [2048]u8 = undefined;
-        var final_query: []const u8 = query;
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
 
         if (std.ascii.startsWithIgnoreCase(trimmed, "CREATE")) {
@@ -1298,25 +1295,14 @@ pub const App = struct {
             }
         }
 
-        if (std.ascii.startsWithIgnoreCase(trimmed, "WHERE")) {
-            final_query = std.fmt.bufPrint(&query_buf, "SELECT frame, sam3(frame, \"matched\") FROM \"{s}\" {s}", .{
-                self.video_path.?,
-                trimmed,
-            }) catch query;
-        } else if (std.ascii.indexOfIgnoreCase(trimmed, "FROM") == null) {
-            if (std.ascii.indexOfIgnoreCase(trimmed, "WHERE")) |where_idx| {
-                final_query = std.fmt.bufPrint(&query_buf, "{s} FROM \"{s}\" {s}", .{
-                    trimmed[0..where_idx],
-                    self.video_path.?,
-                    trimmed[where_idx..],
-                }) catch query;
-            } else {
-                final_query = std.fmt.bufPrint(&query_buf, "{s} FROM \"{s}\"", .{
-                    trimmed,
-                    self.video_path.?,
-                }) catch query;
-            }
-        }
+        const final_query = vdb.query_input.normalize(self.allocator, trimmed, self.video_path.?) catch |err| {
+            log.info(self.io, "Query normalization failed: {t}", .{err});
+            var err_buf: [160]u8 = undefined;
+            const err_msg = std.fmt.bufPrintZ(&err_buf, "Query syntax error: {t}", .{err}) catch "Query syntax error.";
+            sam_macos_set_status(err_msg);
+            return;
+        };
+        defer self.allocator.free(final_query);
 
         log.info(self.io, "Executing visual query: {s}", .{final_query});
 
