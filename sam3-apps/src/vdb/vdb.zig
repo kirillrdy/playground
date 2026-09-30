@@ -7,6 +7,11 @@ pub const parser = @import("parser.zig");
 pub const index = @import("index.zig");
 pub const planner = @import("planner.zig");
 pub const engine = @import("engine.zig");
+pub const overlay = @import("overlay.zig");
+
+test {
+    _ = overlay;
+}
 
 pub const Database = struct {
     allocator: std.mem.Allocator,

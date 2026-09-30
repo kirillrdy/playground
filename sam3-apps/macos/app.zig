@@ -189,6 +189,7 @@ pub const App = struct {
     video_playing: std.atomic.Value(bool) = .init(false),
     video_phrase: [256]u8 = undefined,
     video_phrase_len: usize = 0,
+    video_overlay_prompts: vdb.overlay.Prompts = .{},
     video_duration: f64 = 0,
     video_position: f64 = 0,
     video_previewed: bool = false,
@@ -331,6 +332,7 @@ pub const App = struct {
         self.video_path = null;
         self.video_active = false;
         self.video_phrase_len = 0;
+        self.video_overlay_prompts = .{};
         self.video_playing.store(false, .release);
         self.video_duration = 0;
         self.video_position = 0;
@@ -520,6 +522,7 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return;
         self.precache_phrase_len = @min(phrase.len, self.precache_phrase.len);
         @memcpy(self.precache_phrase[0..self.precache_phrase_len], phrase[0..self.precache_phrase_len]);
+        self.video_overlay_prompts = .{};
         self.video_phrase_len = self.precache_phrase_len;
         @memcpy(self.video_phrase[0..self.video_phrase_len], self.precache_phrase[0..self.precache_phrase_len]);
         self.precache_cancel.store(false, .release);
@@ -638,30 +641,21 @@ pub const App = struct {
 
             var phrase_buf: [256]u8 = undefined;
             self.mutex.lock(self.io) catch return;
+            const overlay_prompts = self.video_overlay_prompts;
             const phrase_len = self.video_phrase_len;
             @memcpy(phrase_buf[0..phrase_len], self.video_phrase[0..phrase_len]);
             self.mutex.unlock(self.io);
-            if (phrase_len == 0) continue;
+            if (phrase_len == 0 and overlay_prompts.count == 0 and !step and seek == null) continue;
             const phrase = phrase_buf[0..phrase_len];
 
             const started = std.Io.Timestamp.now(self.io, .awake);
-            const maybe_values = self.videoQuery(sam3.RgbImage.fromImage(decoded), phrase, video_frame.pts_seconds) catch |err| {
+            var masks = self.videoOverlayMasks(sam3.RgbImage.fromImage(decoded), phrase, &overlay_prompts, video_frame.pts_seconds) catch |err| {
                 log.info(self.io, "Video frame lookup failed: {t}: {s}", .{ err, sam3.onnx.lastError() });
                 sam_macos_set_status("Video frame inference failed.");
                 self.video_playing.store(false, .release);
                 sam_macos_set_video_mode(1, 0);
                 continue;
             };
-            defer if (maybe_values) |values| self.allocator.free(values);
-            var masks: ?sam3.Masks = null;
-            if (maybe_values) |values| {
-                masks = unpackMasks(self.allocator, values) catch blk: {
-                    // The pre-cache worker may still be writing this entry.
-                    if (self.precache_active.load(.acquire)) break :blk null;
-                    sam_macos_set_status("Cached video frame is invalid.");
-                    continue;
-                };
-            }
             defer if (masks) |*m| m.deinit();
             const lookup_elapsed = started.untilNow(self.io, .awake);
 
@@ -795,6 +789,41 @@ pub const App = struct {
         self.model_mutex.lock(self.io) catch return error.ModelLockFailed;
         defer self.model_mutex.unlock(self.io);
         return try here.call(.computeQuery, args);
+    }
+
+    fn videoOverlayMasks(self: *App, image: sam3.RgbImage, phrase: []const u8, prompts: *const vdb.overlay.Prompts, pts: f64) !?sam3.Masks {
+        var combined: ?sam3.Masks = null;
+        errdefer if (combined) |*m| m.deinit();
+        const count = if (prompts.count > 0) prompts.count else @as(usize, if (phrase.len > 0) 1 else 0);
+        for (0..count) |i| {
+            const prompt = if (prompts.count > 0) prompts.get(i) else phrase;
+            const values = (try self.videoQuery(image, prompt, pts)) orelse continue;
+            defer self.allocator.free(values);
+            var masks = unpackMasks(self.allocator, values) catch |err| {
+                if (self.precache_active.load(.acquire)) continue;
+                return err;
+            };
+            if (combined) |*existing| {
+                defer masks.deinit();
+                if (existing.width != masks.width or existing.height != masks.height) return error.IncompatibleMaskDimensions;
+                const scores = try self.allocator.alloc(f32, existing.scores.len + masks.scores.len);
+                errdefer self.allocator.free(scores);
+                const logits = try self.allocator.alloc(f32, existing.logits.len + masks.logits.len);
+                @memcpy(scores[0..existing.scores.len], existing.scores);
+                @memcpy(scores[existing.scores.len..], masks.scores);
+                @memcpy(logits[0..existing.logits.len], existing.logits);
+                @memcpy(logits[existing.logits.len..], masks.logits);
+                self.allocator.free(existing.scores);
+                self.allocator.free(existing.logits);
+                existing.scores = scores;
+                existing.logits = logits;
+                existing.count += masks.count;
+                existing.object_score = @max(existing.object_score, masks.object_score);
+            } else {
+                combined = masks;
+            }
+        }
+        return combined;
     }
 
     fn sam3SegmentBridge(ctx: *anyopaque, allocator: std.mem.Allocator, frame: vdb.types.FrameRef, prompt: []const u8) anyerror!vdb.types.MaskRef {
@@ -1291,26 +1320,20 @@ pub const App = struct {
 
         log.info(self.io, "Executing visual query: {s}", .{final_query});
 
-        // Extract prompt if sam3(frame, "...") is in query
-        if (std.ascii.indexOfIgnoreCase(final_query, "sam3")) |sam_idx| {
-            if (std.mem.indexOfPos(u8, final_query, sam_idx, "\"")) |q1| {
-                if (std.mem.indexOfPos(u8, final_query, q1 + 1, "\"")) |q2| {
-                    const prompt = final_query[q1 + 1 .. q2];
-                    self.mutex.lock(self.io) catch return;
-                    self.video_phrase_len = @min(prompt.len, self.video_phrase.len);
-                    @memcpy(self.video_phrase[0..self.video_phrase_len], prompt[0..self.video_phrase_len]);
-                    self.mutex.unlock(self.io);
-                }
-            } else if (std.mem.indexOfPos(u8, final_query, sam_idx, "'")) |q1| {
-                if (std.mem.indexOfPos(u8, final_query, q1 + 1, "'")) |q2| {
-                    const prompt = final_query[q1 + 1 .. q2];
-                    self.mutex.lock(self.io) catch return;
-                    self.video_phrase_len = @min(prompt.len, self.video_phrase.len);
-                    @memcpy(self.video_phrase[0..self.video_phrase_len], prompt[0..self.video_phrase_len]);
-                    self.mutex.unlock(self.io);
-                }
-            }
+        const overlay_prompts = vdb.overlay.Prompts.fromSql(self.allocator, final_query) catch |err| {
+            log.info(self.io, "Query overlay planning failed: {t}", .{err});
+            sam_macos_set_status("Could not parse query overlay prompts.");
+            return;
+        };
+        self.mutex.lock(self.io) catch return;
+        self.video_overlay_prompts = overlay_prompts;
+        self.video_phrase_len = 0;
+        if (overlay_prompts.count > 0) {
+            const prompt = overlay_prompts.get(0);
+            self.video_phrase_len = prompt.len;
+            @memcpy(self.video_phrase[0..prompt.len], prompt);
         }
+        self.mutex.unlock(self.io);
 
         self.mutex.lock(self.io) catch return;
         self.query_matches.clearRetainingCapacity();
@@ -1449,6 +1472,7 @@ pub const App = struct {
             if (self.video_previewed and self.video_seek_target == null) {
                 self.video_seek_target = self.video_position;
             }
+            self.video_overlay_prompts = .{};
             self.video_phrase_len = @min(phrase.len, self.video_phrase.len);
             @memcpy(self.video_phrase[0..self.video_phrase_len], phrase[0..self.video_phrase_len]);
             const playing = self.video_playing.load(.acquire);
