@@ -258,7 +258,7 @@ static SamAppDelegate *g_delegate = nil;
                                           styleMask:styleMask
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
-    _window.title = @"SAM 3";
+    _window.title = @"SAM 3 — Visual Database";
     _window.delegate = self;
     _window.minSize = NSMakeSize(780, 520);
     _window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
@@ -301,7 +301,7 @@ static SamAppDelegate *g_delegate = nil;
 
     // TOP HERO: Visual SQL Query Field & Run Button
     _conceptField = [[NSTextField alloc] init];
-    _conceptField.placeholderString = @"Visual SQL query (e.g. SELECT frame, sam3(frame, 'person') WHERE sam3(frame, 'person') > 0.5) or concept word";
+    _conceptField.placeholderString = @"Visual SQL query (e.g. SELECT frame FROM 'holes_3min.mp4' WHERE sam3(frame, 'person') > 0.5) or concept word";
     _conceptField.target = self;
     _conceptField.action = @selector(findClick:);
     _conceptField.delegate = self;
@@ -719,6 +719,17 @@ void sam_macos_run(void) {
     }
 }
 
+void sam_macos_set_window_title(const char *title) {
+    @autoreleasepool {
+        NSString *str = title ? [NSString stringWithUTF8String:title] : @"SAM 3 — Visual Database";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_delegate && g_delegate.window) {
+                [g_delegate.window setTitle:str];
+            }
+        });
+    }
+}
+
 void sam_macos_set_status(const char *text) {
     @autoreleasepool {
         NSString *str = text ? [NSString stringWithUTF8String:text] : @"";
@@ -925,6 +936,15 @@ void sam_macos_video_close(void *opaque) {
     if (!opaque) return;
     SamVideoReader *handle = CFBridgingRelease(opaque);
     [handle.reader cancelReading];
+}
+
+int sam_macos_file_exists(const char *path) {
+    if (!path || path[0] == '\0') return 0;
+    return access(path, F_OK) == 0 ? 1 : 0;
+}
+
+const char *sam_macos_get_home(void) {
+    return [NSHomeDirectory() UTF8String];
 }
 
 void sam_macos_dispatch_main(void (*fn)(void *ctx), void *ctx) {

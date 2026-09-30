@@ -41,6 +41,7 @@ typedef struct {
 
 int sam_macos_init(const SamCallbacks *callbacks);
 void sam_macos_run(void);
+void sam_macos_set_window_title(const char *title);
 void sam_macos_set_status(const char *text);
 void sam_macos_set_image(const uint8_t *rgba_pixels, int width, int height);
 void sam_macos_set_masks(int count, const SamMaskInfo *masks, int best_index, int selected_index);
@@ -54,6 +55,8 @@ double sam_macos_video_duration(void *reader);
 int sam_macos_video_next(void *reader, SamVideoFrame *frame);
 void sam_macos_video_free_frame(SamVideoFrame *frame);
 void sam_macos_video_close(void *reader);
+int sam_macos_file_exists(const char *path);
+const char *sam_macos_get_home(void);
 void sam_macos_dispatch_main(void (*fn)(void *ctx), void *ctx);
 
 #ifdef __cplusplus
