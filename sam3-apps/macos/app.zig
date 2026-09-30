@@ -1634,9 +1634,9 @@ pub const App = struct {
         const masks = self.masks.?;
         const selected: usize = @intCast(mask_index);
         for (0..masks.count) |i| {
-            if (i != selected) self.overlayMask(img, masks, i, 0.35);
+            if (i != selected) self.overlayMask(img, masks, i, 0.25);
         }
-        if (selected < masks.count) self.overlayMask(img, masks, selected, 0.6);
+        if (selected < masks.count) self.overlayMask(img, masks, selected, 0.5);
         self.drawPointMarkers(img);
     }
 

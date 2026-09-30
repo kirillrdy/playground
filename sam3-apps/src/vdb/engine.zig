@@ -246,9 +246,8 @@ pub const Engine = struct {
         allocator: std.mem.Allocator,
         frame: types.FrameRef,
         index: ?*const index_mod.InvertedIndex,
-
         cached_detections: ?[]const types.Detection = null,
-        cached_mask: ?types.MaskRef = null,
+        cached_masks: std.ArrayList(struct { prompt: []const u8, mask: types.MaskRef }) = .empty,
 
         pub fn eval(self: *EvalContext, expr: *const ast.Expr) !types.Value {
             switch (expr.*) {
@@ -337,13 +336,15 @@ pub const Engine = struct {
         }
 
         fn evalSam3(self: *EvalContext, prompt: []const u8) !types.Value {
-            if (self.cached_mask) |m| {
-                return .{ .mask_type = m };
+            for (self.cached_masks.items) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.prompt, prompt)) {
+                    return .{ .mask_type = entry.mask };
+                }
             }
 
             if (self.engine.sam3) |sam| {
                 const mask = try sam.segment(self.allocator, self.frame, prompt);
-                self.cached_mask = mask;
+                try self.cached_masks.append(self.allocator, .{ .prompt = prompt, .mask = mask });
                 return .{ .mask_type = mask };
             }
 
@@ -354,7 +355,7 @@ pub const Engine = struct {
                 .width = self.frame.width,
                 .height = self.frame.height,
             };
-            self.cached_mask = dummy_mask;
+            try self.cached_masks.append(self.allocator, .{ .prompt = prompt, .mask = dummy_mask });
             return .{ .mask_type = dummy_mask };
         }
 
