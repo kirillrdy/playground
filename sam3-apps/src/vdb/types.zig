@@ -5,21 +5,12 @@ pub const BBox = struct {
     y: f32,
     w: f32,
     h: f32,
-
-    pub fn format(self: BBox, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("[{d:.2}, {d:.2}, {d:.2}, {d:.2}]", .{ self.x, self.y, self.w, self.h });
-    }
 };
 
 pub const Detection = struct {
-    class_id: u16 = 0,
     label: []const u8,
     conf: f32,
     bbox: BBox,
-
-    pub fn format(self: Detection, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("{s}({d:.2})@{s}", .{ self.label, self.conf, self.bbox });
-    }
 };
 
 pub const FrameRef = struct {
@@ -28,10 +19,6 @@ pub const FrameRef = struct {
     width: u32,
     height: u32,
     rgb: ?[*]const u8 = null,
-
-    pub fn format(self: FrameRef, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("Frame#{d}({d:.3}s, {d}x{d})", .{ self.index, self.pts_seconds, self.width, self.height });
-    }
 };
 
 pub const MaskRef = struct {
@@ -40,10 +27,6 @@ pub const MaskRef = struct {
     width: u32,
     height: u32,
     bytes: ?[]const u8 = null,
-
-    pub fn format(self: MaskRef, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("Mask(score={d:.2}, cov={d:.2}%)", .{ self.score, self.coverage * 100.0 });
-    }
 };
 
 pub const TypeTag = enum {
@@ -92,26 +75,6 @@ pub const Value = union(TypeTag) {
                 return false;
             },
             else => return false,
-        }
-    }
-
-    pub fn format(self: Value, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        switch (self) {
-            .null_type => try writer.writeAll("NULL"),
-            .bool_type => |b| try writer.print("{}", .{b}),
-            .int_type => |i| try writer.print("{d}", .{i}),
-            .float_type => |f| try writer.print("{d:.4}", .{f}),
-            .string_type => |s| try writer.print("'{s}'", .{s}),
-            .frame_type => |f| try f.format(fmt, options, writer),
-            .detections_type => |dets| {
-                try writer.writeAll("[");
-                for (dets, 0..) |d, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try d.format(fmt, options, writer);
-                }
-                try writer.writeAll("]");
-            },
-            .mask_type => |m| try m.format(fmt, options, writer),
         }
     }
 };
