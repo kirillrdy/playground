@@ -60,29 +60,6 @@ pub const QueryResult = struct {
         }
         self.allocator.free(self.rows);
     }
-
-    pub fn printTable(self: *const QueryResult, writer: anytype) !void {
-        // Print column headers
-        for (self.columns, 0..) |col, i| {
-            if (i > 0) try writer.writeAll(" | ");
-            try writer.print("{s}", .{col.name});
-        }
-        try writer.writeAll("\n");
-
-        for (self.columns, 0..) |_, i| {
-            if (i > 0) try writer.writeAll("-+-");
-            try writer.writeAll("-----------------");
-        }
-        try writer.writeAll("\n");
-
-        for (self.rows) |row| {
-            for (row.values, 0..) |val, i| {
-                if (i > 0) try writer.writeAll(" | ");
-                try val.format("", .{}, writer);
-            }
-            try writer.writeAll("\n");
-        }
-    }
 };
 
 pub const RowCallback = struct {
@@ -310,7 +287,7 @@ pub const Engine = struct {
                 var it = idx.classes.iterator();
                 while (it.next()) |entry| {
                     const label = entry.key_ptr.*;
-                    for (entry.value_ptr.postings) |p| {
+                    for (entry.value_ptr.*) |p| {
                         if (p.frame_idx == self.frame.index) {
                             try frame_dets.append(self.allocator, .{
                                 .label = label,

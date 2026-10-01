@@ -1,7 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
 const BBox = types.BBox;
-const Detection = types.Detection;
 
 pub const IndexMagic = "VDB_YOLO";
 pub const IndexMagicSam = "VDB_SAM3";
@@ -14,17 +13,10 @@ pub const Posting = struct {
     bbox: BBox,
 };
 
-pub const ClassIndex = struct {
-    label: []const u8,
-    postings: []const Posting,
-    /// Bitset of frame indices that contain this class
-    bitset: std.DynamicBitSetUnmanaged,
-};
-
 pub const InvertedIndex = struct {
     allocator: std.mem.Allocator,
     frame_count: u32,
-    classes: std.StringHashMapUnmanaged(ClassIndex),
+    classes: std.StringHashMapUnmanaged([]const Posting),
 
     pub fn init(allocator: std.mem.Allocator, frame_count: u32) InvertedIndex {
         return .{
@@ -38,8 +30,7 @@ pub const InvertedIndex = struct {
         var it = self.classes.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.postings);
-            entry.value_ptr.bitset.deinit(self.allocator);
+            self.allocator.free(entry.value_ptr.*);
         }
         self.classes.deinit(self.allocator);
     }
@@ -49,17 +40,7 @@ pub const InvertedIndex = struct {
         var it = self.classes.iterator();
         while (it.next()) |entry| {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, label)) {
-                return entry.value_ptr.postings;
-            }
-        }
-        return null;
-    }
-
-    pub fn getBitset(self: *const InvertedIndex, label: []const u8) ?*const std.DynamicBitSetUnmanaged {
-        var it = self.classes.iterator();
-        while (it.next()) |entry| {
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, label)) {
-                return &entry.value_ptr.bitset;
+                return entry.value_ptr.*;
             }
         }
         return null;
@@ -89,8 +70,8 @@ pub const InvertedIndex = struct {
 
         var it = self.classes.iterator();
         while (it.next()) |entry| {
-            total_detections += @intCast(entry.value_ptr.postings.len);
-            total_size += 2 + entry.key_ptr.len + 4 + entry.value_ptr.postings.len * 28;
+            total_detections += @intCast(entry.value_ptr.*.len);
+            total_size += 2 + entry.key_ptr.len + 4 + entry.value_ptr.*.len * 28;
         }
 
         const out = try allocator.alloc(u8, total_size);
@@ -122,7 +103,7 @@ pub const InvertedIndex = struct {
             @memcpy(out[offset .. offset + label.len], label);
             offset += label.len;
 
-            const postings = entry.value_ptr.postings;
+            const postings = entry.value_ptr.*;
             std.mem.writeInt(u32, out[offset..][0..4], @intCast(postings.len), .little);
             offset += 4;
 
@@ -197,9 +178,6 @@ pub const InvertedIndex = struct {
             const postings = try allocator.alloc(Posting, postings_count);
             errdefer allocator.free(postings);
 
-            var bitset = try std.DynamicBitSetUnmanaged.initEmpty(allocator, frame_count);
-            errdefer bitset.deinit(allocator);
-
             var p_idx: u32 = 0;
             while (p_idx < postings_count) : (p_idx += 1) {
                 if (offset + 28 > bytes.len) return error.UnexpectedEof;
@@ -236,30 +214,22 @@ pub const InvertedIndex = struct {
                         .h = @bitCast(h_bits),
                     },
                 };
-
-                if (f_idx < frame_count) {
-                    bitset.set(f_idx);
-                }
             }
 
-            try index.classes.put(allocator, label, .{
-                .label = label,
-                .postings = postings,
-                .bitset = bitset,
-            });
+            try index.classes.put(allocator, label, postings);
         }
 
         return index;
     }
 
-const c_io = struct {
-    extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
-    extern "c" fn close(fd: c_int) c_int;
-    extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-    extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-    extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
-    extern "c" fn unlink(path: [*:0]const u8) c_int;
-};
+    const c_io = struct {
+        extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+        extern "c" fn close(fd: c_int) c_int;
+        extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+        extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+        extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
+        extern "c" fn unlink(path: [*:0]const u8) c_int;
+    };
 
     pub fn saveToFile(self: *const InvertedIndex, path: []const u8) !void {
         const bytes = try self.serialize(self.allocator);
@@ -346,7 +316,7 @@ pub const IndexBuilder = struct {
     pub fn importIndex(self: *IndexBuilder, existing: *const InvertedIndex) !void {
         var it = existing.classes.iterator();
         while (it.next()) |entry| {
-            for (entry.value_ptr.postings) |p| {
+            for (entry.value_ptr.*) |p| {
                 try self.addDetection(p.frame_idx, p.pts_ms, entry.key_ptr.*, p.conf, p.bbox);
             }
         }
@@ -393,20 +363,7 @@ pub const IndexBuilder = struct {
             const postings_slice = try self.allocator.dupe(Posting, entry.value_ptr.items);
             errdefer self.allocator.free(postings_slice);
 
-            var bitset = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.frame_count);
-            errdefer bitset.deinit(self.allocator);
-
-            for (postings_slice) |p| {
-                if (p.frame_idx < self.frame_count) {
-                    bitset.set(p.frame_idx);
-                }
-            }
-
-            try index.classes.put(self.allocator, label_copy, .{
-                .label = label_copy,
-                .postings = postings_slice,
-                .bitset = bitset,
-            });
+            try index.classes.put(self.allocator, label_copy, postings_slice);
         }
 
         return index;

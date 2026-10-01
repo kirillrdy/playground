@@ -1,6 +1,5 @@
 const std = @import("std");
 const ast = @import("ast.zig");
-const types = @import("types.zig");
 const index_mod = @import("index.zig");
 
 pub const ScanStrategy = union(enum) {
