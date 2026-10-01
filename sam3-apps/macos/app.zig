@@ -19,6 +19,7 @@ const SamCallbacks = extern struct {
     on_clear_points: ?*const fn () callconv(.c) void,
     on_find_text: ?*const fn (text: [*:0]const u8) callconv(.c) void,
     on_cancel_query: ?*const fn () callconv(.c) void,
+    on_clear_query: ?*const fn () callconv(.c) void,
     on_canvas_click: ?*const fn (norm_x: f32, norm_y: f32, is_positive: c_int) callconv(.c) void,
     on_select_mask: ?*const fn (mask_index: c_int) callconv(.c) void,
 };
