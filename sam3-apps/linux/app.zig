@@ -8,6 +8,12 @@ const log = @import("log");
 const vdb = @import("vdb");
 const here = zimo.bind(@This(), @embedFile("app.zig"));
 
+fn getMonotonicMs() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
+
 const VideoFrame = extern struct { rgb: ?[*]u8, width: c_int, height: c_int, pts_seconds: f64 };
 extern fn sam_linux_video_open(path: [*:0]const u8, start: f64) ?*anyopaque;
 extern fn sam_linux_video_duration(reader: *anyopaque) f64;
@@ -202,6 +208,8 @@ pub const App = struct {
     search_caret: usize = 0,
     search_scroll: usize = 0,
     search_anchor: ?usize = null,
+    repeat_key: ?u32 = null,
+    repeat_next_ms: i64 = 0,
     browser_open: bool = false,
     browser_path: [4096]u8 = undefined,
     browser_path_len: usize = 0,
@@ -321,8 +329,20 @@ pub const App = struct {
                 try self.client.commitFrame();
             }
 
+            // Calculate poll timeout based on next repeat event
+            var timeout_ms: i32 = 16;
+            if (self.repeat_key) |_| {
+                const now = getMonotonicMs();
+                if (now >= self.repeat_next_ms) {
+                    timeout_ms = 0;
+                } else {
+                    const remaining: i64 = self.repeat_next_ms - now;
+                    timeout_ms = @intCast(@min(@as(i64, 16), remaining));
+                }
+            }
+
             // Poll events with timeout
-            const ev_opt = try self.client.pollEvent(16);
+            const ev_opt = try self.client.pollEvent(timeout_ms);
             if (ev_opt) |ev| {
                 switch (ev) {
                     .close => break,
@@ -342,6 +362,7 @@ pub const App = struct {
                         }
                     },
                     .pointer_button => |btn| {
+                        self.repeat_key = null;
                         if (btn.state == 1) { // Pressed
                             if (try self.handlePointerClick(btn.x, btn.y, btn.button, btn.serial)) {
                                 break;
@@ -350,10 +371,46 @@ pub const App = struct {
                         }
                     },
                     .keyboard_key => |k| {
-                        self.handleKey(k.key, k.state);
-                        if (k.state == 1) self.redraw_pending.store(true, .release);
+                        if (k.state == 1) {
+                            self.handleKey(k.key, 1);
+                            self.redraw_pending.store(true, .release);
+                            if (self.isRepeatableKey(k.key) and self.client.repeat_rate > 0) {
+                                self.repeat_key = k.key;
+                                const now = getMonotonicMs();
+                                const delay: i64 = @intCast(self.client.repeat_delay);
+                                self.repeat_next_ms = now + delay;
+                            } else {
+                                self.repeat_key = null;
+                            }
+                        } else {
+                            self.handleKey(k.key, 0);
+                            if (self.repeat_key) |rk| {
+                                if (rk == k.key) {
+                                    self.repeat_key = null;
+                                }
+                            }
+                        }
+                    },
+                    .keyboard_leave => {
+                        self.repeat_key = null;
                     },
                     .pointer_motion => |motion| try self.updateCursor(motion.x, motion.y),
+                }
+            }
+
+            // Check if key repeat timer has expired
+            if (self.repeat_key) |rk| {
+                const now = getMonotonicMs();
+                if (now >= self.repeat_next_ms) {
+                    if (self.isRepeatableKey(rk) and self.client.repeat_rate > 0) {
+                        self.handleKey(rk, 1);
+                        self.redraw_pending.store(true, .release);
+                        const rate: i64 = @max(1, @as(i64, self.client.repeat_rate));
+                        const interval: i64 = @max(1, @divTrunc(@as(i64, 1000), rate));
+                        self.repeat_next_ms = now + interval;
+                    } else {
+                        self.repeat_key = null;
+                    }
                 }
             }
         }
@@ -787,6 +844,23 @@ pub const App = struct {
         }
         self.search_caret = @min(pos, self.search_len);
         self.adjustSearchScroll();
+    }
+
+    fn isRepeatableKey(self: *const App, key: u32) bool {
+        if (self.browser_open) {
+            if (key == 14) return true; // Backspace
+            if (key == 103 or key == 108) return true; // Up / Down
+            if (!self.ctrl_down and evdevToChar(key, self.shift_down, self.caps_lock) != null) return true;
+            return false;
+        }
+        if (self.search_focused) {
+            if (!self.ctrl_down and (key == 14 or key == 111)) return true; // Backspace / Delete
+            if (key == 105 or key == 106) return true; // Left / Right
+            if (key == 28 and (self.shift_down or self.alt_down)) return true; // Shift/Alt+Enter (newline)
+            if (!self.ctrl_down and evdevToChar(key, self.shift_down, self.caps_lock) != null) return true;
+            return false;
+        }
+        return false;
     }
 
     fn handleKey(self: *App, key: u32, state: u32) void {

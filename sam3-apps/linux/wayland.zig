@@ -4,6 +4,7 @@ pub const WaylandEvent = union(enum) {
     pointer_motion: struct { x: f32, y: f32 },
     pointer_button: struct { button: u32, state: u32, x: f32, y: f32, serial: u32 },
     keyboard_key: struct { key: u32, state: u32 },
+    keyboard_leave,
     configure: struct { width: u32, height: u32, maximized: bool = false },
     close,
 };
@@ -54,6 +55,8 @@ pub const WaylandClient = struct {
     xdg_toplevel_id: u32 = 0,
     pointer_id: u32 = 0,
     keyboard_id: u32 = 0,
+    repeat_rate: i32 = 25,
+    repeat_delay: i32 = 400,
 
     cursor_surface_id: u32 = 0,
     cursor_items: [std.meta.tags(Cursor).len]CursorData = undefined,
@@ -693,11 +696,25 @@ pub const WaylandClient = struct {
                 } };
             }
 
+            // Keyboard leave
+            if (id == self.keyboard_id and opcode == 2 and size >= 16) {
+                return .keyboard_leave;
+            }
+
             // Keyboard key
             if (id == self.keyboard_id and opcode == 3 and size >= 24) {
                 const key = std.mem.readInt(u32, msg_bytes[16..20], .little);
                 const state = std.mem.readInt(u32, msg_bytes[20..24], .little);
                 return .{ .keyboard_key = .{ .key = key, .state = state } };
+            }
+
+            // Keyboard repeat_info
+            if (id == self.keyboard_id and opcode == 5 and size >= 16) {
+                const rate = std.mem.readInt(i32, msg_bytes[8..12], .little);
+                const delay = std.mem.readInt(i32, msg_bytes[12..16], .little);
+                if (rate >= 0) self.repeat_rate = rate;
+                if (delay >= 0) self.repeat_delay = delay;
+                continue;
             }
         }
         return null;
