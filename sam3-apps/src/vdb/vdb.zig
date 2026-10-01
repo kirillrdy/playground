@@ -8,11 +8,14 @@ pub const index = @import("index.zig");
 pub const planner = @import("planner.zig");
 pub const engine = @import("engine.zig");
 pub const overlay = @import("overlay.zig");
+pub const query_tab = @import("query_tab.zig");
+
 pub const query_input = @import("query_input.zig");
 
 test {
     _ = overlay;
     _ = query_input;
+    _ = query_tab;
 }
 
 pub const Database = struct {
@@ -37,7 +40,13 @@ pub const Database = struct {
     }
 
     pub fn registerIndex(self: *Database, video_path: []const u8, idx: index.InvertedIndex) !void {
+        if (self.indexes.getPtr(video_path)) |existing| {
+            existing.deinit();
+            existing.* = idx;
+            return;
+        }
         const key = try self.allocator.dupe(u8, video_path);
+        errdefer self.allocator.free(key);
         try self.indexes.put(self.allocator, key, idx);
     }
 
@@ -498,4 +507,133 @@ test "vdb: sam3 index serialization and file load/save roundtrip" {
     try std.testing.expect(car_postings != null);
     try std.testing.expectEqual(@as(usize, 1), car_postings.?.len);
     try std.testing.expectEqual(@as(u32, 20), car_postings.?[0].frame_idx);
+}
+
+test "vdb: replacing a video index releases the previous index" {
+    const allocator = std.testing.allocator;
+    var db = Database.init(allocator);
+    defer db.deinit();
+    var builder = index.IndexBuilder.init(allocator);
+    defer builder.deinit();
+    try builder.addDetection(1, 33, "person", 0.9, .{ .x = 0, .y = 0, .w = 1, .h = 1 });
+    try db.registerIndex("video.mp4", try builder.build());
+    try builder.addDetection(2, 66, "person", 0.9, .{ .x = 0, .y = 0, .w = 1, .h = 1 });
+    try db.registerIndex("video.mp4", try builder.build());
+    try std.testing.expectEqual(@as(u32, 1), db.indexes.count());
+    try std.testing.expectEqual(@as(usize, 2), db.getIndex("video.mp4").?.lookup("person").?.len);
+}
+
+test "vdb: cancelling a background query does not interrupt a foreground query" {
+    const Worker = struct {
+        database: Database,
+        reader: MockReader = .{ .frames_total = 10 },
+        cancel: std.atomic.Value(bool) = .init(false),
+        started: std.atomic.Value(bool) = .init(false),
+        resume_query: std.atomic.Value(bool) = .init(false),
+        cancelled: bool = false,
+
+        fn onRow(ctx: *anyopaque, _: *const types.Row) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.started.store(true, .release);
+            while (!self.resume_query.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        fn run(self: *@This()) void {
+            defer self.started.store(true, .release);
+            var result = self.database.executeQuery(
+                "SELECT frame FROM 'background.mp4'",
+                self.reader.reader(),
+                &self.cancel,
+                .{ .ctx = self, .onRow = onRow },
+            ) catch |err| {
+                self.cancelled = err == error.QueryCancelled;
+                return;
+            };
+            result.deinit();
+        }
+    };
+
+    var worker = Worker{ .database = Database.init(std.testing.allocator) };
+    defer worker.database.deinit();
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        worker.resume_query.store(true, .release);
+        thread.join();
+    };
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+
+    // Change the foreground source while the background query is still streaming.
+    var foreground = Database.init(std.testing.allocator);
+    defer foreground.deinit();
+    var reader = MockReader{ .frames_total = 20 };
+    var result = try foreground.executeQuery(
+        "SELECT frame FROM 'foreground.mp4' WHERE frame_id = 8",
+        reader.reader(),
+        null,
+        null,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 8), result.rows[0].values[0].frame_type.index);
+
+    worker.cancel.store(true, .release);
+    worker.resume_query.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(worker.cancelled);
+}
+
+test "vdb: merged indexing jobs produce sorted unique candidate frames" {
+    const allocator = std.testing.allocator;
+    var earlier_job = index.IndexBuilder.init(allocator);
+    defer earlier_job.deinit();
+    const box: types.BBox = .{ .x = 0, .y = 0, .w = 1, .h = 1 };
+    try earlier_job.addDetection(100, 3300, "person", 0.9, box);
+    try earlier_job.addDetection(5, 165, "person", 0.8, box);
+    var existing = try earlier_job.build();
+    defer existing.deinit();
+
+    var later_job = index.IndexBuilder.init(allocator);
+    defer later_job.deinit();
+    try later_job.addDetection(1, 33, "person", 0.9, box);
+    try later_job.addDetection(5, 165, "person", 0.95, box);
+    try later_job.addDetection(2, 66, "dog", 0.9, box);
+    try later_job.importIndex(&existing);
+    var merged = try later_job.build();
+    defer merged.deinit();
+    const frames = try merged.getMatchingFrames(allocator, "person", 0.4);
+    defer allocator.free(frames);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 5, 100 }, frames);
+    try std.testing.expectEqual(@as(usize, 1), merged.lookup("dog").?.len);
+}
+
+test "vdb: frame-only shorthand filters by SAM 3 without selecting an overlay" {
+    const allocator = std.testing.allocator;
+    const sql = try query_input.normalize(allocator, "select frame where sam3(frame, \"hat\" ) > 0.9", "video.mp4");
+    defer allocator.free(sql);
+    const prompts = try overlay.Prompts.fromSql(allocator, sql);
+    try std.testing.expectEqual(@as(usize, 0), prompts.count);
+
+    const Segmenter = struct {
+        fn segment(_: *anyopaque, _: std.mem.Allocator, frame: types.FrameRef, prompt: []const u8) anyerror!types.MaskRef {
+            try std.testing.expectEqualStrings("hat", prompt);
+            return .{
+                .score = if (frame.index == 1) 0.95 else 0.85,
+                .coverage = 0.2,
+                .width = frame.width,
+                .height = frame.height,
+            };
+        }
+    };
+    var reader = MockReader{ .frames_total = 3 };
+    var db = Database.init(allocator);
+    defer db.deinit();
+    db.engine_inst.sam3 = .{ .ptr = &reader, .segmentFn = Segmenter.segment };
+    var result = try db.executeQuery(sql, reader.reader(), null, null);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), result.rows[0].values.len);
+    try std.testing.expectEqual(@as(usize, 1), result.rows[0].values[0].frame_type.index);
 }

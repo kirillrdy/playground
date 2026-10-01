@@ -22,30 +22,47 @@ is detected (otherwise OpenCL). Pass `-Dbackend=cuda` and optionally `-Dsm=sm_61
 Both apps cache image-and-text query results and text features by phrase
 in `.sam3-zimo` under the working directory. Repeating a query for the same
 image skips vision encoding and text lookup; using the same phrase on a different
-frame reuses the text features. Open a video, enter a word, and press
-**Find by Word** to process the current frame. On macOS, **Play** advances with
-inference on each frame, following video timestamps when inference is fast enough.
-On Linux, **Play** processes each frame before advancing when a word is set.
-Cached frames replay at the video's pace; uncached frames wait for inference.
-**Pre-cache Video** prepares masks for smooth replay. On Linux, opening or
-seeking shows a decoded frame with its cached mask, if available. Press
-**Find by Word** while paused to process the current frame. **Play** and
-**Pause** control playback, and Play after the end restarts it. Replaying the
-same video with the same word reuses cached frame results. On Linux, install
-`ffmpeg` and `ffprobe` on `PATH` to open videos.
+frame reuses the text features. On Linux, install `ffmpeg` and `ffprobe` on `PATH`
+to open videos.
 
-The video controls also include a timeline for seeking, **Restart**, and
-**Next Frame** for stepping while paused. On macOS, opening or seeking a video
-shows the decoded frame immediately; when a word is set, its mask appears after
-inference. On Linux, **Next Frame** processes the stepped frame.
-**Pre-cache Video** scans the entire video for the entered word and shows progress.
-On macOS, it shows frames processed and precise percentage progress. Both apps
-log scan progress to stdout about once a second.
-You can cancel the scan; completed frames remain cached. The scanned word becomes
-the playback query. Playback and seeking stay available during the scan: cached
-frames show masks, while frames still waiting for inference show the plain video.
-All returned masks appear together in distinct colors. Select a mask in the bar
-to make it more prominent while keeping the others visible.
+Use **Open…** to select an image or video; the app detects the file type.
+Enter SQL in the query box and press **Run Query**. Create a visual index with:
+
+```sql
+CREATE INDEX ON "video.mp4" USING sam3("person");
+```
+
+This scans the entire video, caches masks, and saves matching frames and confidence
+scores to `video.mp4.vdb`. Existing indexes are loaded when the video opens.
+Progress appears during indexing. **Cancel Query** stops the scan after the current
+frame; cached masks remain, but the new index is saved only when the scan completes.
+
+Query the indexed video with:
+
+```sql
+SELECT frame, sam3(frame, "person") AS mask
+FROM "video.mp4"
+WHERE sam3(frame, "person") > 0.4;
+```
+
+Queries and SQL indexing run in the background. You can open another image or
+video while a job continues; its source video, cached masks, and matches stay
+separate from the displayed file. Reopen the source video to browse its matches.
+Each SQL query opens its own tab with its SQL, matches, status, and cancellation
+control. You can edit the input and press **Run Query** to start another query while
+earlier tabs continue. Select a tab to show its video and results. **Cancel Query**
+stops only the selected tab. Model inference is shared and runs one call at a time.
+Closing the app cancels and joins all workers before releasing the model.
+
+Masks appear only for `sam3(...)` expressions in `SELECT`. A query such as
+`SELECT frame WHERE sam3(frame, "hat") > 0.9` filters using SAM 3 and displays
+the matching frames without overlays.
+
+The video controls include **Play/Pause**, a timeline for seeking, **Restart**, and
+**Next Frame** (or **Next Match** for query results). Playback and seeking stay
+available during indexing. Cached frames show masks; frames waiting for inference
+show the plain video. All returned masks appear together in distinct colors.
+Select a mask in the bar to make it more prominent while keeping the others visible.
 
 For an original PyTorch SAM 3 comparison on Intel GPUs, see the
 [Python benchmark and Nix environment](benchmarks/sam3-python/README.md).
