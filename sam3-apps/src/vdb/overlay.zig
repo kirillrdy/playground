@@ -45,9 +45,6 @@ pub const Prompts = struct {
         var result: Prompts = .{};
         if (stmt == .select_stmt) {
             for (stmt.select_stmt.projections) |projection| try result.collect(projection.expr);
-            if (result.count == 0) {
-                if (stmt.select_stmt.where_clause) |expr| try result.collect(expr);
-            }
         }
         return result;
     }
@@ -64,13 +61,15 @@ test "overlay prompts follow projections with mixed SQL quoting" {
     try std.testing.expectEqualStrings("glasses", prompts.get(1));
 }
 
-test "overlay prompts deduplicate and fall back to predicates" {
+test "overlay prompts deduplicate selected masks and ignore predicate masks" {
     const prompts = try Prompts.fromSql(std.testing.allocator,
-        \\SELECT frame FROM 'video.mp4'
-        \\WHERE sam3(frame, "person") > 0.4 AND sam3(frame, 'person') > 0.5
+        \\SELECT frame, sam3(frame, 'person'), sam3(frame, 'person') FROM 'video.mp4'
+        \\WHERE sam3(frame, "hat") > 0.9
     );
     try std.testing.expectEqual(@as(usize, 1), prompts.count);
     try std.testing.expectEqualStrings("person", prompts.get(0));
-    const plain = try Prompts.fromSql(std.testing.allocator, "SELECT frame FROM 'video.mp4'");
+    const plain = try Prompts.fromSql(std.testing.allocator,
+        \\SELECT frame FROM 'video.mp4' WHERE sam3(frame, "hat") > 0.9
+    );
     try std.testing.expectEqual(@as(usize, 0), plain.count);
 }

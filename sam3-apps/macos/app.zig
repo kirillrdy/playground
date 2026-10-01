@@ -5,6 +5,7 @@ const zigimg = @import("zigimg");
 const zimo = @import("zimo");
 const log = @import("log");
 const vdb = @import("vdb");
+const QueryTab = vdb.query_tab.QueryTab;
 const here = zimo.bind(@This(), @embedFile("app.zig"));
 
 const SamCallbacks = extern struct {
@@ -13,13 +14,13 @@ const SamCallbacks = extern struct {
     on_video_play_pause: ?*const fn () callconv(.c) void,
     on_video_seek: ?*const fn (seconds: f64) callconv(.c) void,
     on_video_step: ?*const fn () callconv(.c) void,
-    on_precache_video: ?*const fn (text: [*:0]const u8) callconv(.c) void,
     on_sample_click: ?*const fn () callconv(.c) void,
     on_mode_change: ?*const fn (mode: c_int) callconv(.c) void,
     on_clear_points: ?*const fn () callconv(.c) void,
     on_find_text: ?*const fn (text: [*:0]const u8) callconv(.c) void,
     on_cancel_query: ?*const fn () callconv(.c) void,
     on_clear_query: ?*const fn () callconv(.c) void,
+    on_select_query: ?*const fn (index: usize) callconv(.c) void,
     on_canvas_click: ?*const fn (norm_x: f32, norm_y: f32, is_positive: c_int) callconv(.c) void,
     on_select_mask: ?*const fn (mask_index: c_int) callconv(.c) void,
 };
@@ -68,6 +69,8 @@ extern fn sam_macos_set_video_mode(active: c_int, playing: c_int) void;
 extern fn sam_macos_set_video_timeline(duration: f64, position: f64) void;
 extern fn sam_macos_set_precache_progress(state: c_int, fraction: f64, frames: usize) void;
 extern fn sam_macos_set_query_active(active: c_int) void;
+extern fn sam_macos_set_query_tabs(labels: [*:0]const u8, selected: c_int) void;
+extern fn sam_macos_set_query_text(sql: [*:0]const u8) void;
 extern fn sam_macos_video_open(path: [*:0]const u8, start_seconds: f64) ?*anyopaque;
 extern fn sam_macos_video_duration(reader: *anyopaque) f64;
 extern fn sam_macos_video_next(reader: *anyopaque, frame: *VideoFrame) c_int;
@@ -169,6 +172,7 @@ pub const App = struct {
 
     mutex: std.Io.Mutex = .init,
     model_mutex: std.Io.Mutex = .init,
+    index_mutex: std.Io.Mutex = .init,
     is_busy: bool = false,
 
     image: ?zigimg.Image = null,
@@ -196,19 +200,8 @@ pub const App = struct {
     video_previewed: bool = false,
     video_seek_target: ?f64 = null,
     video_step_requested: bool = false,
-    precache_thread: ?std.Thread = null,
-    precache_active: std.atomic.Value(bool) = .init(false),
-    precache_cancel: std.atomic.Value(bool) = .init(false),
-    precache_phrase: [256]u8 = undefined,
-    precache_phrase_len: usize = 0,
-    precache_scanned_until: f64 = -1,
-
-    vdb_database: vdb.Database,
-    query_matches: std.ArrayList(u32) = .empty,
-    query_match_idx: usize = 0,
-    query_thread: ?std.Thread = null,
-    query_active: std.atomic.Value(bool) = .init(false),
-    query_cancel: std.atomic.Value(bool) = .init(false),
+    query_tabs: std.ArrayList(*QueryTab) = .empty,
+    selected_query: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model, example_path: []const u8) App {
         return .{
@@ -216,14 +209,18 @@ pub const App = struct {
             .io = io,
             .model = model,
             .example_path = example_path,
-            .vdb_database = vdb.Database.init(allocator),
         };
     }
 
     pub fn deinit(self: *App) void {
+        for (self.query_tabs.items) |tab| tab.query_cancel.store(true, .release);
+        for (self.query_tabs.items) |tab| {
+            if (tab.query_thread) |thread| thread.join();
+            tab.query_thread = null;
+        }
         self.stopVideo();
-        self.vdb_database.deinit();
-        self.query_matches.deinit(self.allocator);
+        for (self.query_tabs.items) |tab| tab.deinit();
+        self.query_tabs.deinit(self.allocator);
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
@@ -242,13 +239,13 @@ pub const App = struct {
             .on_video_play_pause = &cVideoPlayPause,
             .on_video_seek = &cVideoSeek,
             .on_video_step = &cVideoStep,
-            .on_precache_video = &cPrecacheVideo,
             .on_sample_click = &cSampleClick,
             .on_mode_change = &cModeChange,
             .on_clear_points = &cClearPoints,
             .on_find_text = &cFindText,
             .on_cancel_query = &cCancelQuery,
             .on_clear_query = &cClearQuery,
+            .on_select_query = &cSelectQuery,
             .on_canvas_click = &cCanvasClick,
             .on_select_mask = &cSelectMask,
         };
@@ -264,6 +261,7 @@ pub const App = struct {
     }
 
     fn openImageFromPath(self: *App, path: []const u8) void {
+        if (self.is_busy) return;
         self.stopVideo();
         const file_bytes = std.Io.Dir.cwd().readFileAlloc(
             self.io,
@@ -322,14 +320,10 @@ pub const App = struct {
 
     fn stopVideo(self: *App) void {
         self.video_stop.store(true, .release);
-        self.precache_cancel.store(true, .release);
-        self.query_cancel.store(true, .release);
         if (self.video_thread) |thread| thread.join();
-        if (self.precache_thread) |thread| thread.join();
-        if (self.query_thread) |thread| thread.join();
         self.video_thread = null;
-        self.precache_thread = null;
-        self.query_thread = null;
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
         if (self.video_path) |path| self.allocator.free(path);
         self.video_path = null;
         self.video_active = false;
@@ -341,30 +335,25 @@ pub const App = struct {
         self.video_previewed = false;
         self.video_seek_target = null;
         self.video_step_requested = false;
-        self.precache_active.store(false, .release);
-        self.precache_phrase_len = 0;
-        self.precache_scanned_until = -1;
-        self.query_active.store(false, .release);
-        self.query_matches.clearRetainingCapacity();
-        self.query_match_idx = 0;
         sam_macos_set_video_mode(0, 0);
         sam_macos_set_video_timeline(0, 0);
-        sam_macos_set_precache_progress(0, 0, 0);
-        sam_macos_set_query_active(0);
         sam_macos_set_window_title("SAM 3 — Visual Database");
     }
 
     fn openVideoFromPath(self: *App, path: []const u8) void {
         if (self.is_busy) return;
         self.stopVideo();
-        self.video_path = self.allocator.dupeZ(u8, path) catch {
+        const owned = self.allocator.dupeZ(u8, path) catch {
             sam_macos_set_status("Out of memory opening video.");
             return;
         };
+        self.mutex.lock(self.io) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.video_path = owned;
         self.video_stop.store(false, .release);
-        self.precache_cancel.store(false, .release);
         self.video_active = true;
-        self.mutex.lock(self.io) catch return;
         self.video_seek_target = 0;
         if (self.image) |*old| old.deinit(self.allocator);
         self.image = null;
@@ -375,6 +364,7 @@ pub const App = struct {
         self.points_len = 0;
         self.selected_mask = -1;
         self.best_mask_idx = -1;
+        self.restoreQueryOverlay();
         self.mutex.unlock(self.io);
         sam_macos_set_image(null, 0, 0);
         sam_macos_set_masks(0, null, 0, -1);
@@ -391,11 +381,10 @@ pub const App = struct {
         var indexed_concepts_count: usize = 0;
         if (std.fmt.allocPrint(self.allocator, "{s}.vdb", .{path})) |sidecar| {
             defer self.allocator.free(sidecar);
-            if (vdb.index.InvertedIndex.loadFromFile(self.allocator, sidecar)) |loaded_idx| {
+            if (vdb.index.InvertedIndex.loadFromFile(self.allocator, sidecar)) |loaded| {
+                var loaded_idx = loaded;
+                defer loaded_idx.deinit();
                 indexed_concepts_count = loaded_idx.classes.count();
-                self.vdb_database.registerIndex(path, loaded_idx) catch |err| {
-                    log.info(self.io, "Failed to register loaded index: {t}", .{err});
-                };
                 index_loaded = true;
                 log.info(self.io, "Auto-loaded visual index for \"{s}\" ({d} concepts) from {s}", .{ path, indexed_concepts_count, sidecar });
             } else |_| {}
@@ -409,9 +398,11 @@ pub const App = struct {
             sam_macos_set_status("Video opened. Enter a word or SQL query and press Find/Query.");
         }
         self.video_thread = std.Thread.spawn(.{}, runVideoWorker, .{self}) catch {
+            self.mutex.lock(self.io) catch return;
             self.allocator.free(self.video_path.?);
             self.video_path = null;
             self.video_active = false;
+            self.mutex.unlock(self.io);
             sam_macos_set_video_mode(0, 0);
             sam_macos_set_status("Could not start video playback.");
             return;
@@ -422,7 +413,7 @@ pub const App = struct {
         if (!self.video_active) return;
         self.mutex.lock(self.io) catch return;
         const has_phrase = self.video_phrase_len > 0;
-        const has_matches = self.query_matches.items.len > 0;
+        const has_matches = self.isQueryVideo() and self.queryMatches().len > 0;
         self.mutex.unlock(self.io);
         if (!has_phrase and !has_matches) {
             sam_macos_set_status("Enter a visual query or concept before playing video.");
@@ -441,13 +432,13 @@ pub const App = struct {
     fn handleVideoSeek(self: *App, seconds: f64) void {
         if (!self.video_active or !std.math.isFinite(seconds)) return;
         self.mutex.lock(self.io) catch return;
-        if (seconds == 0 and self.query_matches.items.len > 0) {
-            self.query_match_idx = 0;
-            const target_frame = self.query_matches.items[0];
+        if (seconds == 0 and self.isQueryVideo() and self.queryMatches().len > 0) {
+            self.selectedTab().?.query_match_idx = 0;
+            const target_frame = self.queryMatches()[0];
             const target_sec = @as(f64, @floatFromInt(target_frame)) * 0.0333;
             self.video_seek_target = target_sec;
             self.video_step_requested = true;
-            const total = self.query_matches.items.len;
+            const total = self.queryMatches().len;
             self.mutex.unlock(self.io);
             var buf: [160]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "Restarted at query match 1 of {d} (Frame #{d} at {d:.2}s).", .{ total, target_frame, target_sec }) catch "Query match 1.";
@@ -459,10 +450,10 @@ pub const App = struct {
         self.video_seek_target = target;
         self.video_step_requested = true;
 
-        if (self.query_matches.items.len > 0) {
+        if (self.isQueryVideo() and self.queryMatches().len > 0) {
             var closest_idx: usize = 0;
             var closest_diff: f64 = 1e9;
-            for (self.query_matches.items, 0..) |f, i| {
+            for (self.queryMatches(), 0..) |f, i| {
                 const f_sec = @as(f64, @floatFromInt(f)) * 0.0333;
                 const diff = @abs(f_sec - target);
                 if (diff < closest_diff) {
@@ -470,7 +461,7 @@ pub const App = struct {
                     closest_idx = i;
                 }
             }
-            self.query_match_idx = closest_idx;
+            self.selectedTab().?.query_match_idx = closest_idx;
         }
 
         self.mutex.unlock(self.io);
@@ -480,14 +471,14 @@ pub const App = struct {
     fn handleVideoStep(self: *App) void {
         if (!self.video_active or self.video_playing.load(.acquire)) return;
         self.mutex.lock(self.io) catch return;
-        if (self.query_matches.items.len > 0) {
-            self.query_match_idx = (self.query_match_idx + 1) % self.query_matches.items.len;
-            const target_frame = self.query_matches.items[self.query_match_idx];
+        if (self.isQueryVideo() and self.queryMatches().len > 0) {
+            self.selectedTab().?.query_match_idx = (self.selectedTab().?.query_match_idx + 1) % self.queryMatches().len;
+            const target_frame = self.queryMatches()[self.selectedTab().?.query_match_idx];
             const target_sec = @as(f64, @floatFromInt(target_frame)) * 0.0333;
             self.video_seek_target = target_sec;
             self.video_step_requested = true;
-            const match_num = self.query_match_idx + 1;
-            const total = self.query_matches.items.len;
+            const match_num = self.selectedTab().?.query_match_idx + 1;
+            const total = self.queryMatches().len;
             self.mutex.unlock(self.io);
             var buf: [160]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "Query match {d} of {d} (Frame #{d} at {d:.2}s).", .{ match_num, total, target_frame, target_sec }) catch "Next query match.";
@@ -503,54 +494,6 @@ pub const App = struct {
         }
         self.video_playing.store(false, .release);
         sam_macos_set_video_mode(1, 0);
-    }
-
-    fn handlePrecacheVideo(self: *App, text: [*:0]const u8) void {
-        if (!self.video_active) return;
-        if (self.precache_active.load(.acquire)) {
-            self.precache_cancel.store(true, .release);
-            sam_macos_set_status("Cancelling indexing after this frame…");
-            return;
-        }
-        if (self.precache_thread) |thread| {
-            thread.join();
-            self.precache_thread = null;
-        }
-        const phrase = std.mem.span(text);
-        if (phrase.len == 0) {
-            sam_macos_set_status("Enter a visual concept to create index for this video.");
-            return;
-        }
-        self.mutex.lock(self.io) catch return;
-        self.precache_phrase_len = @min(phrase.len, self.precache_phrase.len);
-        @memcpy(self.precache_phrase[0..self.precache_phrase_len], phrase[0..self.precache_phrase_len]);
-        self.video_overlay_prompts = .{};
-        self.video_phrase_len = self.precache_phrase_len;
-        @memcpy(self.video_phrase[0..self.video_phrase_len], self.precache_phrase[0..self.precache_phrase_len]);
-        self.precache_cancel.store(false, .release);
-        self.precache_scanned_until = -1;
-        self.precache_active.store(true, .release);
-        self.mutex.unlock(self.io);
-        sam_macos_set_precache_progress(1, 0, 0);
-        sam_macos_set_status("Creating visual index for video frames…");
-        self.precache_thread = std.Thread.spawn(.{}, runPrecacheWorker, .{self}) catch {
-            self.precache_active.store(false, .release);
-            sam_macos_set_precache_progress(0, 0, 0);
-            sam_macos_set_status("Could not start visual index creation.");
-            return;
-        };
-    }
-
-    fn runPrecacheWorker(self: *App) void {
-        self.runPrecache(self.precache_phrase[0..self.precache_phrase_len]);
-        self.precache_active.store(false, .release);
-        sam_macos_set_precache_progress(2, 0, 0);
-        if (!self.video_stop.load(.acquire) and !self.video_playing.load(.acquire)) {
-            self.mutex.lock(self.io) catch return;
-            self.video_seek_target = self.video_position;
-            self.video_step_requested = true;
-            self.mutex.unlock(self.io);
-        }
     }
 
     fn runVideoWorker(self: *App) void {
@@ -643,11 +586,12 @@ pub const App = struct {
 
             var phrase_buf: [256]u8 = undefined;
             self.mutex.lock(self.io) catch return;
+            const has_query_matches = self.queryMatches().len > 0;
             const overlay_prompts = self.video_overlay_prompts;
             const phrase_len = self.video_phrase_len;
             @memcpy(phrase_buf[0..phrase_len], self.video_phrase[0..phrase_len]);
             self.mutex.unlock(self.io);
-            if (phrase_len == 0 and overlay_prompts.count == 0 and !step and seek == null) continue;
+            if (phrase_len == 0 and overlay_prompts.count == 0 and !has_query_matches and !step and seek == null) continue;
             const phrase = phrase_buf[0..phrase_len];
 
             const started = std.Io.Timestamp.now(self.io, .awake);
@@ -723,7 +667,9 @@ pub const App = struct {
                 position_ms % 1_000,
             }) catch "0:00.000";
             var status_buf: [256]u8 = undefined;
-            const status = if (self.masks != null)
+            const status = if (phrase_len == 0 and overlay_prompts.count == 0)
+                std.fmt.bufPrintZ(&status_buf, "At {s}: frame shown.", .{timecode}) catch "Frame shown."
+            else if (self.masks != null)
                 std.fmt.bufPrintZ(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{
                     timecode, mask_count, phrase, lookup_elapsed,
                 }) catch "Video frame processed."
@@ -737,18 +683,18 @@ pub const App = struct {
             // If video playback is running and query results exist, advance through matched frames!
             if (self.video_playing.load(.acquire)) {
                 self.mutex.lock(self.io) catch return;
-                const total_matches = self.query_matches.items.len;
+                const total_matches = if (self.isQueryVideo()) self.queryMatches().len else 0;
                 if (total_matches > 0) {
-                    if (self.query_match_idx + 1 < total_matches) {
-                        self.query_match_idx += 1;
+                    if (self.selectedTab().?.query_match_idx + 1 < total_matches) {
+                        self.selectedTab().?.query_match_idx += 1;
                     } else {
-                        self.query_match_idx = 0;
+                        self.selectedTab().?.query_match_idx = 0;
                     }
-                    const next_match_frame = self.query_matches.items[self.query_match_idx];
+                    const next_match_frame = self.queryMatches()[self.selectedTab().?.query_match_idx];
                     const next_sec = @as(f64, @floatFromInt(next_match_frame)) * 0.0333;
                     self.video_seek_target = next_sec;
                     self.video_step_requested = true;
-                    const cur_num = self.query_match_idx + 1;
+                    const cur_num = self.selectedTab().?.query_match_idx + 1;
                     self.mutex.unlock(self.io);
 
                     std.Io.sleep(self.io, .fromMilliseconds(250), .awake) catch {};
@@ -765,7 +711,7 @@ pub const App = struct {
         }
     }
 
-    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8, pts: f64) !?[]f32 {
+    fn cachedFrameQuery(self: *App, image: sam3.RgbImage, phrase: []const u8) ![]f32 {
         const args = .{
             self.allocator,
             [_][]const u8{
@@ -780,17 +726,24 @@ pub const App = struct {
             phrase,
             @as(f32, 0.5),
         };
-        if (self.precache_active.load(.acquire)) {
-            self.mutex.lock(self.io) catch return error.VideoLockFailed;
-            const scanned_until = self.precache_scanned_until;
-            const scanned_phrase = std.mem.eql(u8, phrase, self.precache_phrase[0..self.precache_phrase_len]);
-            self.mutex.unlock(self.io);
-            if (!scanned_phrase or !std.math.isFinite(pts) or pts > scanned_until) return null;
-            return try here.call(.computeQuery, args);
+        return here.call(.computeQuery, args);
+    }
+
+    fn videoQuery(self: *App, image: sam3.RgbImage, phrase: []const u8, pts: f64) !?[]f32 {
+        self.mutex.lock(self.io) catch return error.VideoLockFailed;
+        if (self.selectedTab()) |tab| {
+            if (self.isQueryVideo() and tab.precache_active.load(.acquire)) {
+                const scanned_phrase = std.mem.eql(u8, phrase, tab.precache_phrase[0..tab.precache_phrase_len]);
+                if (!scanned_phrase or !std.math.isFinite(pts) or pts > tab.precache_scanned_until) {
+                    self.mutex.unlock(self.io);
+                    return null;
+                }
+            }
         }
+        self.mutex.unlock(self.io);
         self.model_mutex.lock(self.io) catch return error.ModelLockFailed;
         defer self.model_mutex.unlock(self.io);
-        return try here.call(.computeQuery, args);
+        return try self.cachedFrameQuery(image, phrase);
     }
 
     fn videoOverlayMasks(self: *App, image: sam3.RgbImage, phrase: []const u8, prompts: *const vdb.overlay.Prompts, pts: f64) !?sam3.Masks {
@@ -802,7 +755,10 @@ pub const App = struct {
             const values = (try self.videoQuery(image, prompt, pts)) orelse continue;
             defer self.allocator.free(values);
             var masks = unpackMasks(self.allocator, values) catch |err| {
-                if (self.precache_active.load(.acquire)) continue;
+                self.mutex.lock(self.io) catch return error.VideoLockFailed;
+                const indexing = if (self.selectedTab()) |tab| self.isQueryVideo() and tab.precache_active.load(.acquire) else false;
+                self.mutex.unlock(self.io);
+                if (indexing) continue;
                 return err;
             };
             if (combined) |*existing| {
@@ -845,7 +801,9 @@ pub const App = struct {
             .width = frame.width,
             .height = frame.height,
         };
-        const maybe_vals = try self.videoQuery(rgb_img, prompt, frame.pts_seconds);
+        self.model_mutex.lock(self.io) catch return error.ModelLockFailed;
+        defer self.model_mutex.unlock(self.io);
+        const maybe_vals: ?[]f32 = try self.cachedFrameQuery(rgb_img, prompt);
         if (maybe_vals) |vals| {
             defer self.allocator.free(vals);
             if (vals.len >= 4) {
@@ -865,9 +823,42 @@ pub const App = struct {
         return .{ .score = 0, .coverage = 0, .width = frame.width, .height = frame.height };
     }
 
-    fn runPrecache(self: *App, phrase: []const u8) void {
-        const reader = sam_macos_video_open(self.video_path.?.ptr, 0) orelse {
-            sam_macos_set_status("Could not decode video for pre-caching.");
+    fn saveVideoIndex(self: *App, tab: *QueryTab, builder: *vdb.index.IndexBuilder) !void {
+        try self.index_mutex.lock(self.io);
+        defer self.index_mutex.unlock(self.io);
+        const sidecar = try std.fmt.allocPrint(self.allocator, "{s}.vdb", .{tab.query_path.?});
+        defer self.allocator.free(sidecar);
+        if (vdb.index.InvertedIndex.loadFromFile(self.allocator, sidecar)) |loaded| {
+            var latest = loaded;
+            defer latest.deinit();
+            try builder.importIndex(&latest);
+        } else |_| {}
+        var built = try builder.build();
+        defer built.deinit();
+        try built.saveToFile(sidecar);
+    }
+
+    fn runPrecache(self: *App, tab: *QueryTab, source_path: [:0]const u8, phrase: []const u8) void {
+        self.mutex.lock(self.io) catch return;
+        if (tab.query_cancel.load(.acquire)) {
+            self.mutex.unlock(self.io);
+            return;
+        }
+        tab.precache_phrase_len = @min(phrase.len, tab.precache_phrase.len);
+        @memcpy(tab.precache_phrase[0..tab.precache_phrase_len], phrase[0..tab.precache_phrase_len]);
+        if (self.isSelectedQuery(tab)) {
+            self.video_overlay_prompts = .{};
+            self.video_phrase_len = tab.precache_phrase_len;
+            @memcpy(self.video_phrase[0..self.video_phrase_len], tab.precache_phrase[0..tab.precache_phrase_len]);
+        }
+        tab.precache_scanned_until = -1;
+        tab.precache_active.store(true, .release);
+        self.mutex.unlock(self.io);
+        defer tab.precache_active.store(false, .release);
+        self.refreshQueryTabs();
+        defer self.refreshQueryTabs();
+        const reader = sam_macos_video_open(source_path.ptr, 0) orelse {
+            self.setQueryStatus(tab, "Could not decode video for pre-caching.");
             return;
         };
         defer sam_macos_video_close(reader);
@@ -881,39 +872,27 @@ pub const App = struct {
         var index_builder = vdb.index.IndexBuilder.init(self.allocator);
         defer index_builder.deinit();
 
-        if (self.vdb_database.getIndex(self.video_path.?)) |existing| {
-            index_builder.importIndex(existing) catch |err| {
-                log.info(self.io, "Could not import existing index: {t}", .{err});
-            };
-        }
-
         log.info(self.io, "pre-caching and indexing video for \"{s}\" ({d:.2} s)", .{ phrase, duration });
-        while (!self.video_stop.load(.acquire) and !self.precache_cancel.load(.acquire)) {
+        while (!tab.query_cancel.load(.acquire)) {
             var frame: VideoFrame = .{ .rgb = null, .width = 0, .height = 0, .pts_seconds = 0 };
             const next = sam_macos_video_next(reader, &frame);
             if (next <= 0) {
                 if (next < 0) {
-                    sam_macos_set_status("Video decoding failed during pre-cache.");
+                    self.setQueryStatus(tab, "Video decoding failed during pre-cache.");
                 } else {
-                    if (index_builder.build()) |built_idx| {
-                        self.vdb_database.registerIndex(self.video_path.?, built_idx) catch |err| {
-                            log.info(self.io, "Failed to register index in database: {t}", .{err});
-                        };
-                        if (std.fmt.allocPrint(self.allocator, "{s}.vdb", .{self.video_path.?})) |sidecar| {
-                            defer self.allocator.free(sidecar);
-                            if (self.vdb_database.getIndex(self.video_path.?)) |reg_idx| {
-                                reg_idx.saveToFile(sidecar) catch |err| {
-                                    log.info(self.io, "Failed to save index to {s}: {t}", .{ sidecar, err });
-                                };
-                            }
-                        } else |_| {}
-                    } else |err| {
-                        log.info(self.io, "Failed to build inverted index: {t}", .{err});
-                    }
-                    sam_macos_set_precache_progress(1, 1, frames);
+                    self.saveVideoIndex(tab, &index_builder) catch |err| {
+                        log.info(self.io, "Could not save video index: {t}", .{err});
+                        self.setQueryStatus(tab, "Could not save video index.");
+                        return;
+                    };
+                    self.mutex.lock(self.io) catch return;
+                    tab.precache_progress = 1;
+                    tab.frames_processed = frames;
+                    self.mutex.unlock(self.io);
+                    self.refreshQueryTabs();
                     var status_buf: [200]u8 = undefined;
                     const status = std.fmt.bufPrintZ(&status_buf, "Pre-cached and indexed {d} frames for “{s}”. Saved to .vdb sidecar.", .{ frames, phrase }) catch "Video pre-cache complete.";
-                    sam_macos_set_status(status);
+                    self.setQueryStatus(tab, status);
                     log.info(self.io, "pre-cached and indexed {d} frames for \"{s}\" in {f}", .{ frames, phrase, started.untilNow(self.io, .awake) });
                 }
                 return;
@@ -924,12 +903,12 @@ pub const App = struct {
             const height: usize = @intCast(frame.height);
             const rgb_len = std.math.mul(usize, std.math.mul(usize, width, height) catch continue, 3) catch continue;
             const pixels = self.allocator.dupe(u8, frame.rgb.?[0..rgb_len]) catch {
-                sam_macos_set_status("Out of memory during video pre-cache.");
+                self.setQueryStatus(tab, "Out of memory during video pre-cache.");
                 return;
             };
             var decoded = zigimg.Image.fromRawPixelsOwned(width, height, pixels, .rgb24) catch {
                 self.allocator.free(pixels);
-                sam_macos_set_status("Could not prepare video frame for pre-cache.");
+                self.setQueryStatus(tab, "Could not prepare video frame for pre-cache.");
                 return;
             };
             defer decoded.deinit(self.allocator);
@@ -949,11 +928,15 @@ pub const App = struct {
             };
             const frame_started = std.Io.Timestamp.now(self.io, .awake);
             self.model_mutex.lock(self.io) catch return;
+            if (tab.query_cancel.load(.acquire)) {
+                self.model_mutex.unlock(self.io);
+                break;
+            }
             const result = here.call(.computeQuery, args);
             self.model_mutex.unlock(self.io);
             const values = result catch |err| {
                 log.info(self.io, "Video pre-cache failed at frame {d}: {t}: {s}", .{ frames, err, sam3.onnx.lastError() });
-                sam_macos_set_status("Video pre-cache inference failed.");
+                self.setQueryStatus(tab, "Video pre-cache inference failed.");
                 return;
             };
             defer self.allocator.free(values);
@@ -979,7 +962,7 @@ pub const App = struct {
             frames += 1;
             if (std.math.isFinite(frame.pts_seconds)) {
                 self.mutex.lock(self.io) catch return;
-                self.precache_scanned_until = @max(self.precache_scanned_until, frame.pts_seconds);
+                tab.precache_scanned_until = @max(tab.precache_scanned_until, frame.pts_seconds);
                 self.mutex.unlock(self.io);
             }
             if (duration > 0 and std.math.isFinite(frame.pts_seconds)) {
@@ -987,7 +970,11 @@ pub const App = struct {
             }
             const now = std.Io.Timestamp.now(self.io, .awake);
             if (frames == 1 or last_ui_update.untilNow(self.io, .awake).nanoseconds >= 100_000_000) {
-                sam_macos_set_precache_progress(1, fraction, frames);
+                self.mutex.lock(self.io) catch return;
+                tab.precache_progress = fraction;
+                tab.frames_processed = frames;
+                self.mutex.unlock(self.io);
+                self.refreshQueryTabs();
                 last_ui_update = now;
             }
             if (frames == 1 or last_log.untilNow(self.io, .awake).nanoseconds >= 1_000_000_000) {
@@ -997,8 +984,8 @@ pub const App = struct {
                 last_log = now;
             }
         }
-        if (!self.video_stop.load(.acquire)) {
-            sam_macos_set_status("Video pre-cache cancelled.");
+        if (tab.query_cancel.load(.acquire)) {
+            self.setQueryStatus(tab, "Video pre-cache cancelled.");
             log.info(self.io, "pre-cache cancelled after {d} frames", .{frames});
         }
     }
@@ -1031,6 +1018,12 @@ pub const App = struct {
     }
 
     fn runSegmentWorker(self: *App) void {
+        self.model_mutex.lock(self.io) catch {
+            self.is_busy = false;
+            sam_macos_set_busy(0);
+            return;
+        };
+        defer self.model_mutex.unlock(self.io);
         const started = std.Io.Timestamp.now(self.io, .awake);
 
         var embedding = self.ensureEmbedding(false) catch |err| {
@@ -1096,20 +1089,133 @@ pub const App = struct {
         return false;
     }
 
+    fn finishQueryStatus(self: *App, tab: *QueryTab) void {
+        self.mutex.lock(self.io) catch return;
+        const cancelling = std.mem.startsWith(u8, tab.status[0..tab.status_len], "Cancelling");
+        self.mutex.unlock(self.io);
+        if (cancelling) self.setQueryStatus(tab, "Query cancelled.");
+    }
+
+    fn setQueryStatus(self: *App, tab: *QueryTab, status: []const u8) void {
+        self.mutex.lock(self.io) catch return;
+        tab.status_len = @min(status.len, tab.status.len);
+        @memcpy(tab.status[0..tab.status_len], status[0..tab.status_len]);
+        if (self.selectedTab() == tab) {
+            const message = self.allocator.dupeZ(u8, status) catch {
+                self.mutex.unlock(self.io);
+                return;
+            };
+            defer self.allocator.free(message);
+            sam_macos_set_status(message);
+        }
+        self.mutex.unlock(self.io);
+        self.refreshQueryTabs();
+    }
+
+    fn selectQuery(self: *App, index: usize) void {
+        if (self.is_busy or index >= self.query_tabs.items.len) return;
+        self.mutex.lock(self.io) catch return;
+        self.selected_query = index;
+        const tab = self.query_tabs.items[index];
+        self.mutex.unlock(self.io);
+        self.openVideoFromPath(tab.query_path.?);
+        const sql = self.allocator.dupeZ(u8, tab.sql) catch return;
+        defer self.allocator.free(sql);
+        sam_macos_set_query_text(sql);
+        self.mutex.lock(self.io) catch return;
+        const status = self.allocator.dupeZ(u8, tab.status[0..tab.status_len]) catch {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        self.mutex.unlock(self.io);
+        defer self.allocator.free(status);
+        sam_macos_set_status(status);
+        self.mutex.lock(self.io) catch return;
+        if (tab.query_matches.items.len > 0) {
+            tab.query_match_idx = 0;
+            self.video_seek_target = @as(f64, @floatFromInt(tab.query_matches.items[0])) * 0.0333;
+            self.video_step_requested = true;
+        }
+        self.mutex.unlock(self.io);
+        self.refreshQueryTabs();
+    }
+
+    fn refreshQueryTabs(self: *App) void {
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        var labels: std.ArrayList(u8) = .empty;
+        defer labels.deinit(self.allocator);
+        for (self.query_tabs.items, 0..) |tab, i| {
+            const state = if (tab.query_active.load(.acquire))
+                if (tab.query_cancel.load(.acquire)) "Cancelling" else "Running"
+            else if (tab.query_cancel.load(.acquire)) "Cancelled" else "Done";
+            const label = std.fmt.allocPrint(self.allocator, "Query {d}: {s} ({d})", .{ i + 1, state, tab.query_matches.items.len }) catch return;
+            defer self.allocator.free(label);
+            if (i > 0) labels.append(self.allocator, '\n') catch return;
+            labels.appendSlice(self.allocator, label) catch return;
+        }
+        const labels_z = self.allocator.dupeZ(u8, labels.items) catch return;
+        defer self.allocator.free(labels_z);
+        sam_macos_set_query_tabs(labels_z, if (self.selected_query) |index| @intCast(index) else -1);
+        const selected = self.selectedTab();
+        sam_macos_set_query_active(@intFromBool(if (selected) |tab| tab.query_active.load(.acquire) else false));
+        if (selected) |tab| {
+            sam_macos_set_precache_progress(@intFromBool(tab.precache_active.load(.acquire)), tab.precache_progress, tab.frames_processed);
+        } else {
+            sam_macos_set_precache_progress(0, 0, 0);
+        }
+    }
+
+    fn selectedTab(self: *const App) ?*QueryTab {
+        return self.query_tabs.items[self.selected_query orelse return null];
+    }
+
+    fn isQueryVideo(self: *const App) bool {
+        return (self.selectedTab() orelse return false).matchesVideo(self.video_path);
+    }
+
+    fn isSelectedQuery(self: *const App, tab: *QueryTab) bool {
+        return self.selectedTab() == tab and tab.matchesVideo(self.video_path);
+    }
+
+    fn queryMatches(self: *const App) []const u32 {
+        if (!self.isQueryVideo()) return &.{};
+        return self.selectedTab().?.query_matches.items;
+    }
+
+    fn selectedQueryActive(self: *const App) bool {
+        return (self.selectedTab() orelse return false).query_active.load(.acquire);
+    }
+
+    fn restoreQueryOverlay(self: *App) void {
+        if (!self.isQueryVideo()) return;
+        const tab = self.selectedTab().?;
+        self.video_overlay_prompts = tab.query_prompts;
+        const phrase = if (tab.query_prompts.count > 0)
+            tab.query_prompts.get(0)
+        else
+            tab.precache_phrase[0..tab.precache_phrase_len];
+        self.video_phrase_len = phrase.len;
+        @memcpy(self.video_phrase[0..phrase.len], phrase);
+    }
+
     fn handleCancelQuery(self: *App) void {
-        if (self.query_active.load(.acquire)) {
-            self.query_cancel.store(true, .release);
-            sam_macos_set_status("Cancelling visual database query…");
+        const tab = self.selectedTab() orelse return;
+        if (tab.query_active.load(.acquire)) {
+            tab.query_cancel.store(true, .release);
+            self.setQueryStatus(tab, "Cancelling query…");
         }
     }
 
     fn handleClearQuery(self: *App) void {
-        if (self.query_active.load(.acquire)) {
-            self.handleCancelQuery();
-        }
+        self.handleCancelQuery();
         self.mutex.lock(self.io) catch return;
-        self.query_matches.clearRetainingCapacity();
-        self.query_match_idx = 0;
+        if (self.selectedTab()) |tab| {
+            tab.query_prompts = .{};
+            tab.precache_phrase_len = 0;
+            tab.query_matches.clearRetainingCapacity();
+            tab.query_match_idx = 0;
+        }
         self.video_overlay_prompts = .{};
         self.video_phrase_len = 0;
         if (self.masks) |*m| {
@@ -1120,9 +1226,7 @@ pub const App = struct {
         self.best_mask_idx = -1;
         self.renderComposite(-1);
         self.mutex.unlock(self.io);
-        if (self.image) |img| {
-            sam_macos_set_image(self.frame.ptr, @intCast(img.width), @intCast(img.height));
-        }
+        if (self.image) |img| sam_macos_set_image(self.frame.ptr, @intCast(img.width), @intCast(img.height));
         sam_macos_set_masks(0, null, 0, -1);
         sam_macos_set_status("Query cleared.");
     }
@@ -1183,6 +1287,7 @@ pub const App = struct {
     }
 
     fn handleQuery(self: *App, raw_query: []const u8) void {
+        if (self.is_busy) return;
         const trimmed = std.mem.trim(u8, raw_query, " \t\r\n");
 
         // Attempt to extract source video path if specified in query
@@ -1231,69 +1336,53 @@ pub const App = struct {
             sam_macos_set_status("Specify a video in FROM 'video.mp4' or open a video first.");
             return;
         }
-        if (self.query_active.load(.acquire)) {
-            self.handleCancelQuery();
-            return;
-        }
-        if (self.query_thread) |thread| {
-            thread.join();
-            self.query_thread = null;
-        }
-        if (self.is_busy) return;
-
-        self.query_cancel.store(false, .release);
-        self.query_active.store(true, .release);
-        sam_macos_set_query_active(1);
-
-        self.is_busy = true;
-        sam_macos_set_busy(1);
-        sam_macos_set_status("Planning visual database query with index pushdown…");
-
-        const QueryContext = struct {
-            app: *App,
-            query: []const u8,
-        };
-
-        const ctx = self.allocator.create(QueryContext) catch {
-            self.query_active.store(false, .release);
-            sam_macos_set_query_active(0);
-            self.is_busy = false;
-            sam_macos_set_busy(0);
+        const tab = QueryTab.create(self.allocator, trimmed, self.video_path.?) catch return;
+        self.mutex.lock(self.io) catch {
+            tab.deinit();
             return;
         };
-        const query_copy = self.allocator.dupe(u8, raw_query) catch {
-            self.allocator.destroy(ctx);
-            self.query_active.store(false, .release);
-            sam_macos_set_query_active(0);
-            self.is_busy = false;
-            sam_macos_set_busy(0);
+        self.query_tabs.append(self.allocator, tab) catch {
+            self.mutex.unlock(self.io);
+            tab.deinit();
             return;
         };
-        ctx.* = .{ .app = self, .query = query_copy };
-
-        self.query_thread = std.Thread.spawn(.{}, runQueryWorker, .{ctx}) catch {
-            self.allocator.free(query_copy);
-            self.allocator.destroy(ctx);
-            self.query_active.store(false, .release);
-            sam_macos_set_query_active(0);
-            self.is_busy = false;
-            sam_macos_set_busy(0);
-            sam_macos_set_status("Could not spawn query thread.");
+        self.selected_query = self.query_tabs.items.len - 1;
+        self.mutex.unlock(self.io);
+        self.setQueryStatus(tab, "Planning query in the background…");
+        self.refreshQueryTabs();
+        tab.query_thread = std.Thread.spawn(.{}, runQueryWorker, .{ self, tab }) catch {
+            tab.query_active.store(false, .release);
+            self.setQueryStatus(tab, "Could not start query worker.");
+            self.refreshQueryTabs();
             return;
         };
     }
 
-    fn runQueryWorker(ctx: anytype) void {
+    fn runQueryWorker(self: *App, tab: *QueryTab) void {
         defer {
-            ctx.app.query_active.store(false, .release);
-            sam_macos_set_query_active(0);
-            ctx.app.is_busy = false;
-            sam_macos_set_busy(0);
-            ctx.app.allocator.free(ctx.query);
-            ctx.app.allocator.destroy(ctx);
+            tab.query_active.store(false, .release);
+            self.finishQueryStatus(tab);
+            self.refreshQueryTabs();
         }
-        const self = ctx.app;
-        const query = ctx.query;
+        const query = tab.sql;
+        if (tab.query_cancel.load(.acquire)) return;
+        const source_path = tab.query_path.?;
+        var database = vdb.Database.init(self.allocator);
+        defer database.deinit();
+        const sidecar = std.fmt.allocPrint(self.allocator, "{s}.vdb", .{source_path}) catch return;
+        defer self.allocator.free(sidecar);
+        {
+            self.index_mutex.lock(self.io) catch return;
+            defer self.index_mutex.unlock(self.io);
+            if (vdb.index.InvertedIndex.loadFromFile(self.allocator, sidecar)) |loaded| {
+                var loaded_idx = loaded;
+                database.registerIndex(source_path, loaded_idx) catch {
+                    loaded_idx.deinit();
+                    return;
+                };
+            } else |_| {}
+        }
+
         const started = std.Io.Timestamp.now(self.io, .awake);
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
@@ -1308,24 +1397,24 @@ pub const App = struct {
                     log.info(self.io, "Executing visual CREATE INDEX on concept \"{s}\"", .{target_prompt});
                     var status_buf: [160]u8 = undefined;
                     const status_msg = std.fmt.bufPrintZ(&status_buf, "Creating visual index for “{s}”…", .{target_prompt}) catch "Creating visual index…";
-                    sam_macos_set_status(status_msg);
-                    self.runPrecache(target_prompt);
+                    self.setQueryStatus(tab, status_msg);
+                    self.runPrecache(tab, source_path, target_prompt);
                     return;
                 }
             } else |err| {
                 log.info(self.io, "Failed to parse CREATE INDEX: {t}", .{err});
                 var err_buf: [160]u8 = undefined;
                 const err_msg = std.fmt.bufPrintZ(&err_buf, "CREATE INDEX syntax error: {t}", .{err}) catch "Syntax error.";
-                sam_macos_set_status(err_msg);
+                self.setQueryStatus(tab, err_msg);
                 return;
             }
         }
 
-        const final_query = vdb.query_input.normalize(self.allocator, trimmed, self.video_path.?) catch |err| {
+        const final_query = vdb.query_input.normalize(self.allocator, trimmed, source_path) catch |err| {
             log.info(self.io, "Query normalization failed: {t}", .{err});
             var err_buf: [160]u8 = undefined;
             const err_msg = std.fmt.bufPrintZ(&err_buf, "Query syntax error: {t}", .{err}) catch "Query syntax error.";
-            sam_macos_set_status(err_msg);
+            self.setQueryStatus(tab, err_msg);
             return;
         };
         defer self.allocator.free(final_query);
@@ -1334,26 +1423,29 @@ pub const App = struct {
 
         const overlay_prompts = vdb.overlay.Prompts.fromSql(self.allocator, final_query) catch |err| {
             log.info(self.io, "Query overlay planning failed: {t}", .{err});
-            sam_macos_set_status("Could not parse query overlay prompts.");
+            self.setQueryStatus(tab, "Could not parse query overlay prompts.");
             return;
         };
         self.mutex.lock(self.io) catch return;
-        self.video_overlay_prompts = overlay_prompts;
-        self.video_phrase_len = 0;
-        if (overlay_prompts.count > 0) {
-            const prompt = overlay_prompts.get(0);
-            self.video_phrase_len = prompt.len;
-            @memcpy(self.video_phrase[0..prompt.len], prompt);
+        if (tab.query_cancel.load(.acquire)) {
+            self.mutex.unlock(self.io);
+            return;
         }
-        self.mutex.unlock(self.io);
-
-        self.mutex.lock(self.io) catch return;
-        self.query_matches.clearRetainingCapacity();
-        self.query_match_idx = 0;
+        tab.query_prompts = overlay_prompts;
+        if (self.isSelectedQuery(tab)) {
+            self.video_overlay_prompts = overlay_prompts;
+            self.video_phrase_len = 0;
+            if (overlay_prompts.count > 0) {
+                const prompt = overlay_prompts.get(0);
+                self.video_phrase_len = prompt.len;
+                @memcpy(self.video_phrase[0..prompt.len], prompt);
+            }
+        }
         self.mutex.unlock(self.io);
 
         const QueryStreamer = struct {
             app: *App,
+            tab: *QueryTab,
             first_match_emitted: bool = false,
             last_ui_update: std.Io.Timestamp,
 
@@ -1374,14 +1466,20 @@ pub const App = struct {
                 const idx = match_idx orelse return;
 
                 app.mutex.lock(app.io) catch return;
-                app.query_matches.append(app.allocator, @intCast(idx)) catch {};
-                const total = app.query_matches.items.len;
+                if (streamer.tab.query_cancel.load(.acquire)) {
+                    app.mutex.unlock(app.io);
+                    return error.QueryCancelled;
+                }
+                streamer.tab.query_matches.append(app.allocator, @intCast(idx)) catch {};
+                const total = streamer.tab.query_matches.items.len;
 
                 if (!streamer.first_match_emitted) {
                     streamer.first_match_emitted = true;
-                    app.query_match_idx = 0;
-                    app.video_seek_target = match_pts;
-                    app.video_step_requested = true;
+                    if (app.isSelectedQuery(streamer.tab)) {
+                        streamer.tab.query_match_idx = 0;
+                        app.video_seek_target = match_pts;
+                        app.video_step_requested = true;
+                    }
                     app.mutex.unlock(app.io);
 
                     // INSTANT UI update for first frame!
@@ -1390,7 +1488,7 @@ pub const App = struct {
                         idx,
                         match_pts,
                     }) catch "First frame matched!";
-                    sam_macos_set_status(status_msg);
+                    app.setQueryStatus(streamer.tab, status_msg);
                     log.info(app.io, "Instantly streamed first match: Frame #{d} at {d:.2}s", .{ idx, match_pts });
                 } else {
                     app.mutex.unlock(app.io);
@@ -1401,7 +1499,7 @@ pub const App = struct {
                         streamer.last_ui_update = now;
                         var status_buf: [160]u8 = undefined;
                         const status_msg = std.fmt.bufPrintZ(&status_buf, "Streaming query: {d} matches found… scanning… Press Cancel Query to stop.", .{total}) catch "Streaming query…";
-                        sam_macos_set_status(status_msg);
+                        app.setQueryStatus(streamer.tab, status_msg);
                     }
                 }
             }
@@ -1409,6 +1507,7 @@ pub const App = struct {
 
         var streamer = QueryStreamer{
             .app = self,
+            .tab = tab,
             .last_ui_update = started,
         };
         const stream_cb: vdb.engine.RowCallback = .{
@@ -1416,32 +1515,32 @@ pub const App = struct {
             .onRow = QueryStreamer.onRow,
         };
 
-        var video_adapter = MacosVideoReader.init(self.video_path.?);
+        var video_adapter = MacosVideoReader.init(source_path);
         defer video_adapter.deinit();
 
-        self.vdb_database.engine_inst.sam3 = .{
+        database.engine_inst.sam3 = .{
             .ptr = self,
             .segmentFn = sam3SegmentBridge,
         };
 
-        var result = self.vdb_database.executeQuery(final_query, video_adapter.asReader(), &self.query_cancel, stream_cb) catch |err| {
+        var result = database.executeQuery(final_query, video_adapter.asReader(), &tab.query_cancel, stream_cb) catch |err| {
             if (err == error.QueryCancelled) {
                 log.info(self.io, "Visual database query cancelled.", .{});
                 self.mutex.lock(self.io) catch return;
-                const matches_so_far = self.query_matches.items.len;
+                const matches_so_far = tab.query_matches.items.len;
                 self.mutex.unlock(self.io);
                 var cancel_buf: [160]u8 = undefined;
                 const cancel_msg = if (matches_so_far > 0)
                     std.fmt.bufPrintZ(&cancel_buf, "Query cancelled. Kept {d} matches found so far.", .{matches_so_far}) catch "Query cancelled."
                 else
                     "Visual query cancelled.";
-                sam_macos_set_status(cancel_msg);
+                self.setQueryStatus(tab, cancel_msg);
                 return;
             }
             log.info(self.io, "Query execution error: {t}", .{err});
             var err_buf: [160]u8 = undefined;
             const err_msg = std.fmt.bufPrintZ(&err_buf, "Query error: {t}", .{err}) catch "Query execution failed.";
-            sam_macos_set_status(err_msg);
+            self.setQueryStatus(tab, err_msg);
             return;
         };
         defer result.deinit();
@@ -1449,24 +1548,25 @@ pub const App = struct {
         const elapsed = started.untilNow(self.io, .awake);
 
         self.mutex.lock(self.io) catch return;
-        const total_matches = self.query_matches.items.len;
-        const first_frame_target = if (total_matches > 0) @as(f64, @floatFromInt(self.query_matches.items[0])) * 0.0333 else null;
+        const total_matches = tab.query_matches.items.len;
+        const first_frame = if (total_matches > 0) tab.query_matches.items[0] else 0;
+        const first_frame_target = if (total_matches > 0) @as(f64, @floatFromInt(first_frame)) * 0.0333 else null;
         self.mutex.unlock(self.io);
 
         if (total_matches > 0) {
             var status_buf: [256]u8 = undefined;
             const first_sec = first_frame_target.?;
-            const status_msg = std.fmt.bufPrintZ(&status_buf, "Query complete: {d} match(es) in {f}. Showing match 1 (Frame #{d} at {d:.2}s). Press Next Frame to step.", .{
+            const status_msg = std.fmt.bufPrintZ(&status_buf, "Query complete: {d} match(es) in {f}. First match: Frame #{d} at {d:.2}s.", .{
                 total_matches,
                 elapsed,
-                self.query_matches.items[0],
+                first_frame,
                 first_sec,
             }) catch "Query completed.";
-            sam_macos_set_status(status_msg);
+            self.setQueryStatus(tab, status_msg);
         } else {
             var status_buf: [160]u8 = undefined;
             const status_msg = std.fmt.bufPrintZ(&status_buf, "Query returned 0 matching frames in {f}.", .{elapsed}) catch "0 matches.";
-            sam_macos_set_status(status_msg);
+            self.setQueryStatus(tab, status_msg);
         }
     }
 
@@ -1536,6 +1636,12 @@ pub const App = struct {
         }
         const self = ctx.app;
         const phrase = ctx.phrase;
+        self.model_mutex.lock(self.io) catch {
+            self.is_busy = false;
+            sam_macos_set_busy(0);
+            return;
+        };
+        defer self.model_mutex.unlock(self.io);
         const started = std.Io.Timestamp.now(self.io, .awake);
 
         const lookup_started = std.Io.Timestamp.now(self.io, .awake);
@@ -1849,10 +1955,6 @@ fn cVideoStep() callconv(.c) void {
     if (g_app) |app| app.handleVideoStep();
 }
 
-fn cPrecacheVideo(text: [*:0]const u8) callconv(.c) void {
-    if (g_app) |app| app.handlePrecacheVideo(text);
-}
-
 fn cSampleClick() callconv(.c) void {
     if (g_app) |app| {
         app.openImageFromPath(app.example_path);
@@ -1875,6 +1977,10 @@ fn cFindText(text: [*:0]const u8) callconv(.c) void {
     if (g_app) |app| {
         app.handleFindText(text);
     }
+}
+
+fn cSelectQuery(index: usize) callconv(.c) void {
+    if (g_app) |app| app.selectQuery(index);
 }
 
 fn cCancelQuery() callconv(.c) void {

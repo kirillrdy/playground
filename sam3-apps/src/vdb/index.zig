@@ -362,6 +362,11 @@ pub const IndexBuilder = struct {
 
             const postings_slice = try self.allocator.dupe(Posting, entry.value_ptr.items);
             errdefer self.allocator.free(postings_slice);
+            std.mem.sort(Posting, postings_slice, {}, struct {
+                fn lessThan(_: void, a: Posting, b: Posting) bool {
+                    return a.frame_idx < b.frame_idx;
+                }
+            }.lessThan);
 
             try index.classes.put(self.allocator, label_copy, postings_slice);
         }

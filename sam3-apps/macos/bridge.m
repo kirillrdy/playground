@@ -5,6 +5,16 @@
 #include <math.h>
 #import "bridge.h"
 
+static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
+    if (!url || !callbacks) return;
+    UTType *type = [UTType typeWithFilenameExtension:url.pathExtension];
+    if ([type conformsToType:UTTypeMovie] || [type conformsToType:UTTypeVideo]) {
+        if (callbacks->on_open_video) callbacks->on_open_video([url.path UTF8String]);
+    } else if (callbacks->on_open_file) {
+        callbacks->on_open_file([url.path UTF8String]);
+    }
+}
+
 @interface SamVideoReader : NSObject
 @property (nonatomic, strong) AVAssetReader *reader;
 @property (nonatomic, strong) AVAssetReaderOutput *output;
@@ -173,16 +183,12 @@
 }
 
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    if (_isBusy) return NO;
     NSPasteboard *pboard = [sender draggingPasteboard];
     if ([[pboard types] containsObject:NSPasteboardTypeFileURL]) {
         NSURL *fileURL = [NSURL URLFromPasteboard:pboard];
         if (fileURL && _callbacks) {
-            UTType *type = [UTType typeWithFilenameExtension:fileURL.pathExtension];
-            if ([type conformsToType:UTTypeMovie] || [type conformsToType:UTTypeVideo]) {
-                if (_callbacks->on_open_video) _callbacks->on_open_video([fileURL.path UTF8String]);
-            } else if (_callbacks->on_open_file) {
-                _callbacks->on_open_file([fileURL.path UTF8String]);
-            }
+            openMediaURL(fileURL, _callbacks);
             return YES;
         }
     }
@@ -197,7 +203,6 @@
 @property (nonatomic, strong) NSTextField *statusLabel;
 @property (nonatomic, strong) NSTextField *conceptField;
 @property (nonatomic, strong) NSButton *openBtn;
-@property (nonatomic, strong) NSButton *openVideoBtn;
 @property (nonatomic, strong) NSButton *playBtn;
 @property (nonatomic, strong) NSButton *stepBtn;
 @property (nonatomic, strong) NSButton *restartBtn;
@@ -208,7 +213,9 @@
 @property (nonatomic, strong) NSButton *clearBtn;
 @property (nonatomic, strong) NSButton *findBtn;
 @property (nonatomic, strong) NSButton *clearQueryBtn;
-@property (nonatomic, strong) NSButton *precacheBtn;
+@property (nonatomic, strong) NSButton *cancelQueryBtn;
+@property (nonatomic, strong) NSSegmentedControl *queryTabs;
+@property (nonatomic, strong) NSScrollView *queryTabsScroll;
 @property (nonatomic, strong) NSProgressIndicator *precacheProgress;
 @property (nonatomic, strong) NSTextField *precachePercent;
 @property (nonatomic, strong) NSProgressIndicator *spinner;
@@ -218,7 +225,6 @@
 @property (nonatomic, assign) const SamCallbacks *callbacks;
 @property (nonatomic, assign) BOOL videoMode;
 @property (nonatomic, assign) BOOL videoPlaying;
-@property (nonatomic, assign) BOOL precacheActive;
 @property (nonatomic, assign) BOOL queryActive;
 
 - (instancetype)initWithCallbacks:(const SamCallbacks *)callbacks;
@@ -267,10 +273,18 @@ static SamAppDelegate *g_delegate = nil;
 
     NSView *contentView = _window.contentView;
 
+    _queryTabs = [[NSSegmentedControl alloc] init];
+    _queryTabs.trackingMode = NSSegmentSwitchTrackingSelectOne;
+    _queryTabs.target = self;
+    _queryTabs.action = @selector(selectQueryTab:);
+    _queryTabsScroll = [[NSScrollView alloc] init];
+    _queryTabsScroll.hasHorizontalScroller = YES;
+    _queryTabsScroll.drawsBackground = NO;
+    _queryTabsScroll.documentView = _queryTabs;
+
     // Row 1
-    // Video & File Buttons
-    _openVideoBtn = [NSButton buttonWithTitle:@"Open Video…" target:self action:@selector(openVideo:)];
-    _openBtn = [NSButton buttonWithTitle:@"Open Image…" target:self action:@selector(openFile:)];
+    // File button
+    _openBtn = [NSButton buttonWithTitle:@"Open…" target:self action:@selector(openFile:)];
     _sampleBtn = [NSButton buttonWithTitle:@"Sample Image" target:self action:@selector(sampleClick:)];
 
     _modeSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Add to mask", @"Cut from mask"]
@@ -324,21 +338,22 @@ static SamAppDelegate *g_delegate = nil;
     _clearQueryBtn.toolTip = @"Clear the query input and active query matches";
     [_clearQueryBtn setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
+    _cancelQueryBtn = [NSButton buttonWithTitle:@"Cancel Query" target:self action:@selector(cancelQueryClick:)];
+    _cancelQueryBtn.enabled = NO;
+    [_cancelQueryBtn setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+
     _spinner = [[NSProgressIndicator alloc] init];
     _spinner.style = NSProgressIndicatorStyleSpinning;
     _spinner.controlSize = NSControlSizeSmall;
     _spinner.displayedWhenStopped = NO;
     [_spinner setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    NSStackView *queryRow = [NSStackView stackViewWithViews:@[_conceptField, _findBtn, _clearQueryBtn, _spinner]];
+    NSStackView *queryRow = [NSStackView stackViewWithViews:@[_conceptField, _findBtn, _cancelQueryBtn, _clearQueryBtn, _spinner]];
     queryRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     queryRow.spacing = 8.0;
     queryRow.alignment = NSLayoutAttributeCenterY;
 
-    // Index Creation Controls
-    _precacheBtn = [NSButton buttonWithTitle:@"Create Index" target:self action:@selector(precacheVideo:)];
-    _precacheBtn.toolTip = @"Build and save a visual index on this video for instant sub-millisecond queries";
-    _precacheBtn.enabled = NO;
+    // SQL index progress
     _precacheProgress = [[NSProgressIndicator alloc] init];
     _precacheProgress.style = NSProgressIndicatorStyleBar;
     _precacheProgress.indeterminate = NO;
@@ -350,11 +365,9 @@ static SamAppDelegate *g_delegate = nil;
     _precachePercent.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
     _precachePercent.hidden = YES;
 
-    // Clean Toolbar Row: [Open Video] [Open Image] | [Create Index] [Progress] | [Mode] [Clear] [Sample]
+    // Toolbar: files, SQL index progress, and image point controls
     NSStackView *toolbarRow = [NSStackView stackViewWithViews:@[
-        _openVideoBtn,
         _openBtn,
-        _precacheBtn,
         _precacheProgress,
         _precachePercent,
         _modeSeg,
@@ -388,20 +401,24 @@ static SamAppDelegate *g_delegate = nil;
     _masksScrollView.documentView = _masksStackView;
 
     // Layout
-    for (NSView *v in @[queryRow, toolbarRow, _statusLabel, _canvasView, videoRow, _masksScrollView]) {
+    for (NSView *v in @[_queryTabsScroll, queryRow, toolbarRow, _statusLabel, _canvasView, videoRow, _masksScrollView]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [contentView addSubview:v];
     }
 
     [NSLayoutConstraint activateConstraints:@[
         // 1. Top Hero: Main Visual Query Console
-        [queryRow.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:12.0],
+        [_queryTabsScroll.topAnchor constraintEqualToAnchor:queryRow.bottomAnchor constant:8.0],
+        [_queryTabsScroll.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+        [_queryTabsScroll.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [_queryTabsScroll.heightAnchor constraintEqualToConstant:36.0],
+        [queryRow.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:8.0],
         [queryRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [queryRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_conceptField.heightAnchor constraintEqualToConstant:54.0],
 
         // 2. Action Toolbar: Open, Index, Segmentation Tools
-        [toolbarRow.topAnchor constraintEqualToAnchor:queryRow.bottomAnchor constant:10.0],
+        [toolbarRow.topAnchor constraintEqualToAnchor:_queryTabsScroll.bottomAnchor constant:10.0],
         [toolbarRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [toolbarRow.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_precacheProgress.widthAnchor constraintEqualToConstant:180.0],
@@ -449,30 +466,13 @@ static SamAppDelegate *g_delegate = nil;
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
     if (@available(macOS 11.0, *)) {
-        panel.allowedContentTypes = @[UTTypeImage];
+        panel.allowedContentTypes = @[UTTypeImage, UTTypeMovie, UTTypeVideo];
     } else {
-        panel.allowedFileTypes = @[@"png", @"jpg", @"jpeg", @"webp", @"bmp", @"tiff", @"gif"];
+        panel.allowedFileTypes = @[@"png", @"jpg", @"jpeg", @"webp", @"bmp", @"tiff", @"gif", @"mp4", @"mov", @"m4v", @"mkv", @"webm", @"avi", @"mpeg", @"mpg", @"3gp", @"ts", @"mts", @"flv", @"wmv"];
     }
 
     if ([panel runModal] == NSModalResponseOK) {
-        NSURL *url = panel.URLs.firstObject;
-        if (url && _callbacks && _callbacks->on_open_file) {
-            _callbacks->on_open_file([url.path UTF8String]);
-        }
-    }
-}
-
-- (void)openVideo:(id)sender {
-    NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.canChooseFiles = YES;
-    panel.canChooseDirectories = NO;
-    panel.allowsMultipleSelection = NO;
-    panel.allowedContentTypes = @[UTTypeMovie, UTTypeVideo];
-    if ([panel runModal] == NSModalResponseOK) {
-        NSURL *url = panel.URLs.firstObject;
-        if (url && _callbacks && _callbacks->on_open_video) {
-            _callbacks->on_open_video([url.path UTF8String]);
-        }
+        openMediaURL(panel.URLs.firstObject, _callbacks);
     }
 }
 
@@ -486,15 +486,6 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)stepFrame:(id)sender {
     if (_callbacks && _callbacks->on_video_step) _callbacks->on_video_step();
-}
-
-- (void)precacheVideo:(id)sender {
-    NSString *text = [_conceptField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (_precacheActive || text.length > 0) {
-        if (_callbacks && _callbacks->on_precache_video) _callbacks->on_precache_video([text UTF8String]);
-    } else {
-        [_statusLabel setStringValue:@"Enter a word to pre-cache this video."];
-    }
 }
 
 - (void)seekVideo:(NSSlider *)sender {
@@ -521,6 +512,17 @@ static SamAppDelegate *g_delegate = nil;
     }
 }
 
+- (void)selectQueryTab:(NSSegmentedControl *)sender {
+    NSInteger index = sender.selectedSegment;
+    if (index >= 0 && _callbacks && _callbacks->on_select_query) {
+        _callbacks->on_select_query((size_t)index);
+    }
+}
+
+- (void)cancelQueryClick:(id)sender {
+    if (_callbacks && _callbacks->on_cancel_query) _callbacks->on_cancel_query();
+}
+
 - (void)clearQueryClick:(id)sender {
     _conceptField.stringValue = @"";
     if (_callbacks && _callbacks->on_clear_query) {
@@ -544,12 +546,6 @@ static SamAppDelegate *g_delegate = nil;
 }
 
 - (void)findClick:(id)sender {
-    if (_queryActive) {
-        if (_callbacks && _callbacks->on_cancel_query) {
-            _callbacks->on_cancel_query();
-        }
-        return;
-    }
     NSString *text = [_conceptField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (text.length > 0 && _callbacks && _callbacks->on_find_text) {
         _callbacks->on_find_text([text UTF8String]);
@@ -599,7 +595,7 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)setQueryActive:(BOOL)active {
     _queryActive = active;
-    _findBtn.title = active ? @"Cancel Query" : @"Run Query";
+    _cancelQueryBtn.enabled = active;
     _findBtn.enabled = YES;
     [self setVideoMode:_videoMode playing:_videoPlaying];
     [self setBusy:_canvasView.isBusy];
@@ -608,19 +604,18 @@ static SamAppDelegate *g_delegate = nil;
 - (void)setBusy:(BOOL)busy {
     _canvasView.isBusy = busy;
     _openBtn.enabled = !busy;
-    _openVideoBtn.enabled = !busy;
-    _playBtn.enabled = (!busy || _queryActive) && _videoMode;
-    _stepBtn.enabled = (!busy || _queryActive) && _videoMode && !_videoPlaying;
-    _restartBtn.enabled = (!busy || _queryActive) && _videoMode;
-    _seekSlider.enabled = (!busy || _queryActive) && _videoMode && _seekSlider.maxValue > 0;
+    _playBtn.enabled = !busy && _videoMode;
+    _stepBtn.enabled = !busy && _videoMode && !_videoPlaying;
+    _restartBtn.enabled = !busy && _videoMode;
+    _seekSlider.enabled = !busy && _videoMode && _seekSlider.maxValue > 0;
     _sampleBtn.enabled = !busy;
     _clearBtn.enabled = !busy;
-    _findBtn.enabled = !busy || _queryActive;
+    _findBtn.enabled = !busy;
+    _cancelQueryBtn.enabled = _queryActive;
     _clearQueryBtn.enabled = !busy || _queryActive;
     _conceptField.enabled = YES;
-    _precacheBtn.enabled = _precacheActive || (_videoMode && !busy);
 
-    if (busy) {
+    if (busy || _queryActive) {
         [_spinner startAnimation:nil];
     } else {
         [_spinner stopAnimation:nil];
@@ -630,11 +625,10 @@ static SamAppDelegate *g_delegate = nil;
 - (void)setVideoMode:(BOOL)active playing:(BOOL)playing {
     _videoMode = active;
     _videoPlaying = playing;
-    _playBtn.enabled = active && (!_canvasView.isBusy || _queryActive);
-    _stepBtn.enabled = active && !playing && (!_canvasView.isBusy || _queryActive);
-    _restartBtn.enabled = active && (!_canvasView.isBusy || _queryActive);
-    _seekSlider.enabled = active && (!_canvasView.isBusy || _queryActive) && _seekSlider.maxValue > 0;
-    _precacheBtn.enabled = _precacheActive || (active && !_canvasView.isBusy);
+    _playBtn.enabled = active && !_canvasView.isBusy;
+    _stepBtn.enabled = active && !playing && !_canvasView.isBusy;
+    _restartBtn.enabled = active && !_canvasView.isBusy;
+    _seekSlider.enabled = active && !_canvasView.isBusy && _seekSlider.maxValue > 0;
     _playBtn.title = playing ? @"Pause" : @"Play";
     _clearBtn.enabled = !_canvasView.isBusy;
     _modeSeg.enabled = !active;
@@ -645,15 +639,13 @@ static SamAppDelegate *g_delegate = nil;
     double safePosition = isfinite(position) ? fmax(0, fmin(position, safeDuration)) : 0;
     _seekSlider.maxValue = safeDuration > 0 ? safeDuration : 1;
     _seekSlider.doubleValue = safePosition;
-    _seekSlider.enabled = _videoMode && (!_canvasView.isBusy || _queryActive) && safeDuration > 0;
+    _seekSlider.enabled = _videoMode && !_canvasView.isBusy && safeDuration > 0;
     _timeLabel.stringValue = [NSString stringWithFormat:@"%d:%02d / %d:%02d",
                               (int)safePosition / 60, (int)safePosition % 60,
                               (int)safeDuration / 60, (int)safeDuration % 60];
 }
 
 - (void)setPrecacheProgressState:(int)state fraction:(double)fraction frames:(size_t)frames {
-    _precacheActive = state == 1;
-    _precacheBtn.title = _precacheActive ? @"Cancel Indexing" : @"Create Index";
     _precacheProgress.hidden = state == 0;
     _precachePercent.hidden = state == 0;
     if (state != 2) {
@@ -703,8 +695,7 @@ int sam_macos_init(const SamCallbacks *callbacks) {
         NSMenuItem *fileMenuItem = [[NSMenuItem alloc] init];
         [menubar addItem:fileMenuItem];
         NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
-        [fileMenu addItemWithTitle:@"Open Image…" action:@selector(openFile:) keyEquivalent:@"o"];
-        [fileMenu addItemWithTitle:@"Open Video…" action:@selector(openVideo:) keyEquivalent:@"O"];
+        [fileMenu addItemWithTitle:@"Open…" action:@selector(openFile:) keyEquivalent:@"o"];
         [fileMenu addItem:[NSMenuItem separatorItem]];
         [fileMenu addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
         [fileMenuItem setSubmenu:fileMenu];
@@ -839,6 +830,31 @@ void sam_macos_set_video_timeline(double duration, double position) {
 void sam_macos_set_precache_progress(int state, double fraction, size_t frames) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_delegate setPrecacheProgressState:state fraction:fraction frames:frames];
+    });
+}
+
+void sam_macos_set_query_tabs(const char *labels, int selected) {
+    NSString *text = [NSString stringWithUTF8String:labels];
+    NSArray<NSString *> *titles = text.length ? [text componentsSeparatedByString:@"\n"] : @[];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSSegmentedControl *tabs = g_delegate.queryTabs;
+        tabs.segmentCount = titles.count;
+        for (NSUInteger i = 0; i < titles.count; i++) {
+            [tabs setLabel:titles[i] forSegment:i];
+            [tabs setWidth:180 forSegment:i];
+        }
+        tabs.selectedSegment = selected;
+        [tabs sizeToFit];
+        if (selected >= 0 && selected < titles.count) {
+            [tabs scrollRectToVisible:NSMakeRect(selected * 180, 0, 180, tabs.bounds.size.height)];
+        }
+    });
+}
+
+void sam_macos_set_query_text(const char *sql) {
+    NSString *text = [NSString stringWithUTF8String:sql];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_delegate.conceptField.stringValue = text ?: @"";
     });
 }
 
