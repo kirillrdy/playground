@@ -128,9 +128,17 @@ pub fn build(b: *std.Build) void {
     const vdb_test = b.addTest(.{
         .root_module = vdb,
     });
+    vdb_test.root_module.link_libc = true;
     test_step.dependOn(&b.addRunArtifact(vdb_test).step);
 
     if (target.result.os.tag == .linux) {
+        const wayland_test = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("linux/wayland.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(wayland_test).step);
         const font_test = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("linux/font.zig"),
             .target = target,

@@ -71,6 +71,8 @@ pub const WaylandClient = struct {
 
     width: u32 = 1000,
     height: u32 = 720,
+    configured: bool = false,
+    pending_configure: ?WaylandEvent = null,
 
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
@@ -127,7 +129,7 @@ pub const WaylandClient = struct {
         var synced = false;
         while (!synced) {
             try client.readMessages();
-            while (client.popEvent()) |ev| {
+            while (try client.popEvent()) |ev| {
                 if (ev == .sync and ev.sync == sync_cb_id) {
                     synced = true;
                     break;
@@ -473,6 +475,8 @@ pub const WaylandClient = struct {
     }
 
     pub fn beginFrame(self: *WaylandClient) !bool {
+        // XDG surfaces may only attach a buffer after the first configure is acknowledged.
+        if (!self.configured) return false;
         self.discardUnusedBuffers();
         var matching: usize = 0;
         for (self.buffers.items, 0..) |buffer, i| {
@@ -493,6 +497,7 @@ pub const WaylandClient = struct {
     }
 
     pub fn commitFrame(self: *WaylandClient) !void {
+        if (!self.configured) return error.SurfaceNotConfigured;
         const index = self.frame_index orelse return error.NoFrame;
         try self.sendMsg(self.surface_id, 1, .{ self.buffers.items[index].id, @as(i32, 0), @as(i32, 0) });
         try self.sendMsg(self.surface_id, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(self.width)), @as(i32, @intCast(self.height)) });
@@ -521,11 +526,11 @@ pub const WaylandClient = struct {
     }
 
     fn readMessages(self: *WaylandClient) !void {
-        if (self.recv_len >= self.recv_buf.len) return;
+        if (self.recv_len >= self.recv_buf.len) return error.ReceiveBufferFull;
         const n = std.posix.system.recv(self.socket_fd, self.recv_buf[self.recv_len..].ptr, self.recv_buf.len - self.recv_len, 0);
-        if (n > 0) {
-            self.recv_len += @intCast(n);
-        }
+        if (n == 0) return error.WaylandDisconnected;
+        if (n < 0) return error.ReceiveFailed;
+        self.recv_len += @intCast(n);
     }
 
     const InternalEvent = union(enum) {
@@ -533,7 +538,7 @@ pub const WaylandClient = struct {
         other,
     };
 
-    fn popEvent(self: *WaylandClient) ?InternalEvent {
+    fn popEvent(self: *WaylandClient) !?InternalEvent {
         if (self.recv_len < 8) return null;
         const bytes = self.recv_buf[0..self.recv_len];
         const id = std.mem.readInt(u32, bytes[0..4], .little);
@@ -541,6 +546,7 @@ pub const WaylandClient = struct {
         const opcode: u16 = @truncate(header);
         const size: u16 = @truncate(header >> 16);
 
+        if (size < 8 or size % 4 != 0) return error.InvalidWaylandMessage;
         if (self.recv_len < size) return null;
 
         defer {
@@ -549,6 +555,11 @@ pub const WaylandClient = struct {
                 std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[size..self.recv_len]);
             }
             self.recv_len = remaining;
+        }
+
+        if (id == 1 and opcode == 0) {
+            reportProtocolError(bytes[0..size]);
+            return error.WaylandProtocolError;
         }
 
         // Registry global event: id == 2, opcode == 0
@@ -594,6 +605,7 @@ pub const WaylandClient = struct {
             const opcode: u16 = @truncate(header);
             const size: u16 = @truncate(header >> 16);
 
+            if (size < 8 or size % 4 != 0) return .close;
             if (self.recv_len < size) return null;
 
             const msg_bytes = bytes[0..size];
@@ -603,6 +615,11 @@ pub const WaylandClient = struct {
                     std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[size..self.recv_len]);
                 }
                 self.recv_len = remaining;
+            }
+
+            if (id == 1 and opcode == 0) {
+                reportProtocolError(msg_bytes);
+                return .close;
             }
 
             // xdg_wm_base ping -> send pong
@@ -615,8 +632,11 @@ pub const WaylandClient = struct {
             // xdg_surface configure -> send ack_configure
             if (id == self.xdg_surface_id and opcode == 0 and size >= 12) {
                 const serial = std.mem.readInt(u32, msg_bytes[8..12], .little);
-                self.sendMsg(self.xdg_surface_id, 4, .{serial}) catch {};
-                continue;
+                self.sendMsg(self.xdg_surface_id, 4, .{serial}) catch return .close;
+                self.configured = true;
+                const event = self.pending_configure orelse WaylandEvent{ .configure = .{ .width = 0, .height = 0 } };
+                self.pending_configure = null;
+                return event;
             }
 
             // xdg_toplevel configure
@@ -636,7 +656,9 @@ pub const WaylandClient = struct {
                 }
                 const width: u32 = if (w > 0) @intCast(w) else 0;
                 const height: u32 = if (h > 0) @intCast(h) else 0;
-                return .{ .configure = .{ .width = width, .height = height, .maximized = is_max } };
+                // Toplevel state is applied atomically with xdg_surface.configure.
+                self.pending_configure = .{ .configure = .{ .width = width, .height = height, .maximized = is_max } };
+                continue;
             }
 
             // xdg_toplevel close
@@ -721,6 +743,24 @@ pub const WaylandClient = struct {
     }
 
     // Wire sender helpers
+    fn reportProtocolError(bytes: []const u8) void {
+        if (bytes.len < 20) return;
+        const object = std.mem.readInt(u32, bytes[8..12], .little);
+        const code = std.mem.readInt(u32, bytes[12..16], .little);
+        const len = std.mem.readInt(u32, bytes[16..20], .little);
+        if (len > bytes.len - 20) return;
+        std.debug.print("Wayland protocol error on object {d} (code {d}): {s}\n", .{ object, code, std.mem.sliceTo(bytes[20..][0..len], 0) });
+    }
+
+    fn sendBytes(self: *WaylandClient, bytes: []const u8) !void {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const sent = std.posix.system.send(self.socket_fd, bytes[offset..].ptr, bytes.len - offset, std.posix.MSG.NOSIGNAL);
+            if (sent <= 0) return error.SendFailed;
+            offset += @intCast(sent);
+        }
+    }
+
     fn sendMsg(self: *WaylandClient, id: u32, opcode: u16, args: anytype) !void {
         const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
         var words: [2 + fields.len]u32 = undefined;
@@ -729,7 +769,7 @@ pub const WaylandClient = struct {
         inline for (fields, 0..) |f, i| {
             words[2 + i] = @as(u32, @bitCast(@field(args, f.name)));
         }
-        _ = std.posix.system.send(self.socket_fd, @ptrCast(&words), words.len * 4, 0);
+        try self.sendBytes(std.mem.sliceAsBytes(&words));
     }
 
     pub fn setTitle(self: *WaylandClient, title: []const u8) !void {
@@ -748,7 +788,7 @@ pub const WaylandClient = struct {
         std.mem.writeInt(u32, buf[8..12], @intCast(str.len + 1), .little);
         @memset(buf[12 .. 12 + str_padded], 0);
         @memcpy(buf[12 .. 12 + str.len], str);
-        _ = std.posix.system.send(self.socket_fd, buf[0..total].ptr, total, 0);
+        try self.sendBytes(buf[0..total]);
     }
 
     fn sendRegistryBind(self: *WaylandClient, name: u32, iface: []const u8, version: u32, new_id: u32) !void {
@@ -769,7 +809,7 @@ pub const WaylandClient = struct {
         std.mem.writeInt(u32, buf[offset..][0..4], new_id, .little);
         offset += 4;
 
-        _ = std.posix.system.send(self.socket_fd, buf[0..total_size].ptr, total_size, 0);
+        try self.sendBytes(buf[0..total_size]);
     }
 
     fn sendCreatePool(self: *WaylandClient, shm_id: u32, pool_id: u32, fd: std.posix.fd_t, size: i32) !void {
@@ -802,10 +842,59 @@ pub const WaylandClient = struct {
             .controllen = @sizeOf(Cmsg),
             .flags = 0,
         };
-        const sent = std.posix.system.sendmsg(self.socket_fd, &msg, 0);
-        if (sent < 0) return error.SendFailed;
+        const sent = std.posix.system.sendmsg(self.socket_fd, &msg, std.posix.MSG.NOSIGNAL);
+        if (sent <= 0) return error.SendFailed;
+        if (sent < body.len) try self.sendBytes(body[@intCast(sent)..]);
     }
 };
+
+test "first frame waits for surface configure acknowledgement, including split messages" {
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets));
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+    var client: WaylandClient = .{
+        .allocator = std.testing.allocator,
+        .socket_fd = sockets[0],
+        .xdg_surface_id = 6,
+        .xdg_toplevel_id = 7,
+    };
+    try std.testing.expect(!try client.beginFrame());
+    try std.testing.expectError(error.SurfaceNotConfigured, client.commitFrame());
+
+    const toplevel = [_]u32{ 7, 24 << 16, 1200, 800, 4, 1 };
+    @memcpy(client.recv_buf[0..24], std.mem.sliceAsBytes(&toplevel));
+    client.recv_len = 24;
+    try std.testing.expect(client.parseNextEvent() == null);
+    try std.testing.expect(!try client.beginFrame());
+
+    const surface = [_]u32{ 6, 12 << 16, 42 };
+    const bytes = std.mem.sliceAsBytes(&surface);
+    @memcpy(client.recv_buf[0..8], bytes[0..8]);
+    client.recv_len = 8;
+    try std.testing.expect(client.parseNextEvent() == null);
+    try std.testing.expect(!client.configured);
+    @memcpy(client.recv_buf[8..12], bytes[8..12]);
+    client.recv_len = 12;
+    const event = client.parseNextEvent().?;
+    try std.testing.expect(client.configured);
+    try std.testing.expectEqual(@as(u32, 1200), event.configure.width);
+    try std.testing.expectEqual(@as(u32, 800), event.configure.height);
+    try std.testing.expect(event.configure.maximized);
+    var ack: [3]u32 = undefined;
+    try std.testing.expectEqual(@as(isize, 12), std.c.recv(sockets[1], @ptrCast(&ack), 12, std.posix.MSG.DONTWAIT));
+    try std.testing.expectEqualSlices(u32, &.{ 6, (12 << 16) | 4, 42 }, &ack);
+}
+
+test "compositor disconnect terminates registry and window reads" {
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets));
+    defer _ = std.c.close(sockets[0]);
+    _ = std.c.close(sockets[1]);
+    var client: WaylandClient = .{ .allocator = std.testing.allocator, .socket_fd = sockets[0] };
+    try std.testing.expectError(error.WaylandDisconnected, client.readMessages());
+    try std.testing.expectError(error.WaylandDisconnected, client.pollEvent(0));
+}
 
 test "pointer coordinates use Wayland fixed-point fields and track enter before motion" {
     var client: WaylandClient = .{
@@ -814,7 +903,13 @@ test "pointer coordinates use Wayland fixed-point fields and track enter before 
         .pointer_id = 7,
     };
     try client.buffers.append(std.testing.allocator, .{
-        .id = 8, .pool_id = 9, .fd = -1, .pixels = &.{}, .width = 1, .height = 1, .busy = true,
+        .id = 8,
+        .pool_id = 9,
+        .fd = -1,
+        .pixels = &.{},
+        .width = 1,
+        .height = 1,
+        .busy = true,
     });
     defer client.buffers.deinit(std.testing.allocator);
 
