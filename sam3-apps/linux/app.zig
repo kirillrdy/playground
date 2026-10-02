@@ -2423,6 +2423,7 @@ pub const App = struct {
     }
 
     fn redraw(self: *App) void {
+        // The event loop holds mutex for the entire frame, including query state.
         const pixels = self.client.pixels;
         const stride = self.client.width;
         const h = self.client.height;
@@ -2450,7 +2451,6 @@ pub const App = struct {
             font.drawButton(pixels, stride, stride - 36, 5, 26, 22, "x", false, false, 0x00e05555);
         }
 
-        self.mutex.lock(self.io) catch return;
         const tab_count = self.query_tabs.items.len;
         if (tab_count > 0) {
             const selected = self.selected_query orelse 0;
@@ -2470,7 +2470,6 @@ pub const App = struct {
         } else {
             font.drawText(pixels, stride, "Run SQL to create a query tab", 16, 108, 0x0068707c);
         }
-        self.mutex.unlock(self.io);
 
         // SQL query console
         const q_x: usize = 16;
@@ -2578,9 +2577,7 @@ pub const App = struct {
             font.drawButton(pixels, stride, 16, video_bar_y, 70, 28, if (self.video_playing.load(.acquire)) "Pause" else "Play", false, false, 0x0000dc64);
             font.drawButton(pixels, stride, 94, video_bar_y, 80, 28, "Restart", false, false, 0x0000dc64);
 
-            self.mutex.lock(self.io) catch return;
             const next_label = if (self.isQueryVideo() and self.queryMatches().len > 0) "Next Match" else "Next Frame";
-            self.mutex.unlock(self.io);
             font.drawButton(pixels, stride, 182, video_bar_y, 104, 28, next_label, false, false, 0x0000dc64);
 
             const s_x: usize = 294;
