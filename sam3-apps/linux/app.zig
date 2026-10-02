@@ -186,6 +186,7 @@ pub const App = struct {
     video_seek_target: ?f64 = null,
     video_step_requested: bool = false,
     query_tabs: std.ArrayList(*QueryTab) = .empty,
+    closed_queries: std.ArrayList(*QueryTab) = .empty,
     selected_query: ?usize = null,
 
     window_title: [256]u8 = undefined,
@@ -200,6 +201,8 @@ pub const App = struct {
     search_caret: usize = 0,
     search_scroll: usize = 0,
     search_anchor: ?usize = null,
+    completion_visible: bool = false,
+    completion_index: usize = 0,
     repeat_key: ?u32 = null,
     repeat_next_ms: i64 = 0,
     browser_open: bool = false,
@@ -265,6 +268,8 @@ pub const App = struct {
             if (tab.query_thread) |thread| thread.join();
             tab.query_thread = null;
         }
+        for (self.closed_queries.items) |tab| tab.deinit();
+        self.closed_queries.deinit(self.allocator);
         self.stopVideo();
         for (self.query_tabs.items) |tab| tab.deinit();
         self.query_tabs.deinit(self.allocator);
@@ -307,6 +312,7 @@ pub const App = struct {
         self.pending_width = self.client.width;
         self.pending_height = self.client.height;
         while (true) {
+            vdb.query_tab.reapClosed(&self.closed_queries);
             if (self.pending_width != self.client.width or self.pending_height != self.client.height) {
                 try self.client.resizeShmBuffer(self.pending_width, self.pending_height);
                 self.redraw_pending.store(true, .release);
@@ -653,6 +659,14 @@ pub const App = struct {
 
         if (button != 0x110 and button != 0x111) return false;
 
+        const suggestions = self.queryCompletions();
+        if (suggestions.len > 0 and button == 0x110 and x >= 16 and x < 236 and y >= 96 and y < 96 + 24 * suggestions.len) {
+            self.completion_index = (y - 96) / 24;
+            self.acceptQueryCompletion();
+            return false;
+        }
+        self.completion_visible = false;
+
         if (y >= 102 and y < 130 and button == 0x110 and self.query_tabs.items.len > 0) {
             const count = self.query_tabs.items.len;
             const selected = self.selected_query orelse 0;
@@ -665,7 +679,14 @@ pub const App = struct {
                 const first = @min(selected, count -| visible);
                 if (x >= 48) {
                     const index = first + (x - 48) / 160;
-                    if (index < count and index < first + visible) self.selectQuery(index);
+                    if (index < count and index < first + visible) {
+                        const offset = (x - 48) % 160;
+                        if (offset >= 128 and offset < 152) {
+                            self.closeQuery(index);
+                        } else if (offset < 128) {
+                            self.selectQuery(index);
+                        }
+                    }
                 }
             }
             return false;
@@ -867,6 +888,33 @@ pub const App = struct {
         return false;
     }
 
+    fn queryCompletions(self: *App) vdb.completion.Matches {
+        if (!self.completion_visible or !self.search_focused or self.browser_open or self.selection() != null) return .{};
+        var matches = vdb.completion.suggest(self.search_text[0..self.search_len], self.search_caret);
+        matches.len = @min(matches.len, 8);
+        return matches;
+    }
+
+    fn acceptQueryCompletion(self: *App) void {
+        const matches = self.queryCompletions();
+        if (self.completion_index >= matches.len) return;
+        const word = matches.items[self.completion_index];
+        const new_len = self.search_len - (matches.end - matches.start) + word.len;
+        if (new_len > self.search_text.len) return;
+        const tail_len = self.search_len - matches.end;
+        if (new_len > self.search_len) {
+            std.mem.copyBackwards(u8, self.search_text[matches.start + word.len ..][0..tail_len], self.search_text[matches.end..self.search_len]);
+        } else {
+            std.mem.copyForwards(u8, self.search_text[matches.start + word.len ..][0..tail_len], self.search_text[matches.end..self.search_len]);
+        }
+        @memcpy(self.search_text[matches.start..][0..word.len], word);
+        self.search_len = new_len;
+        self.search_caret = matches.start + word.len;
+        self.search_anchor = null;
+        self.completion_visible = false;
+        self.adjustSearchScroll();
+    }
+
     fn handleKey(self: *App, key: u32, state: u32) void {
         if (key == 42 or key == 54) {
             self.shift_down = state == 1;
@@ -948,6 +996,7 @@ pub const App = struct {
         }
 
         if (self.ctrl_down) {
+            self.completion_visible = false;
             if (key == 30) { // Ctrl+A
                 self.search_anchor = 0;
                 self.search_caret = self.search_len;
@@ -956,6 +1005,23 @@ pub const App = struct {
             return;
         }
 
+        const suggestions = self.queryCompletions();
+        if (suggestions.len > 0) {
+            if (key == 15) { // Tab accepts; Return continues to run the query.
+                self.acceptQueryCompletion();
+                return;
+            }
+            if (key == 103 or key == 108) {
+                self.completion_index = (self.completion_index + (if (key == 108) @as(usize, 1) else suggestions.len - 1)) % suggestions.len;
+                return;
+            }
+            if (key == 1) {
+                self.completion_visible = false;
+                return;
+            }
+        }
+        self.completion_visible = key == 14 or key == 111 or evdevToChar(key, self.shift_down, self.caps_lock) != null;
+        self.completion_index = 0;
         switch (key) {
             28 => { // Enter
                 if (self.shift_down or self.alt_down) {
@@ -1212,6 +1278,49 @@ pub const App = struct {
         self.refreshQueryTabs();
     }
 
+    fn closeQuery(self: *App, index: usize) void {
+        if (self.is_busy or index >= self.query_tabs.items.len) return;
+        self.mutex.lock(self.io) catch return;
+        const tab = self.query_tabs.items[index];
+        self.closed_queries.append(self.allocator, tab) catch {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        tab.query_cancel.store(true, .release);
+        const was_selected = self.selected_query == index;
+        _ = self.query_tabs.orderedRemove(index);
+        self.selected_query = vdb.query_tab.selectionAfterClose(self.selected_query, index, self.query_tabs.items.len);
+        const next = self.selected_query;
+        if (was_selected) {
+            self.video_overlay_prompts = .{};
+            self.video_phrase_len = 0;
+            self.video_seek_target = null;
+            self.video_step_requested = false;
+            if (self.masks) |*m| {
+                m.deinit();
+                self.masks = null;
+            }
+            self.selected_mask = -1;
+            self.best_mask_idx = -1;
+            self.renderComposite(-1);
+        }
+        self.mutex.unlock(self.io);
+        if (was_selected) {
+            if (next) |selected| {
+                self.selectQuery(selected);
+            } else {
+                self.search_len = 0;
+                self.search_caret = 0;
+                self.search_anchor = null;
+                self.search_scroll = 0;
+                self.completion_visible = false;
+                self.setStatus("Query closed.");
+            }
+        }
+        self.refreshQueryTabs();
+        vdb.query_tab.reapClosed(&self.closed_queries);
+    }
+
     fn selectQuery(self: *App, index: usize) void {
         if (self.is_busy or index >= self.query_tabs.items.len) return;
         self.mutex.lock(self.io) catch return;
@@ -1389,6 +1498,7 @@ pub const App = struct {
             tab.query_active.store(false, .release);
             self.finishQueryStatus(tab);
             self.refreshQueryTabs();
+            tab.worker_finished.store(true, .release);
         }
         const query = tab.sql;
         if (tab.query_cancel.load(.acquire)) return;
@@ -2465,7 +2575,9 @@ pub const App = struct {
                 else if (tab.query_cancel.load(.acquire)) "cancelled" else "done";
                 var label_buf: [48]u8 = undefined;
                 const label = std.fmt.bufPrint(&label_buf, "Q{d}: {s} ({d})", .{ index + 1, state, tab.query_matches.items.len }) catch "Query";
-                font.drawButton(pixels, stride, 48 + (index - first) * 160, 102, 152, 28, label, index == selected, tab.query_active.load(.acquire), 0x0000dc64);
+                const tab_x = 48 + (index - first) * 160;
+                font.drawButton(pixels, stride, tab_x, 102, 128, 28, label, index == selected, tab.query_active.load(.acquire), 0x0000dc64);
+                font.drawButton(pixels, stride, tab_x + 128, 102, 24, 28, "x", false, false, 0x008892a0);
             }
         } else {
             font.drawText(pixels, stride, "Run SQL to create a query tab", 16, 108, 0x0068707c);
@@ -2653,6 +2765,13 @@ pub const App = struct {
 
                 font.drawButton(pixels, stride, cur_btn_x, mask_bar_y, 160, 28, mtitle, false, is_active, 0x0000dc64);
                 cur_btn_x += 168;
+            }
+        }
+        const suggestions = self.queryCompletions();
+        if (suggestions.len > 0) {
+            for (suggestions.items[0..suggestions.len], 0..) |word, i| {
+                font.fillRect(pixels, stride, 16, 96 + i * 24, 220, 24, if (i == self.completion_index) 0x00323742 else 0x0023272e);
+                font.drawText(pixels, stride, word, 26, 100 + i * 24, if (i == self.completion_index) 0x0000dc64 else 0x00f2f4f6);
             }
         }
         if (self.browser_open) self.drawBrowser(pixels, stride, h);
