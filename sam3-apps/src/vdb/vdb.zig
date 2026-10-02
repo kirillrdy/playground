@@ -204,6 +204,8 @@ test "vdb: query planner pushdown" {
 const MockReader = struct {
     frames_total: usize = 100,
     current_frame: usize = 0,
+    reads: usize = 0,
+    seeks: usize = 0,
 
     pub fn reader(self: *MockReader) engine.VideoReader {
         return .{
@@ -224,12 +226,14 @@ const MockReader = struct {
     fn seekToFrameImpl(ctx: *anyopaque, frame_idx: usize) anyerror!void {
         const self: *MockReader = @ptrCast(@alignCast(ctx));
         self.current_frame = frame_idx;
+        self.seeks += 1;
     }
 
     fn nextFrameImpl(ctx: *anyopaque) anyerror!?types.FrameRef {
         const self: *MockReader = @ptrCast(@alignCast(ctx));
         if (self.current_frame >= self.frames_total) return null;
         const idx = self.current_frame;
+        self.reads += 1;
         self.current_frame += 1;
         return types.FrameRef{
             .index = idx,
@@ -638,4 +642,83 @@ test "vdb: frame-only shorthand filters by SAM 3 without selecting an overlay" {
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqual(@as(usize, 1), result.rows[0].values.len);
     try std.testing.expectEqual(@as(usize, 1), result.rows[0].values[0].frame_type.index);
+}
+
+test "vdb: frame ranges seek once and decode only requested frames" {
+    const allocator = std.testing.allocator;
+    var db = Database.init(allocator);
+    defer db.deinit();
+    const predicates = [_][]const u8{
+        "frame_id BETWEEN 100 AND 102",
+        "frame_idx >= 100 AND frame_idx <= 102",
+        "99 < frame_number AND 103 > frame_number",
+        "frame_id BETWEEN 100 AND 105 AND frame_id <= 102",
+    };
+    for (predicates) |predicate| {
+        const sql = try std.fmt.allocPrint(allocator, "SELECT frame_id FROM 'video.mp4' WHERE {s}", .{predicate});
+        defer allocator.free(sql);
+        var mock = MockReader{ .frames_total = 200 };
+        var result = try db.executeQuery(sql, mock.reader(), null, null);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+        try std.testing.expectEqual(@as(i64, 100), result.rows[0].values[0].int_type);
+        try std.testing.expectEqual(@as(i64, 102), result.rows[2].values[0].int_type);
+        try std.testing.expectEqual(@as(usize, 3), mock.reads);
+        try std.testing.expectEqual(@as(usize, 1), mock.seeks);
+    }
+}
+
+test "vdb: frame range empty, EOF, limit and logical OR behavior" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+    const cases = [_]struct { predicate: []const u8, count: usize }{
+        .{ .predicate = "frame_id BETWEEN 10 AND 5", .count = 0 },
+        .{ .predicate = "frame_id BETWEEN 0 AND 0", .count = 1 },
+        .{ .predicate = "frame_id BETWEEN 198 AND 500", .count = 2 },
+        .{ .predicate = "frame_id BETWEEN 100 AND 150 LIMIT 2", .count = 2 },
+        .{ .predicate = "frame_id BETWEEN 100 AND 102 OR frame_id = 1", .count = 4 },
+        .{ .predicate = "frame_id >= 198", .count = 2 },
+        .{ .predicate = "frame_id < 3", .count = 3 },
+        .{ .predicate = "frame_id BETWEEN 4294967296 AND 4294967298", .count = 0 },
+    };
+    for (cases) |case| {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT frame_id FROM 'video.mp4' WHERE {s}", .{case.predicate});
+        defer std.testing.allocator.free(sql);
+        var mock = MockReader{ .frames_total = 200 };
+        var result = try db.executeQuery(sql, mock.reader(), null, null);
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.rows.len);
+        if (case.count == 0) try std.testing.expectEqual(@as(usize, 0), mock.reads);
+    }
+}
+
+test "vdb: frame ranges filter index candidates before seeking" {
+    const allocator = std.testing.allocator;
+    var db = Database.init(allocator);
+    defer db.deinit();
+    var builder = index.IndexBuilder.init(allocator);
+    defer builder.deinit();
+    for ([_]u32{ 1, 100, 101, 150 }) |frame| {
+        try builder.addDetection(frame, frame * 33, "cat", 0.9, .{ .x = 0, .y = 0, .w = 1, .h = 1 });
+    }
+    try db.registerIndex("video.mp4", try builder.build());
+    var mock = MockReader{ .frames_total = 200 };
+    var result = try db.executeQuery("SELECT frame_id FROM 'video.mp4' WHERE frame_id BETWEEN 100 AND 102 AND yolov8(frame) CONTAINS 'cat'", mock.reader(), null, null);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), mock.reads);
+    try std.testing.expectEqual(@as(usize, 2), mock.seeks);
+}
+
+test "vdb: bounded sampled scans retain frame-zero step alignment" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+    var mock = MockReader{ .frames_total = 100 };
+    var result = try db.executeQuery("SELECT frame_id FROM video('video.mp4', 5) WHERE frame_id BETWEEN 11 AND 21", mock.reader(), null, null);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 15), result.rows[0].values[0].int_type);
+    try std.testing.expectEqual(@as(i64, 20), result.rows[1].values[0].int_type);
+    try std.testing.expectEqual(@as(usize, 6), mock.reads);
+    try std.testing.expectEqual(@as(usize, 1), mock.seeks);
 }

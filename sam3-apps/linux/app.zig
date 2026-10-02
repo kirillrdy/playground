@@ -203,6 +203,7 @@ pub const App = struct {
     search_anchor: ?usize = null,
     completion_visible: bool = false,
     completion_index: usize = 0,
+    completion_cache: vdb.completion.Matches = .{},
     repeat_key: ?u32 = null,
     repeat_next_ms: i64 = 0,
     browser_open: bool = false,
@@ -258,11 +259,12 @@ pub const App = struct {
         };
 
         app.setWindowTitle("SAM 3 — Visual Database");
-        app.setStatus("Ready. Open a video or enter a visual query.");
+        app.setStatus("Enter SQL with FROM to choose a video.");
         return app;
     }
 
     pub fn deinit(self: *App) void {
+        self.completion_cache.deinit(self.allocator);
         for (self.query_tabs.items) |tab| tab.query_cancel.store(true, .release);
         for (self.query_tabs.items) |tab| {
             if (tab.query_thread) |thread| thread.join();
@@ -306,8 +308,7 @@ pub const App = struct {
         g_app = self;
         _ = here.id(.computeQuery);
         _ = here.id(.computeTextFeatures);
-        // Open sample image by default
-        _ = self.openImageFromPath(self.example_path);
+        self.newQuery();
 
         self.pending_width = self.client.width;
         self.pending_height = self.client.height;
@@ -660,22 +661,26 @@ pub const App = struct {
         if (button != 0x110 and button != 0x111) return false;
 
         const suggestions = self.queryCompletions();
-        if (suggestions.len > 0 and button == 0x110 and x >= 16 and x < 236 and y >= 96 and y < 96 + 24 * suggestions.len) {
-            self.completion_index = (y - 96) / 24;
+        if (suggestions.len > 0 and button == 0x110 and x >= 16 and x < 16 + self.completionWidth() and y >= 136 and y < 136 + 24 * suggestions.len) {
+            self.completion_index = (y - 136) / 24;
             self.acceptQueryCompletion();
             return false;
         }
         self.completion_visible = false;
 
-        if (y >= 102 and y < 130 and button == 0x110 and self.query_tabs.items.len > 0) {
+        if (y >= 40 and y < 68 and button == 0x110 and x >= stride -| 40 and x < stride -| 16) {
+            self.newQuery();
+            return false;
+        }
+        if (y >= 40 and y < 68 and button == 0x110 and self.query_tabs.items.len > 0) {
             const count = self.query_tabs.items.len;
             const selected = self.selected_query orelse 0;
             if (x >= 16 and x < 40) {
                 self.selectQuery(if (selected == 0) count - 1 else selected - 1);
-            } else if (x >= stride -| 40 and x < stride -| 16) {
+            } else if (x >= stride -| 72 and x < stride -| 48) {
                 self.selectQuery((selected + 1) % count);
             } else {
-                const visible = @max(1, (stride -| 96) / 160);
+                const visible = @max(1, (stride -| 128) / 160);
                 const first = @min(selected, count -| visible);
                 if (x >= 48) {
                     const index = first + (x - 48) / 160;
@@ -694,7 +699,7 @@ pub const App = struct {
 
         // SQL query input
         const q_x: usize = 16;
-        const q_y: usize = 40;
+        const q_y: usize = 80;
         const q_h: usize = 54;
         const btn_gap: usize = 8;
         const run_btn_w: usize = 124;
@@ -735,30 +740,8 @@ pub const App = struct {
         self.search_focused = false;
         self.search_anchor = null;
 
-        // Action toolbar
-        const tb_y: usize = 138;
-        if (y >= tb_y and y <= tb_y + 28 and button == 0x110) {
-            if (x >= 16 and x <= 132) {
-                self.openBrowser();
-                return false;
-            }
-            const tool_x: usize = if (self.selectedIndexing()) 380 else 140;
-            if (x >= tool_x and x <= tool_x + 140) {
-                self.click_mode_add = !self.click_mode_add;
-                return false;
-            }
-            if (x >= tool_x + 148 and x <= tool_x + 298) {
-                self.handleClearPoints();
-                return false;
-            }
-            if (x >= tool_x + 306 and x <= tool_x + 426) {
-                _ = self.openImageFromPath(self.example_path);
-                return false;
-            }
-        }
-
         // 4. Video Playback Controls (below canvas)
-        const video_bar_y: usize = self.client.height -| 82;
+        const video_bar_y: usize = self.client.height -| 44;
         if (self.video_active and y >= video_bar_y and y < video_bar_y + 28 and button == 0x110) {
             if (x >= 16 and x < 86) {
                 self.toggleVideoPlay();
@@ -782,41 +765,6 @@ pub const App = struct {
             }
         }
 
-        // 5. Masks bar (bottom)
-        const mask_bar_y: usize = self.client.height -| 44;
-        if (y >= mask_bar_y and y <= mask_bar_y + 28 and button == 0x110) {
-            self.mutex.lock(self.io) catch return false;
-            defer self.mutex.unlock(self.io);
-            if (self.masks) |m| {
-                var cur_btn_x: usize = 16;
-                for (0..m.count) |i| {
-                    if (x >= cur_btn_x and x <= cur_btn_x + 160) {
-                        const target_idx: i32 = @intCast(i);
-                        if (self.selected_mask == target_idx) {
-                            self.selected_mask = -1;
-                        } else {
-                            self.selected_mask = target_idx;
-                        }
-                        self.renderComposite(self.selected_mask);
-                        return false;
-                    }
-                    cur_btn_x += 168;
-                }
-            }
-        }
-
-        // 6. Canvas click for point prompt
-        if (self.image != null and self.img_rect_w > 0 and self.img_rect_h > 0) {
-            if (x >= self.img_rect_x and x < self.img_rect_x + self.img_rect_w and
-                y >= self.img_rect_y and y < self.img_rect_y + self.img_rect_h)
-            {
-                const norm_x = @as(f32, @floatFromInt(x - self.img_rect_x)) / @as(f32, @floatFromInt(self.img_rect_w));
-                const norm_y = @as(f32, @floatFromInt(y - self.img_rect_y)) / @as(f32, @floatFromInt(self.img_rect_h));
-
-                const is_pos: c_int = if (button == 0x111) 0 else if (self.click_mode_add) 1 else 0;
-                self.handleCanvasClick(norm_x, norm_y, is_pos);
-            }
-        }
         return false;
     }
 
@@ -827,11 +775,8 @@ pub const App = struct {
         const q_w = self.client.width -| 404;
         const kind: wayland.Cursor = if (getResizeCursor(edges)) |c|
             c
-        else if (x >= 16 and x < 16 + q_w and y >= 40 and y < 94)
+        else if (x >= 16 and x < 16 + q_w and y >= 80 and y < 134)
             .text
-        else if (self.image != null and x >= self.img_rect_x and x < self.img_rect_x + self.img_rect_w and
-            y >= self.img_rect_y and y < self.img_rect_y + self.img_rect_h)
-            .crosshair
         else
             .arrow;
         try self.client.setCursor(kind);
@@ -890,9 +835,22 @@ pub const App = struct {
 
     fn queryCompletions(self: *App) vdb.completion.Matches {
         if (!self.completion_visible or !self.search_focused or self.browser_open or self.selection() != null) return .{};
-        var matches = vdb.completion.suggest(self.search_text[0..self.search_len], self.search_caret);
+        var matches = self.completion_cache;
         matches.len = @min(matches.len, 8);
         return matches;
+    }
+
+    fn refreshCompletions(self: *App) void {
+        self.completion_cache.deinit(self.allocator);
+        self.completion_cache = vdb.completion.complete(self.allocator, self.io, self.search_text[0..self.search_len], self.search_caret) catch .{};
+    }
+
+    fn completionWidth(self: *const App) usize {
+        var width: usize = 220;
+        for (self.completion_cache.items[0..@min(self.completion_cache.len, 8)]) |word| {
+            width = @max(width, word.len * font.font_width + 20);
+        }
+        return @min(width, self.client.width -| 32);
     }
 
     fn acceptQueryCompletion(self: *App) void {
@@ -910,9 +868,17 @@ pub const App = struct {
         @memcpy(self.search_text[matches.start..][0..word.len], word);
         self.search_len = new_len;
         self.search_caret = matches.start + word.len;
+        const directory = word.len >= 2 and word[word.len - 2] == '/' and (word[word.len - 1] == '\'' or word[word.len - 1] == '"');
+        if (directory) self.search_caret -= 1;
         self.search_anchor = null;
         self.completion_visible = false;
         self.adjustSearchScroll();
+        self.editQuery(self.search_text[0..self.search_len]);
+        if (directory) {
+            self.refreshCompletions();
+            self.completion_index = 0;
+            self.completion_visible = true;
+        }
     }
 
     fn handleKey(self: *App, key: u32, state: u32) void {
@@ -931,10 +897,6 @@ pub const App = struct {
         if (state != 1) return;
         if (key == 58) {
             self.caps_lock = !self.caps_lock;
-            return;
-        }
-        if (self.ctrl_down and key == 24) { // Ctrl+O: Open file
-            self.openBrowser();
             return;
         }
         if (self.browser_open) {
@@ -979,9 +941,6 @@ pub const App = struct {
                     self.stepVideo();
                     return;
                 }
-            } else if (key == 46) { // C: Hide/Clear masks
-                self.handleClearPoints();
-                return;
             } else if (key == 1) { // Escape
                 if (self.selectedQueryActive()) {
                     self.handleCancelQuery();
@@ -1069,18 +1028,15 @@ pub const App = struct {
             },
         }
         self.adjustSearchScroll();
+        self.editQuery(self.search_text[0..self.search_len]);
+        self.refreshCompletions();
     }
 
     fn triggerFind(self: *App) void {
-        if (self.is_busy) return;
-        if (self.search_len == 0) return;
-        const phrase = self.search_text[0..self.search_len];
-        if (isQuerySql(phrase)) {
-            self.handleQuery(phrase);
-            return;
-        }
-        if (self.image == null and !self.video_active) return;
-        self.handleFindText(phrase);
+        if (self.is_busy or self.search_len == 0) return;
+        self.editQuery(self.search_text[0..self.search_len]);
+        self.completion_visible = false;
+        self.handleQuery(self.search_text[0..self.search_len]);
     }
 
     fn handleCanvasClick(self: *App, norm_x: f32, norm_y: f32, is_positive: c_int) void {
@@ -1278,6 +1234,29 @@ pub const App = struct {
         self.refreshQueryTabs();
     }
 
+    fn editQuery(self: *App, text: []const u8) void {
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        if (self.selectedTab()) |tab| tab.setDraft(text) catch {};
+    }
+
+    fn newQuery(self: *App) void {
+        if (self.is_busy) return;
+        const tab = QueryTab.createDraft(self.allocator, "") catch return;
+        self.mutex.lock(self.io) catch {
+            tab.deinit();
+            return;
+        };
+        self.query_tabs.append(self.allocator, tab) catch {
+            self.mutex.unlock(self.io);
+            tab.deinit();
+            return;
+        };
+        const index = self.query_tabs.items.len - 1;
+        self.mutex.unlock(self.io);
+        self.selectQuery(index);
+    }
+
     fn closeQuery(self: *App, index: usize) void {
         if (self.is_busy or index >= self.query_tabs.items.len) return;
         self.mutex.lock(self.io) catch return;
@@ -1317,6 +1296,7 @@ pub const App = struct {
                 self.setStatus("Query closed.");
             }
         }
+        if (self.query_tabs.items.len == 0) self.newQuery();
         self.refreshQueryTabs();
         vdb.query_tab.reapClosed(&self.closed_queries);
     }
@@ -1326,20 +1306,37 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return;
         self.selected_query = index;
         const tab = self.query_tabs.items[index];
+        self.video_overlay_prompts = .{};
+        self.video_phrase_len = 0;
         self.mutex.unlock(self.io);
-        _ = self.openVideoFromPath(tab.query_path.?);
-        self.search_len = @min(tab.sql.len, self.search_text.len);
-        @memcpy(self.search_text[0..self.search_len], tab.sql[0..self.search_len]);
+        if (tab.query_path.?.len > 0) {
+            _ = self.openVideoFromPath(tab.query_path.?);
+        } else {
+            self.stopVideo();
+            self.mutex.lock(self.io) catch return;
+            if (self.image) |*img| img.deinit(self.allocator);
+            self.image = null;
+            self.allocator.free(self.frame);
+            self.frame = &.{};
+            if (self.masks) |*m| m.deinit();
+            self.masks = null;
+            self.mutex.unlock(self.io);
+            self.redraw_pending.store(true, .release);
+        }
+        self.search_len = @min(tab.draft.len, self.search_text.len);
+        @memcpy(self.search_text[0..self.search_len], tab.draft[0..self.search_len]);
         self.search_caret = self.search_len;
         self.search_anchor = null;
+        self.search_focused = true;
+        self.completion_visible = false;
         self.adjustSearchScroll();
         self.mutex.lock(self.io) catch return;
         self.setStatus(tab.status[0..tab.status_len]);
         self.mutex.unlock(self.io);
         self.mutex.lock(self.io) catch return;
         if (tab.query_matches.items.len > 0) {
-            tab.query_match_idx = 0;
-            self.video_seek_target = @as(f64, @floatFromInt(tab.query_matches.items[0])) * 0.0333;
+            tab.query_match_idx = @min(tab.query_match_idx, tab.query_matches.items.len - 1);
+            self.video_seek_target = tab.matchTime(tab.query_match_idx);
             self.video_step_requested = true;
         }
         self.mutex.unlock(self.io);
@@ -1402,6 +1399,7 @@ pub const App = struct {
             tab.query_prompts = .{};
             tab.precache_phrase_len = 0;
             tab.query_matches.clearRetainingCapacity();
+            tab.query_match_pts.clearRetainingCapacity();
             tab.query_match_idx = 0;
         }
         self.video_overlay_prompts = .{};
@@ -1418,6 +1416,7 @@ pub const App = struct {
         self.search_caret = 0;
         self.search_anchor = null;
         self.search_scroll = 0;
+        self.editQuery("");
         self.setStatus("Query cleared.");
     }
 
@@ -1447,6 +1446,11 @@ pub const App = struct {
             }
         } else |_| {}
 
+        if (parsed_source_path == null) {
+            if (self.selectedTab()) |tab| self.setQueryStatus(tab, "Include FROM 'video.mp4' in this tab's query.");
+            return;
+        }
+
         // If a video path is specified in the query, resolve and open it
         if (parsed_source_path) |source_file| {
             if (resolveVideoPath(self.allocator, source_file)) |resolved| {
@@ -1462,13 +1466,13 @@ pub const App = struct {
             } else {
                 var err_buf: [256]u8 = undefined;
                 const err_msg = std.fmt.bufPrintZ(&err_buf, "Could not find video file: “{s}”", .{source_file}) catch "Video not found.";
-                self.setStatus(err_msg);
+                if (self.selectedTab()) |current| self.setQueryStatus(current, err_msg);
                 return;
             }
         }
 
         if (!self.video_active or self.video_path == null) {
-            self.setStatus("Specify a video in FROM 'video.mp4' or open a video first.");
+            if (self.selectedTab()) |current| self.setQueryStatus(current, "Could not load the video specified in FROM.");
             return;
         }
         const tab = QueryTab.create(self.allocator, trimmed, self.video_path.?) catch return;
@@ -1476,12 +1480,25 @@ pub const App = struct {
             tab.deinit();
             return;
         };
-        self.query_tabs.append(self.allocator, tab) catch {
-            self.mutex.unlock(self.io);
-            tab.deinit();
-            return;
-        };
-        self.selected_query = self.query_tabs.items.len - 1;
+        if (self.selected_query) |selected| {
+            const old = self.query_tabs.items[selected];
+            self.closed_queries.append(self.allocator, old) catch {
+                self.mutex.unlock(self.io);
+                tab.deinit();
+                return;
+            };
+            old.query_cancel.store(true, .release);
+            self.query_tabs.items[selected] = tab;
+        } else {
+            self.query_tabs.append(self.allocator, tab) catch {
+                self.mutex.unlock(self.io);
+                tab.deinit();
+                return;
+            };
+            self.selected_query = self.query_tabs.items.len - 1;
+        }
+        self.video_overlay_prompts = .{};
+        self.video_phrase_len = 0;
         self.mutex.unlock(self.io);
         self.setQueryStatus(tab, "Planning query in the background…");
         self.refreshQueryTabs();
@@ -1606,7 +1623,10 @@ pub const App = struct {
                     app.mutex.unlock(app.io);
                     return error.QueryCancelled;
                 }
-                streamer.tab.query_matches.append(app.allocator, @intCast(idx)) catch {};
+                streamer.tab.appendMatch(@intCast(idx), match_pts) catch |err| {
+                    app.mutex.unlock(app.io);
+                    return err;
+                };
                 const total = streamer.tab.query_matches.items.len;
 
                 if (!streamer.first_match_emitted) {
@@ -1686,7 +1706,7 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return;
         const total_matches = tab.query_matches.items.len;
         const first_frame = if (total_matches > 0) tab.query_matches.items[0] else 0;
-        const first_frame_target = if (total_matches > 0) @as(f64, @floatFromInt(first_frame)) * 0.0333 else null;
+        const first_frame_target = if (total_matches > 0) tab.matchTime(0) else null;
         self.mutex.unlock(self.io);
 
         if (total_matches > 0) {
@@ -1875,6 +1895,15 @@ pub const App = struct {
             return false;
         };
         self.video_path = owned;
+        if (self.selectedTab()) |tab| {
+            if (!tab.has_run and !std.mem.eql(u8, tab.query_path.?, owned)) {
+                const source = self.allocator.dupeZ(u8, owned) catch null;
+                if (source) |path_copy| {
+                    self.allocator.free(tab.query_path.?);
+                    tab.query_path = path_copy;
+                }
+            }
+        }
         self.video_active = true;
         self.video_stop.store(false, .release);
         self.video_seek_target = 0;
@@ -1948,7 +1977,7 @@ pub const App = struct {
         if (self.isQueryVideo() and self.queryMatches().len > 0) {
             self.selectedTab().?.query_match_idx = (self.selectedTab().?.query_match_idx + 1) % self.queryMatches().len;
             const target_frame = self.queryMatches()[self.selectedTab().?.query_match_idx];
-            const target_sec = @as(f64, @floatFromInt(target_frame)) * 0.0333;
+            const target_sec = self.selectedTab().?.matchTime(self.selectedTab().?.query_match_idx);
             self.video_seek_target = target_sec;
             self.video_step_requested = true;
             const cur = self.selectedTab().?.query_match_idx + 1;
@@ -2194,7 +2223,7 @@ pub const App = struct {
                         self.selectedTab().?.query_match_idx = 0;
                     }
                     const next_match_frame = self.queryMatches()[self.selectedTab().?.query_match_idx];
-                    const next_sec = @as(f64, @floatFromInt(next_match_frame)) * 0.0333;
+                    const next_sec = self.selectedTab().?.matchTime(self.selectedTab().?.query_match_idx);
                     self.video_seek_target = next_sec;
                     self.video_step_requested = true;
                     const cur_num = self.selectedTab().?.query_match_idx + 1;
@@ -2564,28 +2593,30 @@ pub const App = struct {
         const tab_count = self.query_tabs.items.len;
         if (tab_count > 0) {
             const selected = self.selected_query orelse 0;
-            const visible = @max(1, (stride -| 96) / 160);
+            const visible = @max(1, (stride -| 128) / 160);
             const first = @min(selected, tab_count -| visible);
-            font.drawButton(pixels, stride, 16, 102, 24, 28, "<", false, false, 0x008892a0);
-            font.drawButton(pixels, stride, stride -| 40, 102, 24, 28, ">", false, false, 0x008892a0);
+            font.drawButton(pixels, stride, 16, 40, 24, 28, "<", false, false, 0x008892a0);
+            font.drawButton(pixels, stride, stride -| 72, 40, 24, 28, ">", false, false, 0x008892a0);
             for (first..@min(tab_count, first + visible)) |index| {
                 const tab = self.query_tabs.items[index];
-                const state = if (tab.query_active.load(.acquire))
+                const state = if (!tab.has_run) "new" else if (tab.query_active.load(.acquire))
                     if (tab.query_cancel.load(.acquire)) "cancelling" else "running"
                 else if (tab.query_cancel.load(.acquire)) "cancelled" else "done";
                 var label_buf: [48]u8 = undefined;
-                const label = std.fmt.bufPrint(&label_buf, "Q{d}: {s} ({d})", .{ index + 1, state, tab.query_matches.items.len }) catch "Query";
+                const label = std.fmt.bufPrint(&label_buf, "Q{d} {s}", .{ index + 1, state }) catch "Query";
                 const tab_x = 48 + (index - first) * 160;
-                font.drawButton(pixels, stride, tab_x, 102, 128, 28, label, index == selected, tab.query_active.load(.acquire), 0x0000dc64);
-                font.drawButton(pixels, stride, tab_x + 128, 102, 24, 28, "x", false, false, 0x008892a0);
+                font.drawButton(pixels, stride, tab_x, 40, 128, 28, label, index == selected, tab.query_active.load(.acquire), 0x0000dc64);
+                font.drawButton(pixels, stride, tab_x + 128, 40, 24, 28, "x", false, false, 0x008892a0);
             }
         } else {
-            font.drawText(pixels, stride, "Run SQL to create a query tab", 16, 108, 0x0068707c);
+            font.drawText(pixels, stride, "New query", 16, 46, 0x0068707c);
         }
+
+        font.drawButton(pixels, stride, stride -| 40, 40, 24, 28, "+", false, false, 0x0000dc64);
 
         // SQL query console
         const q_x: usize = 16;
-        const q_y: usize = 40;
+        const q_y: usize = 80;
         const q_h: usize = 54;
         const btn_gap: usize = 8;
         const run_btn_w: usize = 124;
@@ -2602,8 +2633,8 @@ pub const App = struct {
 
         const max_cols = if (q_w > 20) (q_w - 20) / font.font_width else 10;
         if (self.search_len == 0) {
-            font.drawText(pixels, stride, "Visual SQL query (e.g. SELECT frame FROM 'video.mp4' WHERE sam3(frame, 'person') > 0.5)", q_x + 10, q_y + 10, 0x0068707c);
-            font.drawText(pixels, stride, "or enter a concept word to find/segment", q_x + 10, q_y + 30, 0x0068707c);
+            font.drawText(pixels, stride, "SELECT frame FROM 'video.mp4' WHERE frame_id BETWEEN 100 AND 200", q_x + 10, q_y + 10, 0x0068707c);
+            font.drawText(pixels, stride, "Use FROM to choose this tab's video", q_x + 10, q_y + 30, 0x0068707c);
         } else {
             var line1_end: usize = 0;
             var line2_start: usize = 0;
@@ -2648,35 +2679,25 @@ pub const App = struct {
         font.drawButton(pixels, stride, clear_btn_x, q_y, clear_btn_w, q_h, "Clear Query", false, false, 0x008892a0);
 
         // Action toolbar
-        const tb_y: usize = 138;
-        font.drawButton(pixels, stride, 16, tb_y, 116, 28, "Open…", false, false, 0x0000dc64);
+        const tb_y: usize = 146;
 
         const precaching = self.selectedIndexing();
-        var tool_x: usize = 140;
+        const tool_x: usize = 16;
         if (precaching) {
             font.fillRect(pixels, stride, tool_x, tb_y + 11, 100, 6, 0x002c3038);
             font.fillRect(pixels, stride, tool_x, tb_y + 11, @intFromFloat(100.0 * self.selectedTab().?.precache_progress), 6, 0x0000b8ff);
             var pct_buf: [32]u8 = undefined;
             const pct_str = std.fmt.bufPrint(&pct_buf, "Indexing {d:.1}%", .{self.selectedTab().?.precache_progress * 100.0}) catch "Indexing…";
             font.drawText(pixels, stride, pct_str, tool_x + 108, tb_y + 6, 0x0000b8ff);
-            tool_x += 240;
         }
 
-        const mode_text = if (self.click_mode_add) "Add to mask" else "Cut from mask";
-        font.drawButton(pixels, stride, tool_x, tb_y, 140, 28, mode_text, false, !self.click_mode_add, 0x0000dc64);
-        tool_x += 148;
-        font.drawButton(pixels, stride, tool_x, tb_y, 150, 28, "Hide/Clear Masks", false, false, 0x0000dc64);
-        tool_x += 158;
-        font.drawButton(pixels, stride, tool_x, tb_y, 120, 28, "Sample Image", false, false, 0x0000dc64);
-
         // Selected query status
-        font.drawText(pixels, stride, self.status_text[0..self.status_len], 16, 172, 0x00969ba5);
+        font.drawText(pixels, stride, self.status_text[0..self.status_len], 16, 180, 0x00969ba5);
 
         // 5. Layout geometry for Canvas and Controls Below Canvas
-        const mask_bar_y: usize = h -| 44;
-        const video_bar_y: usize = h -| 82;
-        const cy: usize = 194;
-        const canvas_bottom: usize = if (self.video_active) video_bar_y -| 8 else mask_bar_y -| 8;
+        const video_bar_y: usize = h -| 44;
+        const cy: usize = 202;
+        const canvas_bottom: usize = if (self.video_active) video_bar_y -| 8 else h -| 16;
         const ch = if (canvas_bottom > cy) canvas_bottom - cy else 100;
         const cw = if (stride > 32) stride - 32 else 100;
         self.canvas_x = 16;
@@ -2753,25 +2774,19 @@ pub const App = struct {
             }
         }
 
-        // 8. Bottom Masks Bar
-        if (self.masks) |m| {
-            var cur_btn_x: usize = 16;
-            for (0..m.count) |i| {
-                var title_buf: [64]u8 = undefined;
-                const star = if (@as(i32, @intCast(i)) == self.best_mask_idx) "*" else "";
-                const cov = if (self.coverages.len > i) self.coverages[i] * 100.0 else 0;
-                const mtitle = std.fmt.bufPrint(&title_buf, "Mask {d}{s} ({d:.2}%)", .{ i, star, cov }) catch "Mask";
-                const is_active = (@as(i32, @intCast(i)) == self.selected_mask);
-
-                font.drawButton(pixels, stride, cur_btn_x, mask_bar_y, 160, 28, mtitle, false, is_active, 0x0000dc64);
-                cur_btn_x += 168;
-            }
-        }
         const suggestions = self.queryCompletions();
         if (suggestions.len > 0) {
+            const width = self.completionWidth();
+            const columns = (width -| 20) / font.font_width;
             for (suggestions.items[0..suggestions.len], 0..) |word, i| {
-                font.fillRect(pixels, stride, 16, 96 + i * 24, 220, 24, if (i == self.completion_index) 0x00323742 else 0x0023272e);
-                font.drawText(pixels, stride, word, 26, 100 + i * 24, if (i == self.completion_index) 0x0000dc64 else 0x00f2f4f6);
+                const color: u32 = if (i == self.completion_index) 0x0000dc64 else 0x00f2f4f6;
+                font.fillRect(pixels, stride, 16, 136 + i * 24, width, 24, if (i == self.completion_index) 0x00323742 else 0x0023272e);
+                if (word.len > columns and columns > 3) {
+                    font.drawText(pixels, stride, "...", 26, 140 + i * 24, color);
+                    font.drawText(pixels, stride, word[word.len - (columns - 3) ..], 26 + 3 * font.font_width, 140 + i * 24, color);
+                } else {
+                    font.drawText(pixels, stride, word[0..@min(word.len, columns)], 26, 140 + i * 24, color);
+                }
             }
         }
         if (self.browser_open) self.drawBrowser(pixels, stride, h);

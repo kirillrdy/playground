@@ -23,6 +23,8 @@ typedef struct {
     void (*on_select_query)(size_t index);
     void (*on_close_query)(size_t index);
     void (*on_reap_queries)(void);
+    void (*on_new_query)(void);
+    void (*on_edit_query)(const char *text);
     void (*on_canvas_click)(float norm_x, float norm_y, int is_positive);
     void (*on_select_mask)(int mask_index);
 } SamCallbacks;
@@ -57,6 +59,7 @@ void sam_macos_set_query_tabs(const char *labels, int selected);
 void sam_macos_set_query_text(const char *sql);
 void *sam_macos_video_open(const char *path, double start_seconds);
 double sam_macos_video_duration(void *reader);
+double sam_macos_video_fps(void *reader);
 int sam_macos_video_next(void *reader, SamVideoFrame *frame);
 void sam_macos_video_free_frame(SamVideoFrame *frame);
 void sam_macos_video_close(void *reader);
