@@ -5,6 +5,9 @@
 #include <math.h>
 #import "bridge.h"
 
+extern size_t sam_query_completions(const char *text, size_t caret, size_t *start,
+                                    size_t *end, const char **output, size_t capacity);
+
 static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
     if (!url || !callbacks) return;
     UTType *type = [UTType typeWithFilenameExtension:url.pathExtension];
@@ -202,6 +205,10 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
 @property (nonatomic, strong) SamCanvasView *canvasView;
 @property (nonatomic, strong) NSTextField *statusLabel;
 @property (nonatomic, strong) NSTextField *conceptField;
+@property (nonatomic, strong) NSPanel *completionPanel;
+@property (nonatomic, strong) NSArray<NSString *> *completions;
+@property (nonatomic, assign) NSRange completionRange;
+@property (nonatomic, assign) NSUInteger completionIndex;
 @property (nonatomic, strong) NSButton *openBtn;
 @property (nonatomic, strong) NSButton *playBtn;
 @property (nonatomic, strong) NSButton *stepBtn;
@@ -214,7 +221,7 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
 @property (nonatomic, strong) NSButton *findBtn;
 @property (nonatomic, strong) NSButton *clearQueryBtn;
 @property (nonatomic, strong) NSButton *cancelQueryBtn;
-@property (nonatomic, strong) NSSegmentedControl *queryTabs;
+@property (nonatomic, strong) NSStackView *queryTabs;
 @property (nonatomic, strong) NSScrollView *queryTabsScroll;
 @property (nonatomic, strong) NSProgressIndicator *precacheProgress;
 @property (nonatomic, strong) NSTextField *precachePercent;
@@ -273,14 +280,15 @@ static SamAppDelegate *g_delegate = nil;
 
     NSView *contentView = _window.contentView;
 
-    _queryTabs = [[NSSegmentedControl alloc] init];
-    _queryTabs.trackingMode = NSSegmentSwitchTrackingSelectOne;
-    _queryTabs.target = self;
-    _queryTabs.action = @selector(selectQueryTab:);
+    _queryTabs = [[NSStackView alloc] init];
+    _queryTabs.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    _queryTabs.spacing = 8;
     _queryTabsScroll = [[NSScrollView alloc] init];
     _queryTabsScroll.hasHorizontalScroller = YES;
     _queryTabsScroll.drawsBackground = NO;
     _queryTabsScroll.documentView = _queryTabs;
+    [NSTimer scheduledTimerWithTimeInterval:0.2 target:self selector:@selector(reapQueries:)
+        userInfo:nil repeats:YES];
 
     // Row 1
     // File button
@@ -320,6 +328,9 @@ static SamAppDelegate *g_delegate = nil;
     _conceptField.target = self;
     _conceptField.action = @selector(findClick:);
     _conceptField.delegate = self;
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(querySelectionChanged:)
+        name:NSTextViewDidChangeSelectionNotification object:nil];
+    _conceptField.toolTip = @"SQL autocomplete: Up/Down to choose, Tab to accept, Escape to dismiss";
     _conceptField.font = [NSFont systemFontOfSize:13];
     _conceptField.usesSingleLineMode = NO;
     _conceptField.maximumNumberOfLines = 0;
@@ -512,11 +523,19 @@ static SamAppDelegate *g_delegate = nil;
     }
 }
 
-- (void)selectQueryTab:(NSSegmentedControl *)sender {
-    NSInteger index = sender.selectedSegment;
+- (void)selectQueryTab:(NSButton *)sender {
+    NSInteger index = sender.tag;
     if (index >= 0 && _callbacks && _callbacks->on_select_query) {
         _callbacks->on_select_query((size_t)index);
     }
+}
+
+- (void)closeQueryTab:(NSButton *)sender {
+    if (_callbacks && _callbacks->on_close_query) _callbacks->on_close_query((size_t)sender.tag);
+}
+
+- (void)reapQueries:(NSTimer *)timer {
+    if (_callbacks && _callbacks->on_reap_queries) _callbacks->on_reap_queries();
 }
 
 - (void)cancelQueryClick:(id)sender {
@@ -524,14 +543,121 @@ static SamAppDelegate *g_delegate = nil;
 }
 
 - (void)clearQueryClick:(id)sender {
+    [self hideCompletions];
     _conceptField.stringValue = @"";
     if (_callbacks && _callbacks->on_clear_query) {
         _callbacks->on_clear_query();
     }
 }
 
+- (void)hideCompletions {
+    [_completionPanel orderOut:nil];
+    _completions = @[];
+}
+
+- (void)showCompletions {
+    if (_completions.count == 0) { [self hideCompletions]; return; }
+    if (!_completionPanel) {
+        _completionPanel = [[NSPanel alloc] initWithContentRect:NSZeroRect
+            styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+            backing:NSBackingStoreBuffered defer:NO];
+        _completionPanel.hasShadow = YES;
+        _completionPanel.hidesOnDeactivate = YES;
+        [_window addChildWindow:_completionPanel ordered:NSWindowAbove];
+    }
+    NSStackView *rows = [[NSStackView alloc] init];
+    rows.orientation = NSUserInterfaceLayoutOrientationVertical;
+    rows.alignment = NSLayoutAttributeLeading;
+    rows.spacing = 0;
+    rows.edgeInsets = NSEdgeInsetsMake(4, 4, 4, 4);
+    for (NSUInteger i = 0; i < _completions.count; i++) {
+        NSString *title = [NSString stringWithFormat:@"%@  %@", i == _completionIndex ? @"›" : @" ", _completions[i]];
+        NSButton *button = [NSButton buttonWithTitle:title target:self action:@selector(acceptCompletionClick:)];
+        button.bordered = NO;
+        button.alignment = NSTextAlignmentLeft;
+        button.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+        button.tag = i;
+        [button.widthAnchor constraintEqualToConstant:212].active = YES;
+        [button.heightAnchor constraintEqualToConstant:24].active = YES;
+        [rows addArrangedSubview:button];
+    }
+    _completionPanel.contentView = rows;
+    NSRect field = [_window convertRectToScreen:[_conceptField convertRect:_conceptField.bounds toView:nil]];
+    [_completionPanel setFrame:NSMakeRect(NSMinX(field), NSMinY(field) - 8 - 24 * _completions.count,
+                                         220, 8 + 24 * _completions.count) display:YES];
+    [_completionPanel orderFront:nil];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    if (notification.object != _conceptField) return;
+    NSTextView *editor = (NSTextView *)_conceptField.currentEditor;
+    if (!editor || editor.hasMarkedText || editor.selectedRange.length > 0) { [self hideCompletions]; return; }
+    NSString *text = editor.string;
+    NSUInteger caret = editor.selectedRange.location;
+    if (caret > text.length) { [self hideCompletions]; return; }
+    size_t start = 0, end = 0;
+    const char *words[8];
+    size_t count = sam_query_completions(text.UTF8String,
+        [[text substringToIndex:caret] lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+        &start, &end, words, 8);
+    if (!count) { [self hideCompletions]; return; }
+    const char *utf8 = text.UTF8String;
+    NSString *before = [[NSString alloc] initWithBytes:utf8 length:start encoding:NSUTF8StringEncoding];
+    NSString *word = [[NSString alloc] initWithBytes:utf8 + start length:end - start encoding:NSUTF8StringEncoding];
+    _completionRange = NSMakeRange(before.length, word.length);
+    NSMutableArray *items = [NSMutableArray array];
+    for (size_t i = 0; i < count; i++) [items addObject:[NSString stringWithUTF8String:words[i]]];
+    _completions = items;
+    _completionIndex = 0;
+    [self showCompletions];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification *)notification {
+    if (notification.object == _conceptField) [self hideCompletions];
+}
+
+- (void)querySelectionChanged:(NSNotification *)notification {
+    if (notification.object != _conceptField.currentEditor) return;
+    NSTextView *editor = notification.object;
+    NSEventType type = NSApp.currentEvent.type;
+    if (editor.selectedRange.length > 0 || type == NSEventTypeLeftMouseDown ||
+        type == NSEventTypeLeftMouseDragged || type == NSEventTypeLeftMouseUp) [self hideCompletions];
+}
+
+- (void)acceptCompletionClick:(NSButton *)sender {
+    _completionIndex = sender.tag;
+    [self acceptCompletion];
+}
+
+- (void)acceptCompletion {
+    NSTextView *editor = (NSTextView *)_conceptField.currentEditor;
+    if (!editor || _completionIndex >= _completions.count || NSMaxRange(_completionRange) > editor.string.length) {
+        [self hideCompletions]; return;
+    }
+    if (editor.selectedRange.length || editor.selectedRange.location <= _completionRange.location ||
+        editor.selectedRange.location > NSMaxRange(_completionRange)) {
+        [self hideCompletions]; return;
+    }
+    NSString *word = _completions[_completionIndex];
+    [self hideCompletions];
+    [editor insertText:word replacementRange:_completionRange];
+    [self hideCompletions];
+}
+
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
     if (control == _conceptField) {
+        if (_completionPanel.visible && _completions.count > 0) {
+            if (commandSelector == @selector(insertTab:)) { [self acceptCompletion]; return YES; }
+            if (commandSelector == @selector(cancelOperation:)) { [self hideCompletions]; return YES; }
+            if (commandSelector == @selector(moveDown:) || commandSelector == @selector(moveUp:)) {
+                _completionIndex = (_completionIndex + (commandSelector == @selector(moveDown:) ? 1 : _completions.count - 1)) % _completions.count;
+                [self showCompletions]; return YES;
+            }
+        }
+        if (commandSelector == @selector(moveLeft:) || commandSelector == @selector(moveRight:) ||
+            commandSelector == @selector(moveToBeginningOfLine:) || commandSelector == @selector(moveToEndOfLine:)) {
+            [self hideCompletions];
+        }
         if (commandSelector == @selector(insertNewline:) || commandSelector == @selector(insertLineBreak:)) {
             NSEventModifierFlags flags = [NSEvent modifierFlags];
             if ((flags & NSEventModifierFlagShift) || (flags & NSEventModifierFlagOption)) {
@@ -546,6 +672,7 @@ static SamAppDelegate *g_delegate = nil;
 }
 
 - (void)findClick:(id)sender {
+    [self hideCompletions];
     NSString *text = [_conceptField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (text.length > 0 && _callbacks && _callbacks->on_find_text) {
         _callbacks->on_find_text([text UTF8String]);
@@ -662,6 +789,7 @@ static SamAppDelegate *g_delegate = nil;
 }
 
 - (void)windowDidResize:(NSNotification *)notification {
+    [self hideCompletions];
     [_canvasView setNeedsDisplay:YES];
     [_window invalidateCursorRectsForView:_canvasView];
 }
@@ -837,16 +965,32 @@ void sam_macos_set_query_tabs(const char *labels, int selected) {
     NSString *text = [NSString stringWithUTF8String:labels];
     NSArray<NSString *> *titles = text.length ? [text componentsSeparatedByString:@"\n"] : @[];
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSSegmentedControl *tabs = g_delegate.queryTabs;
-        tabs.segmentCount = titles.count;
-        for (NSUInteger i = 0; i < titles.count; i++) {
-            [tabs setLabel:titles[i] forSegment:i];
-            [tabs setWidth:180 forSegment:i];
+        NSStackView *tabs = g_delegate.queryTabs;
+        for (NSView *view in tabs.arrangedSubviews) {
+            [tabs removeArrangedSubview:view];
+            [view removeFromSuperview];
         }
-        tabs.selectedSegment = selected;
-        [tabs sizeToFit];
+        for (NSUInteger i = 0; i < titles.count; i++) {
+            NSButton *select = [NSButton buttonWithTitle:titles[i] target:g_delegate action:@selector(selectQueryTab:)];
+            select.tag = i;
+            select.buttonType = NSButtonTypeToggle;
+            select.bezelStyle = NSBezelStylePush;
+            select.state = (NSInteger)i == selected ? NSControlStateValueOn : NSControlStateValueOff;
+            [select.widthAnchor constraintEqualToConstant:180].active = YES;
+            NSButton *close = [NSButton buttonWithTitle:@"×" target:g_delegate action:@selector(closeQueryTab:)];
+            close.tag = i;
+            close.bordered = NO;
+            close.toolTip = @"Close query tab and cancel its running query";
+            close.accessibilityLabel = [NSString stringWithFormat:@"Close query %lu", (unsigned long)i + 1];
+            [close.widthAnchor constraintEqualToConstant:24].active = YES;
+            NSStackView *tab = [NSStackView stackViewWithViews:@[select, close]];
+            tab.spacing = 0;
+            [tabs addArrangedSubview:tab];
+        }
+        tabs.frame = NSMakeRect(0, 0, titles.count * 212, 36);
+        [tabs layoutSubtreeIfNeeded];
         if (selected >= 0 && selected < titles.count) {
-            [tabs scrollRectToVisible:NSMakeRect(selected * 180, 0, 180, tabs.bounds.size.height)];
+            [tabs scrollRectToVisible:NSMakeRect(selected * 212, 0, 204, tabs.bounds.size.height)];
         }
     });
 }
@@ -854,6 +998,7 @@ void sam_macos_set_query_tabs(const char *labels, int selected) {
 void sam_macos_set_query_text(const char *sql) {
     NSString *text = [NSString stringWithUTF8String:sql];
     dispatch_async(dispatch_get_main_queue(), ^{
+        [g_delegate hideCompletions];
         g_delegate.conceptField.stringValue = text ?: @"";
     });
 }

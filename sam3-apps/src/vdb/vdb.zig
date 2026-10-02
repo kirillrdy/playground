@@ -11,10 +11,12 @@ pub const overlay = @import("overlay.zig");
 pub const query_tab = @import("query_tab.zig");
 
 pub const query_input = @import("query_input.zig");
+pub const completion = @import("completion.zig");
 
 test {
     _ = overlay;
     _ = query_input;
+    _ = completion;
     _ = query_tab;
 }
 

@@ -10,6 +10,7 @@ pub const QueryTab = struct {
     query_thread: ?std.Thread = null,
     query_active: std.atomic.Value(bool) = .init(true),
     query_cancel: std.atomic.Value(bool) = .init(false),
+    worker_finished: std.atomic.Value(bool) = .init(false),
     query_matches: std.ArrayList(u32) = .empty,
     query_match_idx: usize = 0,
     query_prompts: overlay.Prompts = .{},
@@ -45,6 +46,56 @@ pub const QueryTab = struct {
         return std.mem.eql(u8, self.query_path.?, path orelse return false);
     }
 };
+
+/// Preserve the selected query when an earlier tab moves, or select a neighbor.
+pub fn selectionAfterClose(selected: ?usize, closed: usize, remaining: usize) ?usize {
+    if (remaining == 0) return null;
+    const index = selected orelse return null;
+    if (index > closed) return index - 1;
+    if (index == closed) return @min(closed, remaining - 1);
+    return index;
+}
+
+/// Called by the UI thread. Finished workers no longer access the app or tab.
+pub fn reapClosed(tabs: *std.ArrayList(*QueryTab)) void {
+    var i: usize = 0;
+    while (i < tabs.items.len) {
+        const tab = tabs.items[i];
+        if (tab.query_thread == null or tab.worker_finished.load(.acquire)) {
+            _ = tabs.orderedRemove(i);
+            tab.deinit();
+        } else {
+            i += 1;
+        }
+    }
+}
+
+test "closing query tabs preserves selection or selects the nearest remaining tab" {
+    try std.testing.expectEqual(@as(?usize, null), selectionAfterClose(0, 0, 0));
+    try std.testing.expectEqual(@as(?usize, 1), selectionAfterClose(2, 0, 2));
+    try std.testing.expectEqual(@as(?usize, 0), selectionAfterClose(0, 2, 2));
+    try std.testing.expectEqual(@as(?usize, 1), selectionAfterClose(1, 1, 2));
+    try std.testing.expectEqual(@as(?usize, 1), selectionAfterClose(2, 2, 2));
+}
+
+test "closed tabs retain active workers until they finish" {
+    const allocator = std.testing.allocator;
+    var tabs: std.ArrayList(*QueryTab) = .empty;
+    defer tabs.deinit(allocator);
+    const tab = try QueryTab.create(allocator, "SELECT frame", "video.mp4");
+    tab.query_cancel.store(true, .release);
+    tab.query_thread = try std.Thread.spawn(.{}, struct {
+        fn run(query: *QueryTab) void {
+            while (!query.worker_finished.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    }.run, .{tab});
+    try tabs.append(allocator, tab);
+    reapClosed(&tabs);
+    try std.testing.expectEqual(@as(usize, 1), tabs.items.len);
+    tab.worker_finished.store(true, .release);
+    reapClosed(&tabs);
+    try std.testing.expectEqual(@as(usize, 0), tabs.items.len);
+}
 
 test "query tabs keep owned sources and independent results and cancellation" {
     const allocator = std.testing.allocator;

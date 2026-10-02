@@ -21,6 +21,8 @@ const SamCallbacks = extern struct {
     on_cancel_query: ?*const fn () callconv(.c) void,
     on_clear_query: ?*const fn () callconv(.c) void,
     on_select_query: ?*const fn (index: usize) callconv(.c) void,
+    on_close_query: ?*const fn (index: usize) callconv(.c) void,
+    on_reap_queries: ?*const fn () callconv(.c) void,
     on_canvas_click: ?*const fn (norm_x: f32, norm_y: f32, is_positive: c_int) callconv(.c) void,
     on_select_mask: ?*const fn (mask_index: c_int) callconv(.c) void,
 };
@@ -201,6 +203,7 @@ pub const App = struct {
     video_seek_target: ?f64 = null,
     video_step_requested: bool = false,
     query_tabs: std.ArrayList(*QueryTab) = .empty,
+    closed_queries: std.ArrayList(*QueryTab) = .empty,
     selected_query: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model, example_path: []const u8) App {
@@ -218,6 +221,8 @@ pub const App = struct {
             if (tab.query_thread) |thread| thread.join();
             tab.query_thread = null;
         }
+        for (self.closed_queries.items) |tab| tab.deinit();
+        self.closed_queries.deinit(self.allocator);
         self.stopVideo();
         for (self.query_tabs.items) |tab| tab.deinit();
         self.query_tabs.deinit(self.allocator);
@@ -246,6 +251,8 @@ pub const App = struct {
             .on_cancel_query = &cCancelQuery,
             .on_clear_query = &cClearQuery,
             .on_select_query = &cSelectQuery,
+            .on_close_query = &cCloseQuery,
+            .on_reap_queries = &cReapQueries,
             .on_canvas_click = &cCanvasClick,
             .on_select_mask = &cSelectMask,
         };
@@ -1112,6 +1119,47 @@ pub const App = struct {
         self.refreshQueryTabs();
     }
 
+    fn closeQuery(self: *App, index: usize) void {
+        if (self.is_busy or index >= self.query_tabs.items.len) return;
+        self.mutex.lock(self.io) catch return;
+        const tab = self.query_tabs.items[index];
+        self.closed_queries.append(self.allocator, tab) catch {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        tab.query_cancel.store(true, .release);
+        const was_selected = self.selected_query == index;
+        _ = self.query_tabs.orderedRemove(index);
+        self.selected_query = vdb.query_tab.selectionAfterClose(self.selected_query, index, self.query_tabs.items.len);
+        const next = self.selected_query;
+        if (was_selected) {
+            self.video_overlay_prompts = .{};
+            self.video_phrase_len = 0;
+            self.video_seek_target = null;
+            self.video_step_requested = false;
+            if (self.masks) |*m| {
+                m.deinit();
+                self.masks = null;
+            }
+            self.selected_mask = -1;
+            self.best_mask_idx = -1;
+            self.renderComposite(-1);
+        }
+        self.mutex.unlock(self.io);
+        if (was_selected) {
+            if (next) |selected| {
+                self.selectQuery(selected);
+            } else {
+                sam_macos_set_query_text("");
+                sam_macos_set_status("Query closed.");
+                sam_macos_set_masks(0, null, 0, -1);
+                if (self.image) |img| sam_macos_set_image(self.frame.ptr, @intCast(img.width), @intCast(img.height));
+            }
+        }
+        self.refreshQueryTabs();
+        vdb.query_tab.reapClosed(&self.closed_queries);
+    }
+
     fn selectQuery(self: *App, index: usize) void {
         if (self.is_busy or index >= self.query_tabs.items.len) return;
         self.mutex.lock(self.io) catch return;
@@ -1363,6 +1411,7 @@ pub const App = struct {
             tab.query_active.store(false, .release);
             self.finishQueryStatus(tab);
             self.refreshQueryTabs();
+            tab.worker_finished.store(true, .release);
         }
         const query = tab.sql;
         if (tab.query_cancel.load(.acquire)) return;
@@ -1981,6 +2030,14 @@ fn cFindText(text: [*:0]const u8) callconv(.c) void {
 
 fn cSelectQuery(index: usize) callconv(.c) void {
     if (g_app) |app| app.selectQuery(index);
+}
+
+fn cCloseQuery(index: usize) callconv(.c) void {
+    if (g_app) |app| app.closeQuery(index);
+}
+
+fn cReapQueries() callconv(.c) void {
+    if (g_app) |app| vdb.query_tab.reapClosed(&app.closed_queries);
 }
 
 fn cCancelQuery() callconv(.c) void {

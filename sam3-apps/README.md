@@ -26,7 +26,14 @@ frame reuses the text features. On Linux, install `ffmpeg` and `ffprobe` on `PAT
 to open videos.
 
 Use **Open…** to select an image or video; the app detects the file type.
-Enter SQL in the query box and press **Run Query**. Create a visual index with:
+Enter SQL in the query box and press **Run Query**.
+
+SQL suggestions appear as you type keywords, frame columns, and model functions.
+Use **Up/Down** to select a suggestion, **Tab** or a click to accept it, and
+**Escape** to dismiss the list. **Return** runs the query; **Shift+Return** adds
+a newline. Suggestions stay hidden inside quoted prompts, paths, and SQL comments.
+
+Create a visual index with:
 
 ```sql
 CREATE INDEX ON "video.mp4" USING sam3("person");
@@ -52,6 +59,8 @@ Each SQL query opens its own tab with its SQL, matches, status, and cancellation
 control. You can edit the input and press **Run Query** to start another query while
 earlier tabs continue. Select a tab to show its video and results. **Cancel Query**
 stops only the selected tab. Model inference is shared and runs one call at a time.
+Click **×** on a query tab to close it. Closing a running query cancels its scan
+after the current frame and selects a neighboring tab; cached results remain.
 Closing the app cancels and joins all workers before releasing the model.
 
 Masks appear only for `sam3(...)` expressions in `SELECT`. A query such as
