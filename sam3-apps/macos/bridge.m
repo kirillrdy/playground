@@ -21,6 +21,7 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
 @interface SamVideoReader : NSObject
 @property (nonatomic, strong) AVAssetReader *reader;
 @property (nonatomic, strong) AVAssetReaderOutput *output;
+@property (nonatomic, assign) double fps;
 @end
 
 @implementation SamVideoReader
@@ -51,7 +52,6 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
         self.layer.borderWidth = 1.0;
         self.layer.cornerRadius = 8.0;
         self.layer.masksToBounds = YES;
-        [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
     }
     return self;
 }
@@ -95,7 +95,7 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
 - (void)resetCursorRects {
     [super resetCursorRects];
     if (_hasImage && _imageRect.size.width > 0 && _imageRect.size.height > 0) {
-        [self addCursorRect:_imageRect cursor:[NSCursor crosshairCursor]];
+        [self addCursorRect:_imageRect cursor:[NSCursor arrowCursor]];
     }
 }
 
@@ -128,7 +128,7 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
         CGContextRestoreGState(ctx);
     } else {
         _imageRect = NSZeroRect;
-        NSString *placeholder = @"Open an image or video, or drag a file here.";
+        NSString *placeholder = @"Use FROM in a SQL query to view its results.";
         NSDictionary *attrs = @{
             NSFontAttributeName: [NSFont systemFontOfSize:14],
             NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.59 green:0.61 blue:0.65 alpha:1.0]
@@ -144,60 +144,6 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
     }
 }
 
-- (void)mouseDown:(NSEvent *)event {
-    if (_isBusy || !_hasImage) return;
-    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
-    if (!NSPointInRect(p, _imageRect)) return;
-
-    float normX = (float)((p.x - _imageRect.origin.x) / _imageRect.size.width);
-    float normY = (float)((p.y - _imageRect.origin.y) / _imageRect.size.height);
-    if (normX < 0.0f) normX = 0.0f; else if (normX > 1.0f) normX = 1.0f;
-    if (normY < 0.0f) normY = 0.0f; else if (normY > 1.0f) normY = 1.0f;
-
-    BOOL shift = (event.modifierFlags & NSEventModifierFlagShift) != 0;
-    int isPositive = (_clickModeAdd && !shift) ? 1 : 0;
-
-    if (_callbacks && _callbacks->on_canvas_click) {
-        _callbacks->on_canvas_click(normX, normY, isPositive);
-    }
-}
-
-- (void)rightMouseDown:(NSEvent *)event {
-    if (_isBusy || !_hasImage) return;
-    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
-    if (!NSPointInRect(p, _imageRect)) return;
-
-    float normX = (float)((p.x - _imageRect.origin.x) / _imageRect.size.width);
-    float normY = (float)((p.y - _imageRect.origin.y) / _imageRect.size.height);
-    if (normX < 0.0f) normX = 0.0f; else if (normX > 1.0f) normX = 1.0f;
-    if (normY < 0.0f) normY = 0.0f; else if (normY > 1.0f) normY = 1.0f;
-
-    if (_callbacks && _callbacks->on_canvas_click) {
-        _callbacks->on_canvas_click(normX, normY, 0); // Always negative on right-click
-    }
-}
-
-- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
-    NSPasteboard *pboard = [sender draggingPasteboard];
-    if ([[pboard types] containsObject:NSPasteboardTypeFileURL]) {
-        return NSDragOperationCopy;
-    }
-    return NSDragOperationNone;
-}
-
-- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
-    if (_isBusy) return NO;
-    NSPasteboard *pboard = [sender draggingPasteboard];
-    if ([[pboard types] containsObject:NSPasteboardTypeFileURL]) {
-        NSURL *fileURL = [NSURL URLFromPasteboard:pboard];
-        if (fileURL && _callbacks) {
-            openMediaURL(fileURL, _callbacks);
-            return YES;
-        }
-    }
-    return NO;
-}
-
 @end
 
 @interface SamAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate>
@@ -209,15 +155,12 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
 @property (nonatomic, strong) NSArray<NSString *> *completions;
 @property (nonatomic, assign) NSRange completionRange;
 @property (nonatomic, assign) NSUInteger completionIndex;
-@property (nonatomic, strong) NSButton *openBtn;
+@property (nonatomic, strong) NSButton *addQueryBtn;
 @property (nonatomic, strong) NSButton *playBtn;
 @property (nonatomic, strong) NSButton *stepBtn;
 @property (nonatomic, strong) NSButton *restartBtn;
 @property (nonatomic, strong) NSSlider *seekSlider;
 @property (nonatomic, strong) NSTextField *timeLabel;
-@property (nonatomic, strong) NSButton *sampleBtn;
-@property (nonatomic, strong) NSSegmentedControl *modeSeg;
-@property (nonatomic, strong) NSButton *clearBtn;
 @property (nonatomic, strong) NSButton *findBtn;
 @property (nonatomic, strong) NSButton *clearQueryBtn;
 @property (nonatomic, strong) NSButton *cancelQueryBtn;
@@ -226,9 +169,6 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
 @property (nonatomic, strong) NSProgressIndicator *precacheProgress;
 @property (nonatomic, strong) NSTextField *precachePercent;
 @property (nonatomic, strong) NSProgressIndicator *spinner;
-@property (nonatomic, strong) NSStackView *masksStackView;
-@property (nonatomic, strong) NSScrollView *masksScrollView;
-@property (nonatomic, strong) NSMutableArray<NSButton *> *maskButtons;
 @property (nonatomic, assign) const SamCallbacks *callbacks;
 @property (nonatomic, assign) BOOL videoMode;
 @property (nonatomic, assign) BOOL videoPlaying;
@@ -252,7 +192,6 @@ static SamAppDelegate *g_delegate = nil;
     self = [super init];
     if (self) {
         _callbacks = callbacks;
-        _maskButtons = [NSMutableArray array];
     }
     return self;
 }
@@ -292,16 +231,13 @@ static SamAppDelegate *g_delegate = nil;
 
     // Row 1
     // File button
-    _openBtn = [NSButton buttonWithTitle:@"Open…" target:self action:@selector(openFile:)];
-    _sampleBtn = [NSButton buttonWithTitle:@"Sample Image" target:self action:@selector(sampleClick:)];
-
-    _modeSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Add to mask", @"Cut from mask"]
-                                                trackingMode:NSSegmentSwitchTrackingSelectOne
-                                                      target:self
-                                                      action:@selector(modeChanged:)];
-    _modeSeg.selectedSegment = 0;
-
-    _clearBtn = [NSButton buttonWithTitle:@"Hide/Clear Masks" target:self action:@selector(clearClick:)];
+    _addQueryBtn = [NSButton buttonWithTitle:@"+" target:self action:@selector(newQueryClick:)];
+    _addQueryBtn.toolTip = @"New query tab";
+    _addQueryBtn.accessibilityLabel = @"New query tab";
+    [_addQueryBtn.widthAnchor constraintEqualToConstant:32].active = YES;
+    [_queryTabsScroll setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSStackView *tabsRow = [NSStackView stackViewWithViews:@[_queryTabsScroll, _addQueryBtn]];
+    tabsRow.spacing = 8;
 
     // Playback Controls (below canvas)
     _playBtn = [NSButton buttonWithTitle:@"Play" target:self action:@selector(playPause:)];
@@ -324,14 +260,14 @@ static SamAppDelegate *g_delegate = nil;
 
     // TOP HERO: Visual SQL Query Field & Run Button
     _conceptField = [[NSTextField alloc] init];
-    _conceptField.placeholderString = @"Visual SQL query (e.g. SELECT frame FROM 'holes_3min.mp4' WHERE sam3(frame, 'person') > 0.5) or concept word";
+    _conceptField.placeholderString = @"SELECT frame FROM 'video.mp4' WHERE frame_id BETWEEN 100 AND 200";
     _conceptField.target = self;
     _conceptField.action = @selector(findClick:);
     _conceptField.delegate = self;
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(querySelectionChanged:)
         name:NSTextViewDidChangeSelectionNotification object:nil];
     _conceptField.toolTip = @"SQL autocomplete: Up/Down to choose, Tab to accept, Escape to dismiss";
-    _conceptField.font = [NSFont systemFontOfSize:13];
+    _conceptField.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
     _conceptField.usesSingleLineMode = NO;
     _conceptField.maximumNumberOfLines = 0;
     _conceptField.cell.wraps = YES;
@@ -376,21 +312,17 @@ static SamAppDelegate *g_delegate = nil;
     _precachePercent.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
     _precachePercent.hidden = YES;
 
-    // Toolbar: files, SQL index progress, and image point controls
+    // Progress for the selected query
     NSStackView *toolbarRow = [NSStackView stackViewWithViews:@[
-        _openBtn,
         _precacheProgress,
-        _precachePercent,
-        _modeSeg,
-        _clearBtn,
-        _sampleBtn
+        _precachePercent
     ]];
     toolbarRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     toolbarRow.spacing = 8.0;
     toolbarRow.alignment = NSLayoutAttributeCenterY;
 
     // Status Label
-    _statusLabel = [NSTextField labelWithString:@"Ready. Open a video or enter a visual query."];
+    _statusLabel = [NSTextField labelWithString:@"Enter SQL with FROM to choose a video."];
     _statusLabel.textColor = [NSColor colorWithCalibratedRed:0.59 green:0.61 blue:0.65 alpha:1.0];
     _statusLabel.font = [NSFont systemFontOfSize:13];
 
@@ -398,38 +330,25 @@ static SamAppDelegate *g_delegate = nil;
     _canvasView = [[SamCanvasView alloc] initWithFrame:NSZeroRect];
     _canvasView.callbacks = _callbacks;
 
-    // Masks Bar
-    _masksStackView = [NSStackView stackViewWithViews:@[]];
-    _masksStackView.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    _masksStackView.spacing = 8.0;
-    _masksStackView.alignment = NSLayoutAttributeCenterY;
-    _masksStackView.translatesAutoresizingMaskIntoConstraints = NO;
-
-    _masksScrollView = [[NSScrollView alloc] init];
-    _masksScrollView.hasHorizontalScroller = YES;
-    _masksScrollView.hasVerticalScroller = NO;
-    _masksScrollView.drawsBackground = NO;
-    _masksScrollView.documentView = _masksStackView;
-
     // Layout
-    for (NSView *v in @[_queryTabsScroll, queryRow, toolbarRow, _statusLabel, _canvasView, videoRow, _masksScrollView]) {
+    for (NSView *v in @[tabsRow, queryRow, toolbarRow, _statusLabel, _canvasView, videoRow]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [contentView addSubview:v];
     }
 
     [NSLayoutConstraint activateConstraints:@[
         // 1. Top Hero: Main Visual Query Console
-        [_queryTabsScroll.topAnchor constraintEqualToAnchor:queryRow.bottomAnchor constant:8.0],
-        [_queryTabsScroll.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
-        [_queryTabsScroll.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [_queryTabsScroll.heightAnchor constraintEqualToConstant:36.0],
-        [queryRow.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:8.0],
+        [tabsRow.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:8.0],
+        [tabsRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
+        [tabsRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
+        [tabsRow.heightAnchor constraintEqualToConstant:36.0],
+        [queryRow.topAnchor constraintEqualToAnchor:tabsRow.bottomAnchor constant:8.0],
         [queryRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [queryRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_conceptField.heightAnchor constraintEqualToConstant:54.0],
 
-        // 2. Action Toolbar: Open, Index, Segmentation Tools
-        [toolbarRow.topAnchor constraintEqualToAnchor:_queryTabsScroll.bottomAnchor constant:10.0],
+        // 2. Index progress
+        [toolbarRow.topAnchor constraintEqualToAnchor:queryRow.bottomAnchor constant:10.0],
         [toolbarRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [toolbarRow.trailingAnchor constraintLessThanOrEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_precacheProgress.widthAnchor constraintEqualToConstant:180.0],
@@ -449,42 +368,15 @@ static SamAppDelegate *g_delegate = nil;
         // 5. Video Playback Controls (directly under canvas)
         [videoRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [videoRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [videoRow.bottomAnchor constraintEqualToAnchor:_masksScrollView.topAnchor constant:-8.0],
+        [videoRow.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor constant:-12.0],
         [_seekSlider.widthAnchor constraintGreaterThanOrEqualToConstant:120.0],
         [_playBtn.widthAnchor constraintGreaterThanOrEqualToConstant:70.0],
 
-        // 6. Masks Scroll View
-        [_masksScrollView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
-        [_masksScrollView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
-        [_masksScrollView.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor constant:-12.0],
-        [_masksScrollView.heightAnchor constraintEqualToConstant:46.0],
-
-        // Inner stack view in scroll view
-        [_masksStackView.topAnchor constraintEqualToAnchor:_masksScrollView.contentView.topAnchor],
-        [_masksStackView.bottomAnchor constraintEqualToAnchor:_masksScrollView.contentView.bottomAnchor],
-        [_masksStackView.leadingAnchor constraintEqualToAnchor:_masksScrollView.contentView.leadingAnchor],
-        [_masksStackView.heightAnchor constraintEqualToAnchor:_masksScrollView.contentView.heightAnchor]
     ]];
 
     [_window center];
     [_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
-}
-
-- (void)openFile:(id)sender {
-    NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.canChooseFiles = YES;
-    panel.canChooseDirectories = NO;
-    panel.allowsMultipleSelection = NO;
-    if (@available(macOS 11.0, *)) {
-        panel.allowedContentTypes = @[UTTypeImage, UTTypeMovie, UTTypeVideo];
-    } else {
-        panel.allowedFileTypes = @[@"png", @"jpg", @"jpeg", @"webp", @"bmp", @"tiff", @"gif", @"mp4", @"mov", @"m4v", @"mkv", @"webm", @"avi", @"mpeg", @"mpg", @"3gp", @"ts", @"mts", @"flv", @"wmv"];
-    }
-
-    if ([panel runModal] == NSModalResponseOK) {
-        openMediaURL(panel.URLs.firstObject, _callbacks);
-    }
 }
 
 - (void)playPause:(id)sender {
@@ -503,26 +395,6 @@ static SamAppDelegate *g_delegate = nil;
     if (_callbacks && _callbacks->on_video_seek) _callbacks->on_video_seek(sender.doubleValue);
 }
 
-- (void)sampleClick:(id)sender {
-    if (_callbacks && _callbacks->on_sample_click) {
-        _callbacks->on_sample_click();
-    }
-}
-
-- (void)modeChanged:(id)sender {
-    int mode = (_modeSeg.selectedSegment == 0) ? 1 : 0;
-    _canvasView.clickModeAdd = (mode == 1);
-    if (_callbacks && _callbacks->on_mode_change) {
-        _callbacks->on_mode_change(mode);
-    }
-}
-
-- (void)clearClick:(id)sender {
-    if (_callbacks && _callbacks->on_clear_points) {
-        _callbacks->on_clear_points();
-    }
-}
-
 - (void)selectQueryTab:(NSButton *)sender {
     NSInteger index = sender.tag;
     if (index >= 0 && _callbacks && _callbacks->on_select_query) {
@@ -538,6 +410,12 @@ static SamAppDelegate *g_delegate = nil;
     if (_callbacks && _callbacks->on_reap_queries) _callbacks->on_reap_queries();
 }
 
+- (void)newQueryClick:(id)sender {
+    [self hideCompletions];
+    if (_callbacks && _callbacks->on_new_query) _callbacks->on_new_query();
+    [_window makeFirstResponder:_conceptField];
+}
+
 - (void)cancelQueryClick:(id)sender {
     if (_callbacks && _callbacks->on_cancel_query) _callbacks->on_cancel_query();
 }
@@ -545,6 +423,7 @@ static SamAppDelegate *g_delegate = nil;
 - (void)clearQueryClick:(id)sender {
     [self hideCompletions];
     _conceptField.stringValue = @"";
+    if (_callbacks && _callbacks->on_edit_query) _callbacks->on_edit_query("");
     if (_callbacks && _callbacks->on_clear_query) {
         _callbacks->on_clear_query();
     }
@@ -570,6 +449,7 @@ static SamAppDelegate *g_delegate = nil;
     rows.alignment = NSLayoutAttributeLeading;
     rows.spacing = 0;
     rows.edgeInsets = NSEdgeInsetsMake(4, 4, 4, 4);
+    CGFloat panelWidth = ([_completions.firstObject hasPrefix:@"'"] || [_completions.firstObject hasPrefix:@"\""]) ? 420 : 220;
     for (NSUInteger i = 0; i < _completions.count; i++) {
         NSString *title = [NSString stringWithFormat:@"%@  %@", i == _completionIndex ? @"›" : @" ", _completions[i]];
         NSButton *button = [NSButton buttonWithTitle:title target:self action:@selector(acceptCompletionClick:)];
@@ -577,19 +457,22 @@ static SamAppDelegate *g_delegate = nil;
         button.alignment = NSTextAlignmentLeft;
         button.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
         button.tag = i;
-        [button.widthAnchor constraintEqualToConstant:212].active = YES;
+        button.toolTip = _completions[i];
+        button.cell.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [button.widthAnchor constraintEqualToConstant:panelWidth - 8].active = YES;
         [button.heightAnchor constraintEqualToConstant:24].active = YES;
         [rows addArrangedSubview:button];
     }
     _completionPanel.contentView = rows;
     NSRect field = [_window convertRectToScreen:[_conceptField convertRect:_conceptField.bounds toView:nil]];
     [_completionPanel setFrame:NSMakeRect(NSMinX(field), NSMinY(field) - 8 - 24 * _completions.count,
-                                         220, 8 + 24 * _completions.count) display:YES];
+                                         panelWidth, 8 + 24 * _completions.count) display:YES];
     [_completionPanel orderFront:nil];
 }
 
 - (void)controlTextDidChange:(NSNotification *)notification {
     if (notification.object != _conceptField) return;
+    if (_callbacks && _callbacks->on_edit_query) _callbacks->on_edit_query(_conceptField.stringValue.UTF8String);
     NSTextView *editor = (NSTextView *)_conceptField.currentEditor;
     if (!editor || editor.hasMarkedText || editor.selectedRange.length > 0) { [self hideCompletions]; return; }
     NSString *text = editor.string;
@@ -634,14 +517,20 @@ static SamAppDelegate *g_delegate = nil;
     if (!editor || _completionIndex >= _completions.count || NSMaxRange(_completionRange) > editor.string.length) {
         [self hideCompletions]; return;
     }
-    if (editor.selectedRange.length || editor.selectedRange.location <= _completionRange.location ||
+    if (editor.selectedRange.length || editor.selectedRange.location < _completionRange.location ||
         editor.selectedRange.location > NSMaxRange(_completionRange)) {
         [self hideCompletions]; return;
     }
     NSString *word = _completions[_completionIndex];
+    NSUInteger insertionStart = _completionRange.location;
+    BOOL directory = [word hasSuffix:@"/'"] || [word hasSuffix:@"/\""];
     [self hideCompletions];
     [editor insertText:word replacementRange:_completionRange];
     [self hideCompletions];
+    if (directory) {
+        editor.selectedRange = NSMakeRange(insertionStart + word.length - 1, 0);
+        [self controlTextDidChange:[NSNotification notificationWithName:NSControlTextDidChangeNotification object:_conceptField]];
+    }
 }
 
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
@@ -674,50 +563,14 @@ static SamAppDelegate *g_delegate = nil;
 - (void)findClick:(id)sender {
     [self hideCompletions];
     NSString *text = [_conceptField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (_callbacks && _callbacks->on_edit_query) _callbacks->on_edit_query(_conceptField.stringValue.UTF8String);
     if (text.length > 0 && _callbacks && _callbacks->on_find_text) {
         _callbacks->on_find_text([text UTF8String]);
     }
 }
 
-- (void)maskClicked:(NSButton *)sender {
-    int index = (int)sender.tag;
-    BOOL isNowOn = (sender.state == NSControlStateValueOn);
-    for (NSButton *button in _maskButtons) {
-        if (button != sender) button.state = NSControlStateValueOff;
-    }
-    int selected = isNowOn ? index : -1;
-    if (_callbacks && _callbacks->on_select_mask) {
-        _callbacks->on_select_mask(selected);
-    }
-}
-
 - (void)updateMasks:(NSArray<NSDictionary *> *)masks bestIndex:(int)bestIndex selectedIndex:(int)selectedIndex {
-    for (NSButton *btn in _maskButtons) {
-        [btn removeFromSuperview];
-    }
-    [_maskButtons removeAllObjects];
-
-    for (int i = 0; i < (int)masks.count; i++) {
-        float score = [masks[i][@"score"] floatValue];
-        float coverage = [masks[i][@"coverage"] floatValue];
-        NSColor *color = [NSColor colorWithCalibratedRed:[masks[i][@"red"] doubleValue] / 255.0
-                                                  green:[masks[i][@"green"] doubleValue] / 255.0
-                                                   blue:[masks[i][@"blue"] doubleValue] / 255.0
-                                                  alpha:1.0];
-        NSString *star = (i == bestIndex) ? @" ★" : @"";
-        NSString *title = [NSString stringWithFormat:@"● Mask %d%@ (%.3f · %.1f%%)",
-                           i, star, score, coverage * 100.0f];
-
-        NSButton *btn = [NSButton buttonWithTitle:title target:self action:@selector(maskClicked:)];
-        btn.tag = i;
-        btn.bezelStyle = NSBezelStyleRounded;
-        [btn setButtonType:NSButtonTypeToggle];
-        btn.state = i == selectedIndex ? NSControlStateValueOn : NSControlStateValueOff;
-        btn.contentTintColor = color;
-
-        [_masksStackView addArrangedSubview:btn];
-        [_maskButtons addObject:btn];
-    }
+    // SQL masks are rendered together on the result canvas.
 }
 
 - (void)setQueryActive:(BOOL)active {
@@ -730,13 +583,10 @@ static SamAppDelegate *g_delegate = nil;
 
 - (void)setBusy:(BOOL)busy {
     _canvasView.isBusy = busy;
-    _openBtn.enabled = !busy;
     _playBtn.enabled = !busy && _videoMode;
     _stepBtn.enabled = !busy && _videoMode && !_videoPlaying;
     _restartBtn.enabled = !busy && _videoMode;
     _seekSlider.enabled = !busy && _videoMode && _seekSlider.maxValue > 0;
-    _sampleBtn.enabled = !busy;
-    _clearBtn.enabled = !busy;
     _findBtn.enabled = !busy;
     _cancelQueryBtn.enabled = _queryActive;
     _clearQueryBtn.enabled = !busy || _queryActive;
@@ -757,8 +607,6 @@ static SamAppDelegate *g_delegate = nil;
     _restartBtn.enabled = active && !_canvasView.isBusy;
     _seekSlider.enabled = active && !_canvasView.isBusy && _seekSlider.maxValue > 0;
     _playBtn.title = playing ? @"Pause" : @"Play";
-    _clearBtn.enabled = !_canvasView.isBusy;
-    _modeSeg.enabled = !active;
 }
 
 - (void)setVideoTimelineDuration:(double)duration position:(double)position {
@@ -823,7 +671,6 @@ int sam_macos_init(const SamCallbacks *callbacks) {
         NSMenuItem *fileMenuItem = [[NSMenuItem alloc] init];
         [menubar addItem:fileMenuItem];
         NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
-        [fileMenu addItemWithTitle:@"Open…" action:@selector(openFile:) keyEquivalent:@"o"];
         [fileMenu addItem:[NSMenuItem separatorItem]];
         [fileMenu addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
         [fileMenuItem setSubmenu:fileMenu];
@@ -1049,8 +896,15 @@ void *sam_macos_video_open(const char *path, double start_seconds) {
         SamVideoReader *handle = [[SamVideoReader alloc] init];
         handle.reader = reader;
         handle.output = output;
+        double frameDuration = CMTimeGetSeconds(output.videoComposition.frameDuration);
+        double fps = frameDuration > 0 ? 1.0 / frameDuration : tracks.firstObject.nominalFrameRate;
+        handle.fps = isfinite(fps) && fps > 0 ? fps : 30.0;
         return (void *)CFBridgingRetain(handle);
     }
+}
+
+double sam_macos_video_fps(void *opaque) {
+    return opaque ? ((__bridge SamVideoReader *)opaque).fps : 30.0;
 }
 
 double sam_macos_video_duration(void *opaque) {

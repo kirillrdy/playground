@@ -157,15 +157,27 @@ pub const Engine = struct {
                 }
             },
             .full_scan => |scan| {
-                var current_idx: usize = 0;
-                while (try reader.nextFrame()) |frame| : (current_idx += 1) {
+                if (scan.step == 0) return error.InvalidScanStep;
+                var current_idx = scan.start;
+                // Preserve sampling alignment with frame zero after seeking.
+                const offset = current_idx % scan.step;
+                if (offset != 0) current_idx = std.math.add(usize, current_idx, scan.step - offset) catch std.math.maxInt(usize);
+                const end = if (scan.end) |bound| if (bound == 0) 0 else bound - (bound - 1) % scan.step else null;
+                if (end == null or current_idx < end.?) {
                     if (cancel_token) |ct| {
                         if (ct.load(.acquire)) return error.QueryCancelled;
                     }
-                    if (current_idx % scan.step != 0) continue;
+                    if (current_idx > 0) try reader.seekToFrame(current_idx);
+                }
+                while (end == null or current_idx < end.?) : (current_idx += 1) {
+                    if (cancel_token) |ct| {
+                        if (ct.load(.acquire)) return error.QueryCancelled;
+                    }
                     if (plan.limit) |lim| {
                         if (rows.items.len >= lim) break;
                     }
+                    const frame = (try reader.nextFrame()) orelse break;
+                    if (current_idx % scan.step != 0) continue;
 
                     if (try self.processFrame(a, plan, frame, index)) |row_vals| {
                         const row_copy = try self.allocator.dupe(types.Value, row_vals);

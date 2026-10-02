@@ -23,6 +23,8 @@ const SamCallbacks = extern struct {
     on_select_query: ?*const fn (index: usize) callconv(.c) void,
     on_close_query: ?*const fn (index: usize) callconv(.c) void,
     on_reap_queries: ?*const fn () callconv(.c) void,
+    on_new_query: ?*const fn () callconv(.c) void,
+    on_edit_query: ?*const fn (text: [*:0]const u8) callconv(.c) void,
     on_canvas_click: ?*const fn (norm_x: f32, norm_y: f32, is_positive: c_int) callconv(.c) void,
     on_select_mask: ?*const fn (mask_index: c_int) callconv(.c) void,
 };
@@ -75,6 +77,7 @@ extern fn sam_macos_set_query_tabs(labels: [*:0]const u8, selected: c_int) void;
 extern fn sam_macos_set_query_text(sql: [*:0]const u8) void;
 extern fn sam_macos_video_open(path: [*:0]const u8, start_seconds: f64) ?*anyopaque;
 extern fn sam_macos_video_duration(reader: *anyopaque) f64;
+extern fn sam_macos_video_fps(reader: *anyopaque) f64;
 extern fn sam_macos_video_next(reader: *anyopaque, frame: *VideoFrame) c_int;
 extern fn sam_macos_video_free_frame(frame: *VideoFrame) void;
 extern fn sam_macos_video_close(reader: *anyopaque) void;
@@ -83,6 +86,7 @@ extern fn sam_macos_dispatch_main(func: *const fn (?*anyopaque) callconv(.c) voi
 const MacosVideoReader = struct {
     path: [:0]const u8,
     duration: f64,
+    fps: f64,
     reader: ?*anyopaque = null,
     current_index: usize = 0,
     current_frame: ?VideoFrame = null,
@@ -93,6 +97,7 @@ const MacosVideoReader = struct {
         return .{
             .path = path,
             .duration = dur,
+            .fps = if (handle) |h| sam_macos_video_fps(h) else 30.0,
             .reader = handle,
             .current_index = 0,
             .current_frame = null,
@@ -123,7 +128,7 @@ const MacosVideoReader = struct {
 
     fn totalFramesImpl(ctx: *anyopaque) usize {
         const self: *MacosVideoReader = @ptrCast(@alignCast(ctx));
-        return @intFromFloat(@max(self.duration * 30.0, 1.0));
+        return @intFromFloat(@max(self.duration * self.fps, 1.0));
     }
 
     fn seekToFrameImpl(ctx: *anyopaque, frame_idx: usize) anyerror!void {
@@ -133,8 +138,8 @@ const MacosVideoReader = struct {
             self.current_frame = null;
         }
         if (self.reader) |r| sam_macos_video_close(r);
-        const pts = @as(f64, @floatFromInt(frame_idx)) * 0.0333;
-        self.reader = sam_macos_video_open(self.path.ptr, pts);
+        const pts = @as(f64, @floatFromInt(frame_idx)) / self.fps;
+        self.reader = if (pts >= self.duration) null else sam_macos_video_open(self.path.ptr, pts);
         self.current_index = frame_idx;
     }
 
@@ -253,6 +258,8 @@ pub const App = struct {
             .on_select_query = &cSelectQuery,
             .on_close_query = &cCloseQuery,
             .on_reap_queries = &cReapQueries,
+            .on_new_query = &cNewQuery,
+            .on_edit_query = &cEditQuery,
             .on_canvas_click = &cCanvasClick,
             .on_select_mask = &cSelectMask,
         };
@@ -261,8 +268,7 @@ pub const App = struct {
             return error.MacosUiInitFailed;
         }
 
-        // Open sample image by default to give user an instant experience
-        self.openImageFromPath(self.example_path);
+        self.newQuery();
 
         sam_macos_run();
     }
@@ -359,6 +365,15 @@ pub const App = struct {
             return;
         };
         self.video_path = owned;
+        if (self.selectedTab()) |tab| {
+            if (!tab.has_run and !std.mem.eql(u8, tab.query_path.?, owned)) {
+                const source = self.allocator.dupeZ(u8, owned) catch null;
+                if (source) |path_copy| {
+                    self.allocator.free(tab.query_path.?);
+                    tab.query_path = path_copy;
+                }
+            }
+        }
         self.video_stop.store(false, .release);
         self.video_active = true;
         self.video_seek_target = 0;
@@ -442,7 +457,7 @@ pub const App = struct {
         if (seconds == 0 and self.isQueryVideo() and self.queryMatches().len > 0) {
             self.selectedTab().?.query_match_idx = 0;
             const target_frame = self.queryMatches()[0];
-            const target_sec = @as(f64, @floatFromInt(target_frame)) * 0.0333;
+            const target_sec = self.selectedTab().?.matchTime(self.selectedTab().?.query_match_idx);
             self.video_seek_target = target_sec;
             self.video_step_requested = true;
             const total = self.queryMatches().len;
@@ -460,8 +475,7 @@ pub const App = struct {
         if (self.isQueryVideo() and self.queryMatches().len > 0) {
             var closest_idx: usize = 0;
             var closest_diff: f64 = 1e9;
-            for (self.queryMatches(), 0..) |f, i| {
-                const f_sec = @as(f64, @floatFromInt(f)) * 0.0333;
+            for (self.selectedTab().?.query_match_pts.items, 0..) |f_sec, i| {
                 const diff = @abs(f_sec - target);
                 if (diff < closest_diff) {
                     closest_diff = diff;
@@ -481,7 +495,7 @@ pub const App = struct {
         if (self.isQueryVideo() and self.queryMatches().len > 0) {
             self.selectedTab().?.query_match_idx = (self.selectedTab().?.query_match_idx + 1) % self.queryMatches().len;
             const target_frame = self.queryMatches()[self.selectedTab().?.query_match_idx];
-            const target_sec = @as(f64, @floatFromInt(target_frame)) * 0.0333;
+            const target_sec = self.selectedTab().?.matchTime(self.selectedTab().?.query_match_idx);
             self.video_seek_target = target_sec;
             self.video_step_requested = true;
             const match_num = self.selectedTab().?.query_match_idx + 1;
@@ -698,7 +712,7 @@ pub const App = struct {
                         self.selectedTab().?.query_match_idx = 0;
                     }
                     const next_match_frame = self.queryMatches()[self.selectedTab().?.query_match_idx];
-                    const next_sec = @as(f64, @floatFromInt(next_match_frame)) * 0.0333;
+                    const next_sec = self.selectedTab().?.matchTime(self.selectedTab().?.query_match_idx);
                     self.video_seek_target = next_sec;
                     self.video_step_requested = true;
                     const cur_num = self.selectedTab().?.query_match_idx + 1;
@@ -1119,6 +1133,29 @@ pub const App = struct {
         self.refreshQueryTabs();
     }
 
+    fn editQuery(self: *App, text: []const u8) void {
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        if (self.selectedTab()) |tab| tab.setDraft(text) catch {};
+    }
+
+    fn newQuery(self: *App) void {
+        if (self.is_busy) return;
+        const tab = QueryTab.createDraft(self.allocator, "") catch return;
+        self.mutex.lock(self.io) catch {
+            tab.deinit();
+            return;
+        };
+        self.query_tabs.append(self.allocator, tab) catch {
+            self.mutex.unlock(self.io);
+            tab.deinit();
+            return;
+        };
+        const index = self.query_tabs.items.len - 1;
+        self.mutex.unlock(self.io);
+        self.selectQuery(index);
+    }
+
     fn closeQuery(self: *App, index: usize) void {
         if (self.is_busy or index >= self.query_tabs.items.len) return;
         self.mutex.lock(self.io) catch return;
@@ -1156,6 +1193,7 @@ pub const App = struct {
                 if (self.image) |img| sam_macos_set_image(self.frame.ptr, @intCast(img.width), @intCast(img.height));
             }
         }
+        if (self.query_tabs.items.len == 0) self.newQuery();
         self.refreshQueryTabs();
         vdb.query_tab.reapClosed(&self.closed_queries);
     }
@@ -1165,9 +1203,24 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return;
         self.selected_query = index;
         const tab = self.query_tabs.items[index];
+        self.video_overlay_prompts = .{};
+        self.video_phrase_len = 0;
         self.mutex.unlock(self.io);
-        self.openVideoFromPath(tab.query_path.?);
-        const sql = self.allocator.dupeZ(u8, tab.sql) catch return;
+        if (tab.query_path.?.len > 0) {
+            self.openVideoFromPath(tab.query_path.?);
+        } else {
+            self.stopVideo();
+            self.mutex.lock(self.io) catch return;
+            if (self.image) |*img| img.deinit(self.allocator);
+            self.image = null;
+            self.allocator.free(self.frame);
+            self.frame = &.{};
+            if (self.masks) |*m| m.deinit();
+            self.masks = null;
+            self.mutex.unlock(self.io);
+            sam_macos_set_image(null, 0, 0);
+        }
+        const sql = self.allocator.dupeZ(u8, tab.draft) catch return;
         defer self.allocator.free(sql);
         sam_macos_set_query_text(sql);
         self.mutex.lock(self.io) catch return;
@@ -1180,8 +1233,8 @@ pub const App = struct {
         sam_macos_set_status(status);
         self.mutex.lock(self.io) catch return;
         if (tab.query_matches.items.len > 0) {
-            tab.query_match_idx = 0;
-            self.video_seek_target = @as(f64, @floatFromInt(tab.query_matches.items[0])) * 0.0333;
+            tab.query_match_idx = @min(tab.query_match_idx, tab.query_matches.items.len - 1);
+            self.video_seek_target = tab.matchTime(tab.query_match_idx);
             self.video_step_requested = true;
         }
         self.mutex.unlock(self.io);
@@ -1194,7 +1247,7 @@ pub const App = struct {
         var labels: std.ArrayList(u8) = .empty;
         defer labels.deinit(self.allocator);
         for (self.query_tabs.items, 0..) |tab, i| {
-            const state = if (tab.query_active.load(.acquire))
+            const state = if (!tab.has_run) "New" else if (tab.query_active.load(.acquire))
                 if (tab.query_cancel.load(.acquire)) "Cancelling" else "Running"
             else if (tab.query_cancel.load(.acquire)) "Cancelled" else "Done";
             const label = std.fmt.allocPrint(self.allocator, "Query {d}: {s} ({d})", .{ i + 1, state, tab.query_matches.items.len }) catch return;
@@ -1262,6 +1315,7 @@ pub const App = struct {
             tab.query_prompts = .{};
             tab.precache_phrase_len = 0;
             tab.query_matches.clearRetainingCapacity();
+            tab.query_match_pts.clearRetainingCapacity();
             tab.query_match_idx = 0;
         }
         self.video_overlay_prompts = .{};
@@ -1360,6 +1414,11 @@ pub const App = struct {
             }
         } else |_| {}
 
+        if (parsed_source_path == null) {
+            if (self.selectedTab()) |tab| self.setQueryStatus(tab, "Include FROM 'video.mp4' in this tab's query.");
+            return;
+        }
+
         // If a video path is specified in the query, resolve and open it
         if (parsed_source_path) |source_file| {
             if (resolveVideoPath(self.allocator, source_file)) |resolved| {
@@ -1375,13 +1434,13 @@ pub const App = struct {
             } else {
                 var err_buf: [256]u8 = undefined;
                 const err_msg = std.fmt.bufPrintZ(&err_buf, "Could not find video file: “{s}”", .{source_file}) catch "Video not found.";
-                sam_macos_set_status(err_msg);
+                if (self.selectedTab()) |current| self.setQueryStatus(current, err_msg);
                 return;
             }
         }
 
         if (!self.video_active or self.video_path == null) {
-            sam_macos_set_status("Specify a video in FROM 'video.mp4' or open a video first.");
+            if (self.selectedTab()) |current| self.setQueryStatus(current, "Could not load the video specified in FROM.");
             return;
         }
         const tab = QueryTab.create(self.allocator, trimmed, self.video_path.?) catch return;
@@ -1389,12 +1448,25 @@ pub const App = struct {
             tab.deinit();
             return;
         };
-        self.query_tabs.append(self.allocator, tab) catch {
-            self.mutex.unlock(self.io);
-            tab.deinit();
-            return;
-        };
-        self.selected_query = self.query_tabs.items.len - 1;
+        if (self.selected_query) |selected| {
+            const old = self.query_tabs.items[selected];
+            self.closed_queries.append(self.allocator, old) catch {
+                self.mutex.unlock(self.io);
+                tab.deinit();
+                return;
+            };
+            old.query_cancel.store(true, .release);
+            self.query_tabs.items[selected] = tab;
+        } else {
+            self.query_tabs.append(self.allocator, tab) catch {
+                self.mutex.unlock(self.io);
+                tab.deinit();
+                return;
+            };
+            self.selected_query = self.query_tabs.items.len - 1;
+        }
+        self.video_overlay_prompts = .{};
+        self.video_phrase_len = 0;
         self.mutex.unlock(self.io);
         self.setQueryStatus(tab, "Planning query in the background…");
         self.refreshQueryTabs();
@@ -1519,7 +1591,10 @@ pub const App = struct {
                     app.mutex.unlock(app.io);
                     return error.QueryCancelled;
                 }
-                streamer.tab.query_matches.append(app.allocator, @intCast(idx)) catch {};
+                streamer.tab.appendMatch(@intCast(idx), match_pts) catch |err| {
+                    app.mutex.unlock(app.io);
+                    return err;
+                };
                 const total = streamer.tab.query_matches.items.len;
 
                 if (!streamer.first_match_emitted) {
@@ -1599,7 +1674,7 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return;
         const total_matches = tab.query_matches.items.len;
         const first_frame = if (total_matches > 0) tab.query_matches.items[0] else 0;
-        const first_frame_target = if (total_matches > 0) @as(f64, @floatFromInt(first_frame)) * 0.0333 else null;
+        const first_frame_target = if (total_matches > 0) tab.matchTime(0) else null;
         self.mutex.unlock(self.io);
 
         if (total_matches > 0) {
@@ -1620,62 +1695,7 @@ pub const App = struct {
     }
 
     fn handleFindText(self: *App, text: [*:0]const u8) void {
-        const phrase = std.mem.span(text);
-        if (phrase.len == 0) return;
-
-        if (isQuerySql(phrase)) {
-            self.handleQuery(phrase);
-            return;
-        }
-
-        if (self.video_active) {
-            self.mutex.lock(self.io) catch return;
-            if (self.video_previewed and self.video_seek_target == null) {
-                self.video_seek_target = self.video_position;
-            }
-            self.video_overlay_prompts = .{};
-            self.video_phrase_len = @min(phrase.len, self.video_phrase.len);
-            @memcpy(self.video_phrase[0..self.video_phrase_len], phrase[0..self.video_phrase_len]);
-            const playing = self.video_playing.load(.acquire);
-            self.video_step_requested = !playing;
-            self.mutex.unlock(self.io);
-            sam_macos_set_status(if (playing) "Updating the video prompt…" else "Processing the current video frame…");
-            return;
-        }
-        if (self.is_busy or self.image == null) return;
-
-        self.is_busy = true;
-        sam_macos_set_busy(1);
-
-        var status_buf: [256]u8 = undefined;
-        const status = std.fmt.bufPrintZ(&status_buf, "Looking for “{s}”…", .{phrase}) catch "Searching…";
-        sam_macos_set_status(status);
-
-        const PhraseContext = struct {
-            app: *App,
-            phrase: []const u8,
-        };
-        const ctx = self.allocator.create(PhraseContext) catch {
-            self.is_busy = false;
-            sam_macos_set_busy(0);
-            return;
-        };
-        const phrase_copy = self.allocator.dupe(u8, phrase) catch {
-            self.allocator.destroy(ctx);
-            self.is_busy = false;
-            sam_macos_set_busy(0);
-            return;
-        };
-        ctx.* = .{ .app = self, .phrase = phrase_copy };
-
-        const thread = std.Thread.spawn(.{}, runLookupWorker, .{ctx}) catch {
-            self.allocator.free(phrase_copy);
-            self.allocator.destroy(ctx);
-            self.is_busy = false;
-            sam_macos_set_busy(0);
-            return;
-        };
-        thread.detach();
+        self.handleQuery(std.mem.span(text));
     }
 
     fn runLookupWorker(ctx: anytype) void {
@@ -2030,6 +2050,14 @@ fn cFindText(text: [*:0]const u8) callconv(.c) void {
 
 fn cSelectQuery(index: usize) callconv(.c) void {
     if (g_app) |app| app.selectQuery(index);
+}
+
+fn cNewQuery() callconv(.c) void {
+    if (g_app) |app| app.newQuery();
+}
+
+fn cEditQuery(text: [*:0]const u8) callconv(.c) void {
+    if (g_app) |app| app.editQuery(std.mem.span(text));
 }
 
 fn cCloseQuery(index: usize) callconv(.c) void {

@@ -11,6 +11,7 @@ pub const TokenType = enum {
     kw_or,
     kw_not,
     kw_contains,
+    kw_between,
     kw_create,
     kw_index,
     kw_on,
@@ -195,6 +196,7 @@ pub const Lexer = struct {
         if (std.ascii.eqlIgnoreCase(text, "OR")) return .kw_or;
         if (std.ascii.eqlIgnoreCase(text, "NOT")) return .kw_not;
         if (std.ascii.eqlIgnoreCase(text, "CONTAINS")) return .kw_contains;
+        if (std.ascii.eqlIgnoreCase(text, "BETWEEN")) return .kw_between;
         if (std.ascii.eqlIgnoreCase(text, "CREATE")) return .kw_create;
         if (std.ascii.eqlIgnoreCase(text, "INDEX")) return .kw_index;
         if (std.ascii.eqlIgnoreCase(text, "ON")) return .kw_on;

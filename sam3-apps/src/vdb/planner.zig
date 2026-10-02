@@ -5,6 +5,8 @@ const index_mod = @import("index.zig");
 pub const ScanStrategy = union(enum) {
     full_scan: struct {
         step: usize,
+        start: usize = 0,
+        end: ?usize = null, // Exclusive; null scans through EOF.
     },
     indexed_seek: struct {
         candidate_frames: []const u32,
@@ -67,6 +69,7 @@ pub const Planner = struct {
 
         // Try index or frame pushdown
         var candidate_frames: ?[]u32 = null;
+        errdefer if (candidate_frames) |frames| self.allocator.free(frames);
         if (stmt.where_clause) |w| {
             candidate_frames = try self.tryPushdown(w, available_index);
         } else {
@@ -96,10 +99,21 @@ pub const Planner = struct {
             }
         }
 
+        const bounds = if (stmt.where_clause) |w| frameBounds(w) else Bounds{};
+        if (candidate_frames) |frames| {
+            var count: usize = 0;
+            for (frames) |frame| {
+                if (frame >= bounds.start and (bounds.end == null or frame < bounds.end.?)) {
+                    frames[count] = frame;
+                    count += 1;
+                }
+            }
+            candidate_frames = try self.allocator.realloc(frames, count);
+        }
         const strategy: ScanStrategy = if (candidate_frames) |frames|
             .{ .indexed_seek = .{ .candidate_frames = frames } }
         else
-            .{ .full_scan = .{ .step = default_step } };
+            .{ .full_scan = .{ .step = default_step, .start = bounds.start, .end = bounds.end } };
 
         return Plan{
             .allocator = self.allocator,
@@ -111,6 +125,46 @@ pub const Planner = struct {
             .requires_sam3 = requires_sam3,
             .requires_yolo = requires_yolo,
             .sam3_prompt = sam3_prompt,
+        };
+    }
+
+    const Bounds = struct { start: usize = 0, end: ?usize = null };
+
+    /// Conjunctions restrict the scan; OR/NOT retain the full predicate scan.
+    fn frameBounds(expr: *ast.Expr) Bounds {
+        if (expr.* != .binary) return .{};
+        const b = expr.binary;
+        if (b.op == .and_op) {
+            const left = frameBounds(b.left);
+            const right = frameBounds(b.right);
+            return .{
+                .start = @max(left.start, right.start),
+                .end = if (left.end) |end| @min(end, right.end orelse end) else right.end,
+            };
+        }
+        var op = b.op;
+        const value = if (isFrameIdent(b.left) and b.right.* == .literal_int)
+            b.right.literal_int
+        else if (isFrameIdent(b.right) and b.left.* == .literal_int) blk: {
+            op = switch (op) {
+                .lt => .gt,
+                .lte => .gte,
+                .gt => .lt,
+                .gte => .lte,
+                else => op,
+            };
+            break :blk b.left.literal_int;
+        } else return .{};
+        if (value < 0) return .{};
+        const n = std.math.cast(usize, value) orelse return .{};
+        const after = std.math.add(usize, n, 1) catch return .{};
+        return switch (op) {
+            .eq => .{ .start = n, .end = after },
+            .gt => .{ .start = after },
+            .gte => .{ .start = n },
+            .lt => .{ .end = n },
+            .lte => .{ .end = after },
+            else => .{},
         };
     }
 
@@ -162,12 +216,12 @@ pub const Planner = struct {
                 // Check frame_id = 10000 or 10000 = frame_id
                 if (b.op == .eq) {
                     if (isFrameIdent(b.left) and b.right.* == .literal_int) {
-                        const target: u32 = @intCast(@max(b.right.literal_int, 0));
+                        const target = std.math.cast(u32, b.right.literal_int) orelse return null;
                         const single = try self.allocator.alloc(u32, 1);
                         single[0] = target;
                         return single;
                     } else if (isFrameIdent(b.right) and b.left.* == .literal_int) {
-                        const target: u32 = @intCast(@max(b.left.literal_int, 0));
+                        const target = std.math.cast(u32, b.left.literal_int) orelse return null;
                         const single = try self.allocator.alloc(u32, 1);
                         single[0] = target;
                         return single;
@@ -230,11 +284,11 @@ pub const Planner = struct {
                     }
                 } else if (b.op == .or_op) {
                     const left_opt = try self.tryPushdown(b.left, idx);
+                    defer if (left_opt) |frames| self.allocator.free(frames);
                     const right_opt = try self.tryPushdown(b.right, idx);
+                    defer if (right_opt) |frames| self.allocator.free(frames);
 
                     if (left_opt != null and right_opt != null) {
-                        defer self.allocator.free(left_opt.?);
-                        defer self.allocator.free(right_opt.?);
                         return try unionSlices(self.allocator, left_opt.?, right_opt.?);
                     }
                 }

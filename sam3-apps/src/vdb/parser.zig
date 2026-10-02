@@ -326,6 +326,20 @@ pub const Parser = struct {
     fn parseComparison(self: *Parser) ParseError!*ast.Expr {
         const left = try self.parsePrimary();
 
+        // Lower inclusive BETWEEN into comparisons, preserving logical AND precedence.
+        if (self.eat(.kw_between)) {
+            const lower = try self.parsePrimary();
+            _ = try self.expect(.kw_and);
+            const upper = try self.parsePrimary();
+            const gte = try self.allocator.create(ast.Expr);
+            gte.* = .{ .binary = .{ .op = .gte, .left = left, .right = lower } };
+            const lte = try self.allocator.create(ast.Expr);
+            lte.* = .{ .binary = .{ .op = .lte, .left = left, .right = upper } };
+            const expr = try self.allocator.create(ast.Expr);
+            expr.* = .{ .binary = .{ .op = .and_op, .left = gte, .right = lte } };
+            return expr;
+        }
+
         const op: ?ast.BinOp = switch (self.tok.tag) {
             .kw_contains => .contains,
             .eq => .eq,
