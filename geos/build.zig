@@ -605,6 +605,18 @@ pub fn build(b: *std.Build) !void {
     geos_c_lib.root_module.linkLibrary(geos_lib);
     b.installArtifact(geos_c_lib);
 
+    // Translate geos_c.h into a Zig module
+    const geos_c_translate = b.addTranslateC(.{
+        .root_source_file = geos_c_h_step.getOutputFile(),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    geos_c_translate.addIncludePath(geos_source.path("include"));
+    geos_c_translate.addIncludePath(geos_c_h_step.getOutputDir());
+    geos_c_translate.addIncludePath(version_h_step.getOutputDir());
+    const geos_c_mod = geos_c_translate.createModule();
+
     // Build the example app
     const exe = b.addExecutable(.{
         .name = "geos_example",
@@ -617,6 +629,7 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
+    exe.root_module.addImport("geos_c", geos_c_mod);
     exe.root_module.addIncludePath(geos_c_h_step.getOutputDir());
     exe.root_module.addIncludePath(geos_source.path("include"));
     exe.root_module.linkLibrary(geos_c_lib);
@@ -627,9 +640,7 @@ pub fn build(b: *std.Build) !void {
     // Add run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the example app");
     run_step.dependOn(&run_cmd.step);

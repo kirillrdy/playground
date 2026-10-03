@@ -1,7 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("geos_c.h");
-});
+const c = @import("geos_c");
 
 export fn geosMessageHandler(fmt: [*c]const u8, ...) void {
     _ = fmt;
