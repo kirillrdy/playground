@@ -762,12 +762,12 @@ pub const WaylandClient = struct {
     }
 
     fn sendMsg(self: *WaylandClient, id: u32, opcode: u16, args: anytype) !void {
-        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
-        var words: [2 + fields.len]u32 = undefined;
+        const field_names = @typeInfo(@TypeOf(args)).@"struct".field_names;
+        var words: [2 + field_names.len]u32 = undefined;
         words[0] = id;
         words[1] = (@as(u32, words.len * 4) << 16) | opcode;
-        inline for (fields, 0..) |f, i| {
-            words[2 + i] = @as(u32, @bitCast(@field(args, f.name)));
+        inline for (field_names, 0..) |name, i| {
+            words[2 + i] = @as(u32, @bitCast(@field(args, name)));
         }
         try self.sendBytes(std.mem.sliceAsBytes(&words));
     }
