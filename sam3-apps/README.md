@@ -1,7 +1,7 @@
 # SAM 3 native apps
 
-The macOS and Linux desktop apps share this `build.zig` and use the SAM 3 library in `../../sam3`.
-Use Zig 0.16.0 or newer from this directory.
+The macOS and Linux desktop apps share this `build.zig` and use the SAM 3 dependency pinned in `build.zig.zon`.
+Use Zig 0.17.0 or newer from this directory.
 
 On macOS:
 

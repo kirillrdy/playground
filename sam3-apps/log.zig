@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @cImport(@cInclude("time.h"));
+const c = @import("c");
 
 var mutex: std.Io.Mutex = .init;
 

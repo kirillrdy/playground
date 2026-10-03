@@ -2,20 +2,20 @@
     .name = .sam3_apps,
     .version = "0.0.0",
     .fingerprint = 0xd0f2eae198a013cf,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .sam3 = .{
-            .url = "git+https://github.com/kirillrdy/sam3#dfabd6103ba6ddb480609bcce8e18d1e9d672aab",
-            .hash = "sam3-0.0.0-arUZ_gPpAAB4s7mSb6JWLwsxlOPfshMq1o3M1OuXicgy",
+            .url = "git+https://github.com/kirillrdy/sam3#32a4c1efe03b78fa562f2fb6b4a6ee94991a1f94",
+            .hash = "sam3-0.0.0-arUZ_kDpAADvL7EtSSQT1VPxE3w1ySTwP1LIgyTyv7of",
         },
         .zigimg = .{
-            .url = "git+https://github.com/nothke/zigimg#581795265e1caee099baae32883c0f9d4f28f81a",
-            .hash = "zigimg-0.1.0-8_eo2jPCFwDJF89NMU5gJjpTRoFdda26viRcdxyJP0Ks",
+            .url = "git+https://github.com/sergot/zigimg#c701c9f99779d7ddf594dcc6da8f858fd277d61f",
+            .hash = "zigimg-0.1.0-8_eo2ri_FwBqF5UYiggLz4IGjHJO_n9-B6gT9Ayqg8G4",
         },
         .zimo = .{
-            .url = "git+https://github.com/kirillrdy/cache#38eaed4c59f76dc8ec03c7ea07ecfb721c2b57ca",
-            .hash = "zimo-0.1.0-014_hIq2AAA7hEZ6zdz0Cv989Mn3NJJ5KZyjtK5QbzDZ",
+            .url = "git+https://github.com/kirillrdy/cache#cc6ec4d51151eabbe2b870bd3c53985c49a863f2",
+            .hash = "zimo-0.1.0-014_hHPBAABLoCQwDCzgP-DFC3ccolXHPrGbzifQHE_Q",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "native_main.zig", "macos", "linux", "README.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "native_main.zig", "log.zig", "log_time.h", "src", "macos", "linux", "README.md" },
 }

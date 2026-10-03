@@ -33,7 +33,7 @@ pub const QueryTab = struct {
         errdefer allocator.free(owned_sql);
         const draft = try allocator.dupe(u8, sql);
         errdefer allocator.free(draft);
-        const path = try allocator.dupeZ(u8, source);
+        const path = try allocator.dupeSentinel(u8, source, 0);
         tab.* = .{ .allocator = allocator, .sql = owned_sql, .draft = draft, .query_path = path };
         return tab;
     }

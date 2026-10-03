@@ -94,7 +94,7 @@ pub const WaylandClient = struct {
         const socket_path = if (std.fs.path.isAbsolute(display))
             display
         else
-            std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ runtime_dir, display }) catch return error.PathTooLong;
+            std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ runtime_dir, display }, 0) catch return error.PathTooLong;
 
         const fd = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
         if (fd < 0) return error.SocketCreationFailed;
@@ -284,7 +284,7 @@ pub const WaylandClient = struct {
 
     fn loadEmbeddedCursor(kind: Cursor) ParsedCursor {
         const entry_size = 16 + 24 * 24 * 4;
-        const offset = @as(usize, @intFromEnum(kind)) * entry_size;
+        const offset = @as(usize, @backingInt(kind)) * entry_size;
         const chunk = embedded_adwaita_cursors[offset .. offset + entry_size];
         const w = std.mem.readInt(u32, chunk[0..4], .little);
         const h = std.mem.readInt(u32, chunk[4..8], .little);
@@ -361,7 +361,7 @@ pub const WaylandClient = struct {
                 if (dir.len == 0) continue;
                 for (themes) |theme| {
                     for (names) |name| {
-                        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/cursors/{s}", .{ dir, theme, name }) catch continue;
+                        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}/cursors/{s}", .{ dir, theme, name }, 0) catch continue;
                         if (readCursorFile(path, target_size)) |cur| return cur;
                     }
                 }
@@ -380,7 +380,7 @@ pub const WaylandClient = struct {
                 const user_dirs = [_][]const u8{ ".icons", ".local/share/icons" };
                 for (user_dirs) |sub| {
                     for (names) |name| {
-                        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/{s}/cursors/{s}", .{ home, sub, theme, name }) catch continue;
+                        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}/{s}/cursors/{s}", .{ home, sub, theme, name }, 0) catch continue;
                         if (readCursorFile(path, target_size)) |cur| return cur;
                     }
                 }
@@ -388,7 +388,7 @@ pub const WaylandClient = struct {
 
             for (static_dirs) |dir| {
                 for (names) |name| {
-                    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/cursors/{s}", .{ dir, theme, name }) catch continue;
+                    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}/cursors/{s}", .{ dir, theme, name }, 0) catch continue;
                     if (readCursorFile(path, target_size)) |cur| return cur;
                 }
             }
@@ -398,7 +398,7 @@ pub const WaylandClient = struct {
                 while (it.next()) |data_dir| {
                     if (data_dir.len == 0) continue;
                     for (names) |name| {
-                        const path = std.fmt.bufPrintZ(&path_buf, "{s}/icons/{s}/cursors/{s}", .{ data_dir, theme, name }) catch continue;
+                        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/icons/{s}/cursors/{s}", .{ data_dir, theme, name }, 0) catch continue;
                         if (readCursorFile(path, target_size)) |cur| return cur;
                     }
                 }
@@ -428,7 +428,7 @@ pub const WaylandClient = struct {
     pub fn setCursor(self: *WaylandClient, kind: Cursor) !void {
         const serial = self.pointer_enter_serial orelse (if (self.last_pointer_serial != 0) self.last_pointer_serial else return);
         if (self.current_cursor == kind) return;
-        const item = self.cursor_items[@intFromEnum(kind)];
+        const item = self.cursor_items[@backingInt(kind)];
         try self.sendMsg(self.cursor_surface_id, 1, .{ item.buffer.id, @as(i32, 0), @as(i32, 0) });
         try self.sendMsg(self.cursor_surface_id, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(item.buffer.width)), @as(i32, @intCast(item.buffer.height)) });
         try self.sendMsg(self.cursor_surface_id, 6, .{});
