@@ -324,10 +324,10 @@ pub const App = struct {
         sam_macos_set_masks(0, null, 0, -1);
 
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "{d} × {d} — click the object you want.", .{
+        const msg = std.fmt.bufPrintSentinel(&buf, "{d} × {d} — click the object you want.", .{
             decoded.width,
             decoded.height,
-        }) catch "Image loaded.";
+        }, 0) catch "Image loaded.";
         sam_macos_set_status(msg);
     }
 
@@ -356,7 +356,7 @@ pub const App = struct {
     fn openVideoFromPath(self: *App, path: []const u8) void {
         if (self.is_busy) return;
         self.stopVideo();
-        const owned = self.allocator.dupeZ(u8, path) catch {
+        const owned = self.allocator.dupeSentinel(u8, path, 0) catch {
             sam_macos_set_status("Out of memory opening video.");
             return;
         };
@@ -367,7 +367,7 @@ pub const App = struct {
         self.video_path = owned;
         if (self.selectedTab()) |tab| {
             if (!tab.has_run and !std.mem.eql(u8, tab.query_path.?, owned)) {
-                const source = self.allocator.dupeZ(u8, owned) catch null;
+                const source = self.allocator.dupeSentinel(u8, owned, 0) catch null;
                 if (source) |path_copy| {
                     self.allocator.free(tab.query_path.?);
                     tab.query_path = path_copy;
@@ -395,7 +395,7 @@ pub const App = struct {
         // Update window title with video file name
         const basename = std.fs.path.basename(path);
         var title_buf: [256]u8 = undefined;
-        const title_str = std.fmt.bufPrintZ(&title_buf, "SAM 3 — Visual Database — {s}", .{basename}) catch "SAM 3 — Visual Database";
+        const title_str = std.fmt.bufPrintSentinel(&title_buf, "SAM 3 — Visual Database — {s}", .{basename}, 0) catch "SAM 3 — Visual Database";
         sam_macos_set_window_title(title_str);
 
         // Try auto-loading sidecar index if exists
@@ -414,7 +414,7 @@ pub const App = struct {
 
         if (index_loaded) {
             var sbuf: [160]u8 = undefined;
-            const smsg = std.fmt.bufPrintZ(&sbuf, "Video opened. Loaded visual index with {d} concept(s) from .vdb sidecar.", .{indexed_concepts_count}) catch "Video opened with index.";
+            const smsg = std.fmt.bufPrintSentinel(&sbuf, "Video opened. Loaded visual index with {d} concept(s) from .vdb sidecar.", .{indexed_concepts_count}, 0) catch "Video opened with index.";
             sam_macos_set_status(smsg);
         } else {
             sam_macos_set_status("Video opened. Enter a word or SQL query and press Find/Query.");
@@ -463,7 +463,7 @@ pub const App = struct {
             const total = self.queryMatches().len;
             self.mutex.unlock(self.io);
             var buf: [160]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "Restarted at query match 1 of {d} (Frame #{d} at {d:.2}s).", .{ total, target_frame, target_sec }) catch "Query match 1.";
+            const msg = std.fmt.bufPrintSentinel(&buf, "Restarted at query match 1 of {d} (Frame #{d} at {d:.2}s).", .{ total, target_frame, target_sec }, 0) catch "Query match 1.";
             sam_macos_set_status(msg);
             return;
         }
@@ -502,7 +502,7 @@ pub const App = struct {
             const total = self.queryMatches().len;
             self.mutex.unlock(self.io);
             var buf: [160]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "Query match {d} of {d} (Frame #{d} at {d:.2}s).", .{ match_num, total, target_frame, target_sec }) catch "Next query match.";
+            const msg = std.fmt.bufPrintSentinel(&buf, "Query match {d} of {d} (Frame #{d} at {d:.2}s).", .{ match_num, total, target_frame, target_sec }, 0) catch "Next query match.";
             sam_macos_set_status(msg);
             return;
         }
@@ -689,13 +689,13 @@ pub const App = struct {
             }) catch "0:00.000";
             var status_buf: [256]u8 = undefined;
             const status = if (phrase_len == 0 and overlay_prompts.count == 0)
-                std.fmt.bufPrintZ(&status_buf, "At {s}: frame shown.", .{timecode}) catch "Frame shown."
+                std.fmt.bufPrintSentinel(&status_buf, "At {s}: frame shown.", .{timecode}, 0) catch "Frame shown."
             else if (self.masks != null)
-                std.fmt.bufPrintZ(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{
+                std.fmt.bufPrintSentinel(&status_buf, "At {s}: {d} match(es) for “{s}” in {f}", .{
                     timecode, mask_count, phrase, lookup_elapsed,
-                }) catch "Video frame processed."
+                }, 0) catch "Video frame processed."
             else
-                std.fmt.bufPrintZ(&status_buf, "At {s}: waiting for cached “{s}” result.", .{ timecode, phrase }) catch "Frame shown without a cached result.";
+                std.fmt.bufPrintSentinel(&status_buf, "At {s}: waiting for cached “{s}” result.", .{ timecode, phrase }, 0) catch "Frame shown without a cached result.";
             sam_macos_set_status(status);
             if (self.masks != null) log.info(self.io, "at {s}: \"{s}\" -> {d} object(s) in {f}", .{
                 timecode, phrase, mask_count, lookup_elapsed,
@@ -721,9 +721,9 @@ pub const App = struct {
                     std.Io.sleep(self.io, .fromMilliseconds(250), .awake) catch {};
 
                     var match_buf: [160]u8 = undefined;
-                    const match_msg = std.fmt.bufPrintZ(&match_buf, "Playing query match {d} of {d} (Frame #{d} at {d:.2}s)", .{
+                    const match_msg = std.fmt.bufPrintSentinel(&match_buf, "Playing query match {d} of {d} (Frame #{d} at {d:.2}s)", .{
                         cur_num, total_matches, next_match_frame, next_sec,
-                    }) catch "Playing query match.";
+                    }, 0) catch "Playing query match.";
                     sam_macos_set_status(match_msg);
                     continue;
                 }
@@ -912,7 +912,7 @@ pub const App = struct {
                     self.mutex.unlock(self.io);
                     self.refreshQueryTabs();
                     var status_buf: [200]u8 = undefined;
-                    const status = std.fmt.bufPrintZ(&status_buf, "Pre-cached and indexed {d} frames for “{s}”. Saved to .vdb sidecar.", .{ frames, phrase }) catch "Video pre-cache complete.";
+                    const status = std.fmt.bufPrintSentinel(&status_buf, "Pre-cached and indexed {d} frames for “{s}”. Saved to .vdb sidecar.", .{ frames, phrase }, 0) catch "Video pre-cache complete.";
                     self.setQueryStatus(tab, status);
                     log.info(self.io, "pre-cached and indexed {d} frames for \"{s}\" in {f}", .{ frames, phrase, started.untilNow(self.io, .awake) });
                 }
@@ -1091,11 +1091,11 @@ pub const App = struct {
 
         const elapsed = started.untilNow(self.io, .awake);
         var status_buf: [128]u8 = undefined;
-        const status = std.fmt.bufPrintZ(&status_buf, "{d} point(s) -> {d} masks in {f}", .{
+        const status = std.fmt.bufPrintSentinel(&status_buf, "{d} point(s) -> {d} masks in {f}", .{
             self.points_len,
             masks.count,
             elapsed,
-        }) catch "Segmentation complete";
+        }, 0) catch "Segmentation complete";
         sam_macos_set_status(status);
 
         self.is_busy = false;
@@ -1122,7 +1122,7 @@ pub const App = struct {
         tab.status_len = @min(status.len, tab.status.len);
         @memcpy(tab.status[0..tab.status_len], status[0..tab.status_len]);
         if (self.selectedTab() == tab) {
-            const message = self.allocator.dupeZ(u8, status) catch {
+            const message = self.allocator.dupeSentinel(u8, status, 0) catch {
                 self.mutex.unlock(self.io);
                 return;
             };
@@ -1220,11 +1220,11 @@ pub const App = struct {
             self.mutex.unlock(self.io);
             sam_macos_set_image(null, 0, 0);
         }
-        const sql = self.allocator.dupeZ(u8, tab.draft) catch return;
+        const sql = self.allocator.dupeSentinel(u8, tab.draft, 0) catch return;
         defer self.allocator.free(sql);
         sam_macos_set_query_text(sql);
         self.mutex.lock(self.io) catch return;
-        const status = self.allocator.dupeZ(u8, tab.status[0..tab.status_len]) catch {
+        const status = self.allocator.dupeSentinel(u8, tab.status[0..tab.status_len], 0) catch {
             self.mutex.unlock(self.io);
             return;
         };
@@ -1255,7 +1255,7 @@ pub const App = struct {
             if (i > 0) labels.append(self.allocator, '\n') catch return;
             labels.appendSlice(self.allocator, label) catch return;
         }
-        const labels_z = self.allocator.dupeZ(u8, labels.items) catch return;
+        const labels_z = self.allocator.dupeSentinel(u8, labels.items, 0) catch return;
         defer self.allocator.free(labels_z);
         sam_macos_set_query_tabs(labels_z, if (self.selected_query) |index| @intCast(index) else -1);
         const selected = self.selectedTab();
@@ -1338,7 +1338,7 @@ pub const App = struct {
         if (trimmed.len == 0) return null;
 
         // 1. Direct check
-        if (allocator.dupeZ(u8, trimmed)) |zpath| {
+        if (allocator.dupeSentinel(u8, trimmed, 0)) |zpath| {
             defer allocator.free(zpath);
             if (sam_macos_file_exists(zpath.ptr) != 0) {
                 return allocator.dupe(u8, trimmed) catch null;
@@ -1350,7 +1350,7 @@ pub const App = struct {
         if (std.mem.startsWith(u8, trimmed, "~/")) {
             if (maybe_home) |home| {
                 if (std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, trimmed[2..] })) |expanded| {
-                    if (allocator.dupeZ(u8, expanded)) |zpath| {
+                    if (allocator.dupeSentinel(u8, expanded, 0)) |zpath| {
                         defer allocator.free(zpath);
                         if (sam_macos_file_exists(zpath.ptr) != 0) {
                             return expanded;
@@ -1364,7 +1364,7 @@ pub const App = struct {
         // 3. Check in home directory (~/<trimmed>)
         if (maybe_home) |home| {
             if (std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, trimmed })) |in_home| {
-                if (allocator.dupeZ(u8, in_home)) |zpath| {
+                if (allocator.dupeSentinel(u8, in_home, 0)) |zpath| {
                     defer allocator.free(zpath);
                     if (sam_macos_file_exists(zpath.ptr) != 0) {
                         return in_home;
@@ -1376,7 +1376,7 @@ pub const App = struct {
 
         // 4. Check in current working directory (./<trimmed>)
         if (std.fmt.allocPrint(allocator, "./{s}", .{trimmed})) |in_cwd| {
-            if (allocator.dupeZ(u8, in_cwd)) |zpath| {
+            if (allocator.dupeSentinel(u8, in_cwd, 0)) |zpath| {
                 defer allocator.free(zpath);
                 if (sam_macos_file_exists(zpath.ptr) != 0) {
                     return in_cwd;
@@ -1433,7 +1433,7 @@ pub const App = struct {
                 }
             } else {
                 var err_buf: [256]u8 = undefined;
-                const err_msg = std.fmt.bufPrintZ(&err_buf, "Could not find video file: “{s}”", .{source_file}) catch "Video not found.";
+                const err_msg = std.fmt.bufPrintSentinel(&err_buf, "Could not find video file: “{s}”", .{source_file}, 0) catch "Video not found.";
                 if (self.selectedTab()) |current| self.setQueryStatus(current, err_msg);
                 return;
             }
@@ -1517,7 +1517,7 @@ pub const App = struct {
                     const target_prompt = stmt.create_index.prompt orelse stmt.create_index.model_name;
                     log.info(self.io, "Executing visual CREATE INDEX on concept \"{s}\"", .{target_prompt});
                     var status_buf: [160]u8 = undefined;
-                    const status_msg = std.fmt.bufPrintZ(&status_buf, "Creating visual index for “{s}”…", .{target_prompt}) catch "Creating visual index…";
+                    const status_msg = std.fmt.bufPrintSentinel(&status_buf, "Creating visual index for “{s}”…", .{target_prompt}, 0) catch "Creating visual index…";
                     self.setQueryStatus(tab, status_msg);
                     self.runPrecache(tab, source_path, target_prompt);
                     return;
@@ -1525,7 +1525,7 @@ pub const App = struct {
             } else |err| {
                 log.info(self.io, "Failed to parse CREATE INDEX: {t}", .{err});
                 var err_buf: [160]u8 = undefined;
-                const err_msg = std.fmt.bufPrintZ(&err_buf, "CREATE INDEX syntax error: {t}", .{err}) catch "Syntax error.";
+                const err_msg = std.fmt.bufPrintSentinel(&err_buf, "CREATE INDEX syntax error: {t}", .{err}, 0) catch "Syntax error.";
                 self.setQueryStatus(tab, err_msg);
                 return;
             }
@@ -1534,7 +1534,7 @@ pub const App = struct {
         const final_query = vdb.query_input.normalize(self.allocator, trimmed, source_path) catch |err| {
             log.info(self.io, "Query normalization failed: {t}", .{err});
             var err_buf: [160]u8 = undefined;
-            const err_msg = std.fmt.bufPrintZ(&err_buf, "Query syntax error: {t}", .{err}) catch "Query syntax error.";
+            const err_msg = std.fmt.bufPrintSentinel(&err_buf, "Query syntax error: {t}", .{err}, 0) catch "Query syntax error.";
             self.setQueryStatus(tab, err_msg);
             return;
         };
@@ -1608,10 +1608,10 @@ pub const App = struct {
 
                     // INSTANT UI update for first frame!
                     var status_buf: [256]u8 = undefined;
-                    const status_msg = std.fmt.bufPrintZ(&status_buf, "First match found instantly! Frame #{d} at {d:.2}s. Streaming visual query results…", .{
+                    const status_msg = std.fmt.bufPrintSentinel(&status_buf, "First match found instantly! Frame #{d} at {d:.2}s. Streaming visual query results…", .{
                         idx,
                         match_pts,
-                    }) catch "First frame matched!";
+                    }, 0) catch "First frame matched!";
                     app.setQueryStatus(streamer.tab, status_msg);
                     log.info(app.io, "Instantly streamed first match: Frame #{d} at {d:.2}s", .{ idx, match_pts });
                 } else {
@@ -1622,7 +1622,7 @@ pub const App = struct {
                     if (streamer.last_ui_update.untilNow(app.io, .awake).nanoseconds > 200_000_000 or total % 50 == 0) {
                         streamer.last_ui_update = now;
                         var status_buf: [160]u8 = undefined;
-                        const status_msg = std.fmt.bufPrintZ(&status_buf, "Streaming query: {d} matches found… scanning… Press Cancel Query to stop.", .{total}) catch "Streaming query…";
+                        const status_msg = std.fmt.bufPrintSentinel(&status_buf, "Streaming query: {d} matches found… scanning… Press Cancel Query to stop.", .{total}, 0) catch "Streaming query…";
                         app.setQueryStatus(streamer.tab, status_msg);
                     }
                 }
@@ -1655,7 +1655,7 @@ pub const App = struct {
                 self.mutex.unlock(self.io);
                 var cancel_buf: [160]u8 = undefined;
                 const cancel_msg = if (matches_so_far > 0)
-                    std.fmt.bufPrintZ(&cancel_buf, "Query cancelled. Kept {d} matches found so far.", .{matches_so_far}) catch "Query cancelled."
+                    std.fmt.bufPrintSentinel(&cancel_buf, "Query cancelled. Kept {d} matches found so far.", .{matches_so_far}, 0) catch "Query cancelled."
                 else
                     "Visual query cancelled.";
                 self.setQueryStatus(tab, cancel_msg);
@@ -1663,7 +1663,7 @@ pub const App = struct {
             }
             log.info(self.io, "Query execution error: {t}", .{err});
             var err_buf: [160]u8 = undefined;
-            const err_msg = std.fmt.bufPrintZ(&err_buf, "Query error: {t}", .{err}) catch "Query execution failed.";
+            const err_msg = std.fmt.bufPrintSentinel(&err_buf, "Query error: {t}", .{err}, 0) catch "Query execution failed.";
             self.setQueryStatus(tab, err_msg);
             return;
         };
@@ -1680,16 +1680,16 @@ pub const App = struct {
         if (total_matches > 0) {
             var status_buf: [256]u8 = undefined;
             const first_sec = first_frame_target.?;
-            const status_msg = std.fmt.bufPrintZ(&status_buf, "Query complete: {d} match(es) in {f}. First match: Frame #{d} at {d:.2}s.", .{
+            const status_msg = std.fmt.bufPrintSentinel(&status_buf, "Query complete: {d} match(es) in {f}. First match: Frame #{d} at {d:.2}s.", .{
                 total_matches,
                 elapsed,
                 first_frame,
                 first_sec,
-            }) catch "Query completed.";
+            }, 0) catch "Query completed.";
             self.setQueryStatus(tab, status_msg);
         } else {
             var status_buf: [160]u8 = undefined;
-            const status_msg = std.fmt.bufPrintZ(&status_buf, "Query returned 0 matching frames in {f}.", .{elapsed}) catch "0 matches.";
+            const status_msg = std.fmt.bufPrintSentinel(&status_buf, "Query returned 0 matching frames in {f}.", .{elapsed}, 0) catch "0 matches.";
             self.setQueryStatus(tab, status_msg);
         }
     }
@@ -1763,7 +1763,7 @@ pub const App = struct {
             sam_macos_set_masks(0, null, 0, -1);
 
             var msg_buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&msg_buf, "No objects matched “{s}”.", .{phrase}) catch "No objects matched.";
+            const msg = std.fmt.bufPrintSentinel(&msg_buf, "No objects matched “{s}”.", .{phrase}, 0) catch "No objects matched.";
             sam_macos_set_status(msg);
         } else {
             if (self.coverages.len != masks.count) {
@@ -1780,11 +1780,11 @@ pub const App = struct {
 
             const elapsed = started.untilNow(self.io, .awake);
             var status_buf: [256]u8 = undefined;
-            const status = std.fmt.bufPrintZ(&status_buf, "{d} object(s) matched “{s}” in {f}", .{
+            const status = std.fmt.bufPrintSentinel(&status_buf, "{d} object(s) matched “{s}” in {f}", .{
                 masks.count,
                 phrase,
                 elapsed,
-            }) catch "Search complete";
+            }, 0) catch "Search complete";
             sam_macos_set_status(status);
         }
 

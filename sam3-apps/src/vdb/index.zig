@@ -235,7 +235,7 @@ pub const InvertedIndex = struct {
         const bytes = try self.serialize(self.allocator);
         defer self.allocator.free(bytes);
 
-        const path_z = try self.allocator.dupeZ(u8, path);
+        const path_z = try self.allocator.dupeSentinel(u8, path, 0);
         defer self.allocator.free(path_z);
 
         const builtin = @import("builtin");
@@ -256,7 +256,7 @@ pub const InvertedIndex = struct {
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !InvertedIndex {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
         const O_RDONLY: c_int = 0x0000;
@@ -285,7 +285,7 @@ pub const InvertedIndex = struct {
     }
 
     pub fn deleteFile(allocator: std.mem.Allocator, path: []const u8) !void {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
         if (c_io.unlink(path_z.ptr) != 0) return error.DeleteFailed;
     }

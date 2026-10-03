@@ -36,6 +36,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const log_bindings = b.addTranslateC(.{
+        .root_source_file = b.path("log_time.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    log.addImport("c", log_bindings.createModule());
 
     const native_main = b.createModule(.{
         .root_source_file = b.path("native_main.zig"),
@@ -60,7 +66,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("macos/main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = if (optimize == .ReleaseFast) true else null,
             .imports = &.{
                 .{ .name = "sam3", .module = sam3.module("sam3") },
                 .{ .name = "zigimg", .module = zigimg.module("zigimg") },
@@ -86,9 +91,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.setCwd(b.path("."));
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
         run_step.dependOn(&run_cmd.step);
         b.step("run-macos", "Run the native macOS UI").dependOn(&run_cmd.step);
         b.step("run-darwin", "Alias for run-macos").dependOn(&run_cmd.step);
@@ -99,7 +102,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("linux/main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = if (optimize == .ReleaseFast) true else null,
             .imports = &.{
                 .{ .name = "sam3", .module = sam3.module("sam3") },
                 .{ .name = "zigimg", .module = zigimg.module("zigimg") },
@@ -116,9 +118,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.setCwd(b.path("."));
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
         run_step.dependOn(&run_cmd.step);
         b.step("run-linux", "Run the native Linux Wayland UI").dependOn(&run_cmd.step);
         b.step("run-wayland", "Alias for run-linux").dependOn(&run_cmd.step);

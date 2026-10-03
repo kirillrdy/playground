@@ -24,7 +24,7 @@ fn findCursorFile(names: []const []const u8) ?[*:0]const u8 {
     var path_buf: [512]u8 = undefined;
     for (search_dirs) |dir| {
         for (names) |name| {
-            const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
+            const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
             const fd = open(path, 0);
             if (fd >= 0) {
                 _ = close(fd);
