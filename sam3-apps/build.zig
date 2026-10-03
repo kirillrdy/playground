@@ -76,7 +76,18 @@ pub fn build(b: *std.Build) void {
             },
         });
         macos_mod.addIncludePath(b.path("macos"));
-        macos_mod.addCSourceFile(.{ .file = b.path("macos/bridge.m"), .flags = &.{"-fobjc-arc"} });
+        const bridge_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        bridge_mod.addIncludePath(b.path("macos"));
+        bridge_mod.addCSourceFile(.{ .file = b.path("macos/bridge.m"), .flags = &.{"-fobjc-arc"} });
+        bridge_mod.link_libc = true;
+        const bridge_obj = b.addObject(.{
+            .name = "macos_bridge",
+            .root_module = bridge_mod,
+        });
+        macos_mod.addObject(bridge_obj);
         macos_mod.link_libc = true;
         macos_mod.linkSystemLibrary("objc", .{});
         macos_mod.linkFramework("Foundation", .{});
