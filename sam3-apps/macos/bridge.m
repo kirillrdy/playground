@@ -969,15 +969,6 @@ void sam_macos_video_close(void *opaque) {
     [handle.reader cancelReading];
 }
 
-int sam_macos_file_exists(const char *path) {
-    if (!path || path[0] == '\0') return 0;
-    return access(path, F_OK) == 0 ? 1 : 0;
-}
-
-const char *sam_macos_get_home(void) {
-    return [NSHomeDirectory() UTF8String];
-}
-
 void sam_macos_dispatch_main(void (*fn)(void *ctx), void *ctx) {
     if ([NSThread isMainThread]) {
         fn(ctx);

@@ -1,13 +1,28 @@
 const std = @import("std");
-const c = @import("c");
+
+const tm = extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: ?[*:0]const u8,
+};
+
+extern "c" fn localtime_r(timer: *const isize, result: *tm) ?*tm;
 
 var mutex: std.Io.Mutex = .init;
 
 pub fn info(io: std.Io, comptime format: []const u8, args: anytype) void {
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
-    const epoch_seconds: c.time_t = @intCast(now);
-    var local: c.struct_tm = undefined;
-    if (c.localtime_r(&epoch_seconds, &local) == null) return;
+    const epoch_seconds: isize = @intCast(now);
+    var local: tm = undefined;
+    if (localtime_r(&epoch_seconds, &local) == null) return;
 
     var message_buffer: [2048]u8 = undefined;
     const message = std.fmt.bufPrint(&message_buffer, format, args) catch return;

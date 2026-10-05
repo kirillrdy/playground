@@ -1,5 +1,5 @@
 const std = @import("std");
-const overlay = @import("overlay.zig");
+const ast = @import("ast.zig");
 
 // A query owns its input, source, cancellation token, and results independently
 // of the selected tab and the video currently displayed by the app.
@@ -16,7 +16,7 @@ pub const QueryTab = struct {
     query_matches: std.ArrayList(u32) = .empty,
     query_match_pts: std.ArrayList(f64) = .empty,
     query_match_idx: usize = 0,
-    query_prompts: overlay.Prompts = .{},
+    query_prompts: ast.Prompts = .{},
     precache_active: std.atomic.Value(bool) = .init(false),
     precache_phrase: [256]u8 = undefined,
     precache_phrase_len: usize = 0,

@@ -63,8 +63,6 @@ double sam_macos_video_fps(void *reader);
 int sam_macos_video_next(void *reader, SamVideoFrame *frame);
 void sam_macos_video_free_frame(SamVideoFrame *frame);
 void sam_macos_video_close(void *reader);
-int sam_macos_file_exists(const char *path);
-const char *sam_macos_get_home(void);
 void sam_macos_dispatch_main(void (*fn)(void *ctx), void *ctx);
 
 #ifdef __cplusplus

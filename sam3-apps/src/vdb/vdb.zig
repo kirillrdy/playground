@@ -7,15 +7,18 @@ pub const parser = @import("parser.zig");
 pub const index = @import("index.zig");
 pub const planner = @import("planner.zig");
 pub const engine = @import("engine.zig");
-pub const overlay = @import("overlay.zig");
+pub const overlay = struct {
+    pub const Prompts = ast.Prompts;
+};
+pub const query_input = struct {
+    pub const normalize = parser.normalize;
+};
 pub const query_tab = @import("query_tab.zig");
-
-pub const query_input = @import("query_input.zig");
 pub const completion = @import("completion.zig");
 
 test {
-    _ = overlay;
-    _ = query_input;
+    _ = ast;
+    _ = parser;
     _ = completion;
     _ = query_tab;
 }
