@@ -70,3 +70,5 @@ void sam_macos_dispatch_main(void (*fn)(void *ctx), void *ctx);
 #endif
 
 #endif // SAM_MACOS_BRIDGE_H
+
+void sam_macos_set_query_table(const char *json);

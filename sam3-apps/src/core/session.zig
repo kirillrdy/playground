@@ -89,12 +89,24 @@ pub fn Session(comptime VideoReader: type) type {
                 const state = if (!tab.has_run) "New" else if (tab.query_active.load(.acquire))
                     if (tab.query_cancel.load(.acquire)) "Cancelling" else "Running"
                 else if (tab.query_cancel.load(.acquire)) "Cancelled" else "Done";
-                const label = try std.fmt.allocPrint(allocator, "Query {d}: {s} ({d})", .{ i + 1, state, tab.query_matches.items.len });
+                const label = try std.fmt.allocPrint(allocator, "Query {d}: {s} ({d})", .{ i + 1, state, tab.resultCount() });
                 defer allocator.free(label);
                 if (i > 0) try labels.append(allocator, '\n');
                 try labels.appendSlice(allocator, label);
             }
             return allocator.dupeSentinel(u8, labels.items, 0);
+        }
+
+        pub fn formatTable(self: *Self, allocator: std.mem.Allocator) ![:0]u8 {
+            self.mutex.lock(self.io) catch return error.LockFailed;
+            defer self.mutex.unlock(self.io);
+            const tab = self.selectedTab();
+            const json = if (tab != null and tab.?.table_mode)
+                try std.json.Stringify.valueAlloc(allocator, .{ .columns = tab.?.table_columns.items, .rows = tab.?.table_rows.items }, .{})
+            else
+                try allocator.dupe(u8, "null");
+            defer allocator.free(json);
+            return allocator.dupeSentinel(u8, json, 0);
         }
 
         pub fn finishQueryStatus(self: *Self, host: anytype, tab: *QueryTab) void {
@@ -232,6 +244,7 @@ pub fn Session(comptime VideoReader: type) type {
             if (self.selectedTab()) |tab| {
                 tab.query_prompts = .{};
                 tab.precache_phrase_len = 0;
+                tab.clearRows();
                 tab.query_matches.clearRetainingCapacity();
                 tab.query_match_pts.clearRetainingCapacity();
                 tab.query_match_idx = 0;
@@ -239,6 +252,7 @@ pub fn Session(comptime VideoReader: type) type {
             host.clearOverlay();
             self.mutex.unlock(self.io);
             host.setStatus("Query cleared.");
+            host.refreshQueryTabs();
         }
 
         pub fn handleQuery(self: *Self, host: anytype, raw_query: []const u8) void {
@@ -298,6 +312,10 @@ pub fn Session(comptime VideoReader: type) type {
                 return;
             }
             const tab = QueryTab.create(self.allocator, trimmed, host.getVideoPath().?) catch return;
+            tab.configureResults(trimmed) catch {
+                tab.deinit();
+                return;
+            };
             self.mutex.lock(self.io) catch {
                 tab.deinit();
                 return;
@@ -581,6 +599,25 @@ pub fn Session(comptime VideoReader: type) type {
                             break;
                         }
                     }
+                    if (streamer.tab.table_mode) {
+                        sess.mutex.lock(sess.io) catch return;
+                        if (streamer.tab.query_cancel.load(.acquire)) {
+                            sess.mutex.unlock(sess.io);
+                            return error.QueryCancelled;
+                        }
+                        streamer.tab.appendRow(row) catch |err| {
+                            sess.mutex.unlock(sess.io);
+                            return err;
+                        };
+                        const total = streamer.tab.resultCount();
+                        sess.mutex.unlock(sess.io);
+                        if (total == 1 or streamer.last_ui_update.untilNow(sess.io, .awake).nanoseconds > 200_000_000) {
+                            streamer.last_ui_update = std.Io.Timestamp.now(sess.io, .awake);
+                            var buffer: [160]u8 = undefined;
+                            sess.setQueryStatus(h, streamer.tab, std.fmt.bufPrint(&buffer, "Streaming query: {d} rows…", .{total}) catch "Streaming query…");
+                        }
+                        return;
+                    }
                     const idx = match_idx orelse return;
 
                     sess.mutex.lock(sess.io) catch return;
@@ -660,7 +697,7 @@ pub fn Session(comptime VideoReader: type) type {
                 if (err == error.QueryCancelled) {
                     log.info(self.io, "Visual database query cancelled.", .{});
                     self.mutex.lock(self.io) catch return;
-                    const matches_so_far = tab.query_matches.items.len;
+                    const matches_so_far = tab.resultCount();
                     self.mutex.unlock(self.io);
                     var cancel_buf: [160]u8 = undefined;
                     const cancel_msg = if (matches_so_far > 0)
@@ -686,7 +723,11 @@ pub fn Session(comptime VideoReader: type) type {
             const first_frame_target = if (total_matches > 0) tab.matchTime(0) else null;
             self.mutex.unlock(self.io);
 
-            if (total_matches > 0) {
+            if (tab.table_mode) {
+                var status_buf: [160]u8 = undefined;
+                const status_msg = std.fmt.bufPrint(&status_buf, "Query complete: {d} row(s) in {f}.", .{ result.rows.len, elapsed }) catch "Query completed.";
+                self.setQueryStatus(host, tab, status_msg);
+            } else if (total_matches > 0) {
                 var status_buf: [256]u8 = undefined;
                 const first_sec = first_frame_target.?;
                 const status_msg = std.fmt.bufPrint(&status_buf, "Query complete: {d} match(es) in {f}. First match: Frame #{d} at {d:.2}s.", .{

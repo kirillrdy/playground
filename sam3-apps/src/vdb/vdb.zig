@@ -725,3 +725,39 @@ test "vdb: bounded sampled scans retain frame-zero step alignment" {
     try std.testing.expectEqual(@as(usize, 6), mock.reads);
     try std.testing.expectEqual(@as(usize, 1), mock.seeks);
 }
+
+test "vdb: timestamp-only SAM3 query streams scalar rows" {
+    const allocator = std.testing.allocator;
+    var reader = MockReader{ .frames_total = 3 };
+    var db = Database.init(allocator);
+    defer db.deinit();
+    const Segmenter = struct {
+        fn segment(_: *anyopaque, _: std.mem.Allocator, frame: types.FrameRef, prompt: []const u8) anyerror!types.MaskRef {
+            try std.testing.expectEqualStrings("hat", prompt);
+            return .{ .score = if (frame.index == 1) 0.95 else 0.85, .coverage = 0.2, .width = frame.width, .height = frame.height };
+        }
+    };
+    db.engine_inst.sam3 = .{ .ptr = &reader, .segmentFn = Segmenter.segment };
+    const sql = "select timestamp from 'foo.mp4' where sam3(frame, \"hat\") > 0.9;";
+    const tab = try query_tab.QueryTab.create(allocator, sql, "foo.mp4");
+    defer tab.deinit();
+    try tab.configureResults(sql);
+    const Streamer = struct {
+        fn onRow(ctx: *anyopaque, row: *const types.Row) anyerror!void {
+            const query: *query_tab.QueryTab = @ptrCast(@alignCast(ctx));
+            try query.appendRow(row);
+        }
+    };
+    const normalized = try query_input.normalize(allocator, sql, "foo.mp4");
+    defer allocator.free(normalized);
+    var result = try db.executeQuery(normalized, reader.reader(), null, .{ .ctx = tab, .onRow = Streamer.onRow });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), tab.table_rows.items[0].len);
+    try std.testing.expect(tab.table_mode);
+    try std.testing.expectEqual(@as(usize, 1), tab.resultCount());
+    try std.testing.expectEqualStrings("timestamp", result.columns[0].name);
+    try std.testing.expectEqual(types.TypeTag.float_type, result.columns[0].type_tag);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.033), result.rows[0].values[0].float_type, 0.000001);
+    try std.testing.expectEqualStrings("0.033000", tab.table_rows.items[0][0]);
+}

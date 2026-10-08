@@ -642,6 +642,18 @@ pub const App = struct {
         }
         self.completion_visible = false;
 
+        if (self.selectedTab()) |tab| {
+            if (tab.table_mode and y >= self.canvas_y and y < self.canvas_y + self.canvas_h and x >= self.canvas_x and x < self.canvas_x + self.canvas_w) {
+                self.session.mutex.lock(self.io) catch return false;
+                defer self.session.mutex.unlock(self.io);
+                const page = @max(1, (self.canvas_h -| 80) / 26);
+                if (y >= self.canvas_y + self.canvas_h -| 36) {
+                    if (x < self.canvas_x + 100) tab.table_scroll -|= page else if (x < self.canvas_x + 200) tab.table_scroll = @min(tab.table_scroll + page, tab.table_rows.items.len -| page) else if (x < self.canvas_x + 300) tab.table_column_scroll -|= 1 else if (x < self.canvas_x + 400) tab.table_column_scroll = @min(tab.table_column_scroll + 1, tab.table_columns.items.len -| 1);
+                }
+                return false;
+            }
+        }
+
         if (y >= 40 and y < 68 and button == 0x110 and x >= stride -| 40 and x < stride -| 16) {
             self.newQuery();
             return false;
@@ -1094,8 +1106,6 @@ pub const App = struct {
         self.is_busy = false;
     }
 
-
-
     pub fn isBusy(self: *const App) bool {
         return self.is_busy;
     }
@@ -1189,7 +1199,6 @@ pub const App = struct {
         @memcpy(self.video_phrase[0..self.video_phrase_len], phrase[0..self.video_phrase_len]);
     }
 
-
     fn selectQuery(self: *App, index: usize) void {
         self.session.selectQuery(self, index);
     }
@@ -1209,7 +1218,6 @@ pub const App = struct {
     fn handleQuery(self: *App, raw_query: []const u8) void {
         self.session.handleQuery(self, raw_query);
     }
-
 
     fn handleFindText(self: *App, phrase: []const u8) void {
         const trimmed = std.mem.trim(u8, phrase, " \t\r\n");
@@ -2049,6 +2057,10 @@ pub const App = struct {
             }
         }
 
+        if (self.selectedTab()) |tab| {
+            if (tab.table_mode) self.drawResultsTable(pixels, stride, tab);
+        }
+
         const suggestions = self.queryCompletions();
         if (suggestions.len > 0) {
             const width = self.completionWidth();
@@ -2065,6 +2077,41 @@ pub const App = struct {
             }
         }
         if (self.browser_open) self.drawBrowser(pixels, stride, h);
+    }
+
+    fn drawResultsTable(self: *App, pixels: []u32, stride: usize, tab: *QueryTab) void {
+        self.session.mutex.lock(self.io) catch return;
+        defer self.session.mutex.unlock(self.io);
+        const x = self.canvas_x;
+        const y = self.canvas_y;
+        const width = self.canvas_w;
+        const height = self.canvas_h;
+        font.fillRect(pixels, stride, x, y, width, height, 0x001c1f25);
+        const visible_columns = @max(1, width / 180);
+        const first_column = @min(tab.table_column_scroll, tab.table_columns.items.len -| 1);
+        const columns = @min(visible_columns, tab.table_columns.items.len -| first_column);
+        const cell_width = width / @max(1, columns);
+        const chars = (cell_width -| 20) / font.font_width;
+        const page = (height -| 80) / 26;
+        for (0..columns) |column| {
+            const name = tab.table_columns.items[first_column + column];
+            font.drawText(pixels, stride, name[0..@min(name.len, chars)], x + column * cell_width + 10, y + 12, 0x0000dc64);
+        }
+        const first = @min(tab.table_scroll, tab.table_rows.items.len);
+        for (tab.table_rows.items[first..@min(first + page, tab.table_rows.items.len)], 0..) |row, i| {
+            const row_y = y + 38 + i * 26;
+            font.fillRect(pixels, stride, x, row_y, width, 26, if (i % 2 == 0) 0x0023272e else 0x001c1f25);
+            for (0..columns) |column| {
+                const cell = row[first_column + column];
+                font.drawText(pixels, stride, cell[0..@min(cell.len, chars)], x + column * cell_width + 10, row_y + 5, 0x00f2f4f6);
+            }
+        }
+        if (tab.table_rows.items.len == 0) font.drawText(pixels, stride, "0 rows", x + 10, y + 42, 0x00969ba5);
+        const controls_y = y + height -| 36;
+        font.drawButton(pixels, stride, x + 8, controls_y, 88, 28, "Previous", false, false, 0x008892a0);
+        font.drawButton(pixels, stride, x + 108, controls_y, 88, 28, "Next", false, false, 0x008892a0);
+        font.drawButton(pixels, stride, x + 208, controls_y, 88, 28, "Cols <", false, false, 0x008892a0);
+        font.drawButton(pixels, stride, x + 308, controls_y, 88, 28, "Cols >", false, false, 0x008892a0);
     }
 
     fn drawBrowser(self: *App, pixels: []u32, stride: usize, height: usize) void {

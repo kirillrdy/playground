@@ -105,11 +105,22 @@ pub const Engine = struct {
             else switch (proj.expr.*) {
                 .column_ref => |c| c,
                 .call => |c| c.name,
-                else => try std.fmt.allocPrint(self.allocator, "col_{d}", .{idx}),
+                else => "",
             };
 
+            const owned_name = if (col_name.len == 0)
+                try std.fmt.allocPrint(self.allocator, "col_{d}", .{idx})
+            else
+                try self.allocator.dupe(u8, col_name);
+            errdefer self.allocator.free(owned_name);
+
             const tag: types.TypeTag = switch (proj.expr.*) {
-                .column_ref => |c| if (std.mem.eql(u8, c, "frame")) .frame_type else .int_type,
+                .column_ref => |c| if (std.ascii.eqlIgnoreCase(c, "frame"))
+                    .frame_type
+                else if (std.ascii.eqlIgnoreCase(c, "timestamp") or std.ascii.eqlIgnoreCase(c, "pts"))
+                    .float_type
+                else
+                    .int_type,
                 .call => |c| if (std.ascii.eqlIgnoreCase(c.name, "sam3"))
                     .mask_type
                 else if (std.ascii.eqlIgnoreCase(c.name, "yolov8"))
@@ -120,7 +131,7 @@ pub const Engine = struct {
             };
 
             try columns.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, col_name),
+                .name = owned_name,
                 .type_tag = tag,
             });
         }

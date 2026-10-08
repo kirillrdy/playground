@@ -146,6 +146,21 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run app tests");
+    if (target.result.os.tag.isDarwin()) {
+        const bridge_test_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        bridge_test_mod.addIncludePath(b.path("macos"));
+        bridge_test_mod.addCSourceFile(.{ .file = b.path("macos/bridge_test.m"), .flags = &.{"-fobjc-arc"} });
+        bridge_test_mod.linkSystemLibrary("objc", .{});
+        for ([_][]const u8{ "Foundation", "AppKit", "QuartzCore", "UniformTypeIdentifiers", "AVFoundation", "CoreMedia", "CoreVideo" }) |framework| {
+            bridge_test_mod.linkFramework(framework, .{});
+        }
+        const bridge_test = b.addExecutable(.{ .name = "macos-bridge-test", .root_module = bridge_test_mod });
+        test_step.dependOn(&b.addRunArtifact(bridge_test).step);
+    }
     const vdb_test = b.addTest(.{
         .root_module = vdb,
     });

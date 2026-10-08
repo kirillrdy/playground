@@ -146,9 +146,12 @@ static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
 
 @end
 
-@interface SamAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate>
+@interface SamAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate>
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) SamCanvasView *canvasView;
+@property (nonatomic, strong) NSScrollView *resultsScroll;
+@property (nonatomic, strong) NSTableView *resultsTable;
+@property (nonatomic, strong) NSArray<NSArray<NSString *> *> *resultRows;
 @property (nonatomic, strong) NSTextField *statusLabel;
 @property (nonatomic, strong) NSTextField *conceptField;
 @property (nonatomic, strong) NSPanel *completionPanel;
@@ -330,8 +333,19 @@ static SamAppDelegate *g_delegate = nil;
     _canvasView = [[SamCanvasView alloc] initWithFrame:NSZeroRect];
     _canvasView.callbacks = _callbacks;
 
+    _resultsTable = [[NSTableView alloc] init];
+    _resultsTable.dataSource = self;
+    _resultsTable.delegate = self;
+    _resultsTable.usesAlternatingRowBackgroundColors = YES;
+    _resultsTable.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
+    _resultsScroll = [[NSScrollView alloc] init];
+    _resultsScroll.hasVerticalScroller = YES;
+    _resultsScroll.hasHorizontalScroller = YES;
+    _resultsScroll.documentView = _resultsTable;
+    _resultsScroll.hidden = YES;
+
     // Layout
-    for (NSView *v in @[tabsRow, queryRow, toolbarRow, _statusLabel, _canvasView, videoRow]) {
+    for (NSView *v in @[tabsRow, queryRow, toolbarRow, _statusLabel, _canvasView, _resultsScroll, videoRow]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [contentView addSubview:v];
     }
@@ -365,6 +379,11 @@ static SamAppDelegate *g_delegate = nil;
         [_canvasView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
         [_canvasView.bottomAnchor constraintEqualToAnchor:videoRow.topAnchor constant:-10.0],
 
+        [_resultsScroll.topAnchor constraintEqualToAnchor:_canvasView.topAnchor],
+        [_resultsScroll.leadingAnchor constraintEqualToAnchor:_canvasView.leadingAnchor],
+        [_resultsScroll.trailingAnchor constraintEqualToAnchor:_canvasView.trailingAnchor],
+        [_resultsScroll.bottomAnchor constraintEqualToAnchor:_canvasView.bottomAnchor],
+
         // 5. Video Playback Controls (directly under canvas)
         [videoRow.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:16.0],
         [videoRow.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-16.0],
@@ -377,6 +396,25 @@ static SamAppDelegate *g_delegate = nil;
     [_window center];
     [_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+    return _resultRows.count;
+}
+
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+    NSUInteger index = column.identifier.integerValue;
+    // AppKit can request cached row views during a schema change or reload.
+    NSString *value = @"";
+    if (row >= 0 && (NSUInteger)row < _resultRows.count) {
+        NSArray<NSString *> *cells = _resultRows[row];
+        if (index < cells.count) value = cells[index];
+    }
+    NSTextField *cell = [NSTextField labelWithString:value];
+    cell.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    cell.selectable = YES;
+    cell.lineBreakMode = NSLineBreakByTruncatingTail;
+    return cell;
 }
 
 - (void)playPause:(id)sender {
@@ -977,4 +1015,37 @@ void sam_macos_dispatch_main(void (*fn)(void *ctx), void *ctx) {
             fn(ctx);
         });
     }
+}
+
+void sam_macos_set_query_table(const char *json) {
+    NSString *copy = json ? [NSString stringWithUTF8String:json] : @"null";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSDictionary *data = [NSJSONSerialization JSONObjectWithData:[copy dataUsingEncoding:NSUTF8StringEncoding]
+            options:NSJSONReadingFragmentsAllowed error:nil];
+        BOOL visible = [data isKindOfClass:[NSDictionary class]];
+        g_delegate.resultsScroll.hidden = !visible;
+        g_delegate.canvasView.hidden = visible;
+        if (!visible) return;
+        NSArray *headers = data[@"columns"];
+        NSTableView *table = g_delegate.resultsTable;
+        BOOL same = table.tableColumns.count == headers.count;
+        for (NSUInteger i = 0; same && i < headers.count; i++) {
+            same = [table.tableColumns[i].title isEqualToString:headers[i]];
+        }
+        if (!same) {
+            // Adding/removing columns can synchronously ask the data source for
+            // cells. Retire the previous schema's rows before changing columns.
+            g_delegate.resultRows = @[];
+            [table reloadData];
+            for (NSTableColumn *column in [table.tableColumns copy]) [table removeTableColumn:column];
+            for (NSUInteger i = 0; i < headers.count; i++) {
+                NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:[NSString stringWithFormat:@"%lu", (unsigned long)i]];
+                column.title = headers[i];
+                column.width = MAX(180, [headers[i] length] * 9 + 24);
+                [table addTableColumn:column];
+            }
+        }
+        g_delegate.resultRows = data[@"rows"];
+        [table reloadData];
+    });
 }

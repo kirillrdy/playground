@@ -57,6 +57,7 @@ extern fn sam_macos_set_busy(is_busy: c_int) void;
 extern fn sam_macos_set_video_mode(active: c_int, playing: c_int) void;
 extern fn sam_macos_set_video_timeline(duration: f64, position: f64) void;
 extern fn sam_macos_set_precache_progress(state: c_int, fraction: f64, frames: usize) void;
+extern fn sam_macos_set_query_table(json: [*:0]const u8) void;
 extern fn sam_macos_set_query_active(active: c_int) void;
 extern fn sam_macos_set_query_tabs(labels: [*:0]const u8, selected: c_int) void;
 extern fn sam_macos_set_query_text(sql: [*:0]const u8) void;
@@ -949,6 +950,9 @@ pub const App = struct {
         const labels_z = self.session.formatTabLabels(self.allocator) catch return;
         defer self.allocator.free(labels_z);
         sam_macos_set_query_tabs(labels_z, if (self.session.selected_query) |index| @intCast(index) else -1);
+        const table_json = self.session.formatTable(self.allocator) catch return;
+        defer self.allocator.free(table_json);
+        sam_macos_set_query_table(table_json);
         const selected = self.session.selectedTab();
         sam_macos_set_query_active(@intFromBool(if (selected) |tab| tab.query_active.load(.acquire) else false));
         if (selected) |tab| {

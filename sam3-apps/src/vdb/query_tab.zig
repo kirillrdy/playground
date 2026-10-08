@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const types = @import("types.zig");
 
 // A query owns its input, source, cancellation token, and results independently
 // of the selected tab and the video currently displayed by the app.
@@ -13,6 +14,11 @@ pub const QueryTab = struct {
     query_active: std.atomic.Value(bool) = .init(true),
     query_cancel: std.atomic.Value(bool) = .init(false),
     worker_finished: std.atomic.Value(bool) = .init(false),
+    table_mode: bool = false,
+    table_columns: std.ArrayList([]const u8) = .empty,
+    table_rows: std.ArrayList([]const []const u8) = .empty,
+    table_scroll: usize = 0,
+    table_column_scroll: usize = 0,
     query_matches: std.ArrayList(u32) = .empty,
     query_match_pts: std.ArrayList(f64) = .empty,
     query_match_idx: usize = 0,
@@ -55,6 +61,64 @@ pub const QueryTab = struct {
         self.draft = draft;
     }
 
+    pub fn configureResults(self: *QueryTab, sql: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var parser = @import("parser.zig").Parser.init(arena.allocator(), sql);
+        const stmt = try parser.parse();
+        if (stmt != .select_stmt) return;
+        self.table_mode = true;
+        for (stmt.select_stmt.projections, 0..) |projection, i| {
+            const expr = projection.expr.*;
+            if ((expr == .column_ref and std.ascii.eqlIgnoreCase(expr.column_ref, "frame")) or
+                (expr == .call and std.ascii.eqlIgnoreCase(expr.call.name, "frame"))) self.table_mode = false;
+            const name = if (projection.alias) |alias| alias else switch (expr) {
+                .column_ref => |name| name,
+                .call => |call| call.name,
+                else => try std.fmt.allocPrint(arena.allocator(), "col_{d}", .{i}),
+            };
+            const owned = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(owned);
+            try self.table_columns.append(self.allocator, owned);
+        }
+    }
+
+    pub fn appendRow(self: *QueryTab, row: *const types.Row) !void {
+        const cells = try self.allocator.alloc([]const u8, row.values.len);
+        var count: usize = 0;
+        errdefer {
+            for (cells[0..count]) |cell| self.allocator.free(cell);
+            self.allocator.free(cells);
+        }
+        for (row.values, 0..) |value, i| {
+            cells[i] = try switch (value) {
+                .null_type => self.allocator.dupe(u8, "NULL"),
+                .bool_type => |v| self.allocator.dupe(u8, if (v) "true" else "false"),
+                .int_type => |v| std.fmt.allocPrint(self.allocator, "{d}", .{v}),
+                .float_type => |v| std.fmt.allocPrint(self.allocator, "{d:.6}", .{v}),
+                .string_type => |v| self.allocator.dupe(u8, v),
+                .mask_type => |v| std.fmt.allocPrint(self.allocator, "{d:.6}", .{v.score}),
+                .detections_type => |v| std.fmt.allocPrint(self.allocator, "{d} detections", .{v.len}),
+                .frame_type => |v| std.fmt.allocPrint(self.allocator, "Frame #{d}", .{v.index}),
+            };
+            count += 1;
+        }
+        try self.table_rows.append(self.allocator, cells);
+    }
+
+    pub fn clearRows(self: *QueryTab) void {
+        for (self.table_rows.items) |cells| {
+            for (cells) |cell| self.allocator.free(cell);
+            self.allocator.free(cells);
+        }
+        self.table_rows.clearRetainingCapacity();
+        self.table_scroll = 0;
+    }
+
+    pub fn resultCount(self: *const QueryTab) usize {
+        return if (self.table_mode) self.table_rows.items.len else self.query_matches.items.len;
+    }
+
     pub fn appendMatch(self: *QueryTab, frame: u32, pts: f64) !void {
         try self.query_matches.ensureUnusedCapacity(self.allocator, 1);
         try self.query_match_pts.ensureUnusedCapacity(self.allocator, 1);
@@ -72,6 +136,10 @@ pub const QueryTab = struct {
         self.allocator.free(self.sql);
         self.allocator.free(self.draft);
         self.allocator.free(self.query_path.?);
+        self.clearRows();
+        self.table_rows.deinit(self.allocator);
+        for (self.table_columns.items) |name| self.allocator.free(name);
+        self.table_columns.deinit(self.allocator);
         self.query_matches.deinit(self.allocator);
         self.query_match_pts.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -176,4 +244,33 @@ test "query results retain their decoded timestamps for tab navigation" {
     tab.query_match_idx = 1;
     try std.testing.expectEqual(@as(u32, 125), tab.query_matches.items[tab.query_match_idx]);
     try std.testing.expectEqual(@as(f64, 5.0), tab.matchTime(tab.query_match_idx));
+}
+
+test "scalar projections choose a table and retain owned cells and aliases" {
+    const tab = try QueryTab.create(std.testing.allocator, "", "foo.mp4");
+    defer tab.deinit();
+    try tab.configureResults("select timestamp AS time, 'hat' AS label from 'foo.mp4' where sam3(frame, \"hat\") > 0.9;");
+    try std.testing.expect(tab.table_mode);
+    try std.testing.expectEqualStrings("time", tab.table_columns.items[0]);
+    var text = [_]u8{ 'h', 'a', 't' };
+    const values = [_]types.Value{ .{ .float_type = 1.25 }, .{ .string_type = &text } };
+    try tab.appendRow(&.{ .values = &values });
+    text[0] = 'c';
+    try std.testing.expectEqualStrings("1.250000", tab.table_rows.items[0][0]);
+    try std.testing.expectEqualStrings("hat", tab.table_rows.items[0][1]);
+    try std.testing.expectEqual(@as(usize, 1), tab.resultCount());
+    tab.clearRows();
+    try std.testing.expectEqual(@as(usize, 0), tab.resultCount());
+}
+
+test "frame projections choose video regardless of alias and predicate" {
+    for ([_][]const u8{
+        "SELECT FRAME AS picture, timestamp FROM 'foo.mp4'",
+        "SELECT frame(1) AS picture FROM 'foo.mp4'",
+    }) |sql| {
+        const tab = try QueryTab.create(std.testing.allocator, sql, "foo.mp4");
+        defer tab.deinit();
+        try tab.configureResults(sql);
+        try std.testing.expect(!tab.table_mode);
+    }
 }

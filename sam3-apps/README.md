@@ -70,6 +70,16 @@ Masks appear only for `sam3(...)` expressions in `SELECT`. A query such as
 `SELECT frame WHERE sam3(frame, "hat") > 0.9` filters using SAM 3 and displays
 the matching frames without overlays.
 
+Queries that omit `frame` from `SELECT` display a table of the selected columns:
+
+```sql
+SELECT timestamp FROM 'foo.mp4' WHERE sam3(frame, "hat") > 0.9;
+```
+
+`timestamp` is the decoded frame time in seconds. Column aliases become table
+headers. Rows stream into the table while the query runs and remain available
+after cancellation. Selecting `frame` (including `frame(...)`) displays video results.
+
 Query an inclusive range of zero-based frame IDs with:
 
 ```sql

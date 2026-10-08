@@ -490,26 +490,15 @@ pub fn normalize(allocator: std.mem.Allocator, input: []const u8, video_path: []
         try std.fmt.allocPrint(allocator, "{s}\nFROM \"{s}\" {s}", .{ sql[0..insert_at], video_path, sql[insert_at..] });
     errdefer allocator.free(sourced);
 
-    // The desktop displays frames from streamed rows even when only a mask was
-    // requested. Include the frame that produced that mask.
+    // Validate the expanded query without changing its selected columns.
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var p = Parser.init(arena.allocator(), sourced);
-    const statement = try p.parse();
-    for (statement.select_stmt.projections) |projection| {
-        switch (projection.expr.*) {
-            .column_ref => |name| if (std.ascii.eqlIgnoreCase(name, "frame")) return sourced,
-            .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "frame")) return sourced,
-            else => {},
-        }
-    }
-    const select_end = first.pos + first.text.len;
-    const result = try std.fmt.allocPrint(allocator, "{s} frame, {s}", .{ sourced[0..select_end], sourced[select_end..] });
-    allocator.free(sourced);
-    return result;
+    _ = try p.parse();
+    return sourced;
 }
 
-test "mask only shorthand inserts frame and source before limit" {
+test "mask only shorthand inserts source and preserves selected columns" {
     const allocator = std.testing.allocator;
     const sql = try normalize(allocator, "SELECT sam3(frame, \"nose\") limit 1", "video.mp4");
     defer allocator.free(sql);
@@ -517,9 +506,8 @@ test "mask only shorthand inserts frame and source before limit" {
     defer arena.deinit();
     var p = Parser.init(arena.allocator(), sql);
     const statement = try p.parse();
-    try std.testing.expectEqual(@as(usize, 2), statement.select_stmt.projections.len);
-    try std.testing.expectEqualStrings("frame", statement.select_stmt.projections[0].expr.column_ref);
-    try std.testing.expectEqualStrings("nose", statement.select_stmt.projections[1].expr.call.args[1].literal_string);
+    try std.testing.expectEqual(@as(usize, 1), statement.select_stmt.projections.len);
+    try std.testing.expectEqualStrings("nose", statement.select_stmt.projections[0].expr.call.args[1].literal_string);
     try std.testing.expectEqualStrings("video.mp4", statement.select_stmt.source.file_path);
     try std.testing.expectEqual(@as(?usize, 1), statement.select_stmt.limit);
 }
