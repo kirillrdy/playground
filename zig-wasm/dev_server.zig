@@ -2,7 +2,7 @@ const std = @import("std");
 const Child = std.process.Child;
 const print = std.log.info;
 
-const server_name = @import("server.zig").server_name;
+const server_name = @import("app_names.zig").server_name;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;

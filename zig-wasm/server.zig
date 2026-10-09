@@ -317,8 +317,8 @@ const templates = struct {
     }
 };
 
-pub const wasm_app_name = "main";
-pub const server_name = "main";
+pub const wasm_app_name = @import("app_names.zig").wasm_app_name;
+pub const server_name = @import("app_names.zig").server_name;
 
 pub const file_names = struct {
     const wasm = wasm_app_name ++ ".wasm";

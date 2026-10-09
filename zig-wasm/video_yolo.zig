@@ -844,7 +844,7 @@ fn runBenchmark(allocator: std.mem.Allocator, video_path: []const u8, producer_c
     }
     var detections_mutex: std.Thread.Mutex = .{};
     var worker_ctxs: [inference_workers]InferenceWorkerCtx = undefined;
-    var worker_threads: [inference_workers]?std.Thread = .{null} ** inference_workers;
+    var worker_threads: [inference_workers]?std.Thread = @splat(null);
     const wall_start_ns = std.time.nanoTimestamp();
 
     for (0..inference_workers) |i| {

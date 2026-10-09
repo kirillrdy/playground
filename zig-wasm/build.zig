@@ -1,6 +1,6 @@
 const std = @import("std");
-const wasm_app_name = @import("server.zig").wasm_app_name;
-const server_name = @import("server.zig").server_name;
+const wasm_app_name = @import("app_names.zig").wasm_app_name;
+const server_name = @import("app_names.zig").server_name;
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -18,12 +18,23 @@ pub fn build(b: *std.Build) !void {
     const zigimg = b.dependency("zigimg", .{ .target = target, .optimize = optimize });
     const vy_opts = b.addOptions();
 
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_c.addIncludePath(onnx_dev.path(b, "include"));
+    translate_c.addIncludePath(ffmpeg_dev.path(b, "include"));
+    translate_c.addIncludePath(cuda.path(b, "include"));
+    const c_mod = translate_c.createModule();
+
     const server_mod = b.createModule(.{
         .root_source_file = b.path("server.zig"),
         .target = target,
         .optimize = optimize,
     });
     server_mod.addOptions("config", vy_opts);
+    server_mod.addImport("c", c_mod);
     server_mod.addImport("zigimg", zigimg.module("zigimg"));
     server_mod.addImport("httpz", b.dependency("httpz", .{}).module("httpz"));
     server_mod.addIncludePath(onnx_dev.path(b, "include"));
@@ -56,6 +67,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     video_yolo_mod.addOptions("config", vy_opts);
+    video_yolo_mod.addImport("c", c_mod);
     video_yolo_mod.addIncludePath(onnx_dev.path(b, "include"));
     video_yolo_mod.addIncludePath(ffmpeg_dev.path(b, "include"));
     video_yolo_mod.addIncludePath(cuda.path(b, "include"));
@@ -116,14 +128,13 @@ pub fn build(b: *std.Build) !void {
 
     const run_vy = b.addRunArtifact(video_yolo);
     run_vy.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_vy.addArgs(args);
+    run_vy.addPassthruArgs();
     b.step("run-video", "Run video_yolo").dependOn(&run_vy.step);
 
     const test_step = b.step("test", "Run tests");
-    const tests = [_][]const u8{ "yolo.zig", "image_preprocess.zig", "image_decode.zig" };
+    const tests = [_][]const u8{ "yolo.zig", "image_preprocess.zig" };
     for (tests) |t| {
         const t_mod = b.createModule(.{ .root_source_file = b.path(t), .target = target, .optimize = optimize });
-        if (std.mem.eql(u8, t, "image_decode.zig")) t_mod.addImport("zigimg", zigimg.module("zigimg"));
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = t_mod })).step);
     }
 }
