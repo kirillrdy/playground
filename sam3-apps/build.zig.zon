@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .sam3 = .{
-            .url = "git+https://github.com/kirillrdy/sam3#32a4c1efe03b78fa562f2fb6b4a6ee94991a1f94",
-            .hash = "sam3-0.0.0-arUZ_kDpAADvL7EtSSQT1VPxE3w1ySTwP1LIgyTyv7of",
+            .url = "git+https://github.com/kirillrdy/sam3#2132568ff8342909041ebf7347d73acd7dba22ea",
+            .hash = "sam3-0.0.0-arUZ_kDpAADc-KPtCMz4GOfhsaYQwWTRjlvMPRrOxEZP",
         },
         .zigimg = .{
             .url = "git+https://github.com/sergot/zigimg#c701c9f99779d7ddf594dcc6da8f858fd277d61f",
