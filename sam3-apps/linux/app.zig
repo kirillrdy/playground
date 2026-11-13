@@ -135,7 +135,6 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     model: *sam3.Model,
-    example_path: []const u8,
 
     client: wayland.WaylandClient,
 
@@ -221,7 +220,6 @@ pub const App = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         model: *sam3.Model,
-        example_path: []const u8,
         width: u32,
         height: u32,
     ) !App {
@@ -231,7 +229,6 @@ pub const App = struct {
             .allocator = allocator,
             .io = io,
             .model = model,
-            .example_path = example_path,
             .client = client,
             .pending_width = width,
             .pending_height = height,

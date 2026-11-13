@@ -12,11 +12,11 @@ const Platform = struct {
     pub const name = "Wayland";
     pub const launch_message = "Connecting to Wayland display…";
 
-    pub fn launch(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model, example_path: []const u8) !void {
+    pub fn launch(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model) !void {
         zimo.open(allocator, io, ".sam3-zimo") catch {};
         defer zimo.close();
 
-        var app = app_mod.App.init(allocator, io, model, example_path, 1000, 720) catch |err| {
+        var app = app_mod.App.init(allocator, io, model, 1000, 720) catch |err| {
             std.debug.print("Failed to connect to Wayland display: {t}\n", .{err});
             std.debug.print("Hint: Make sure a Wayland compositor (e.g. Weston) is running and WAYLAND_DISPLAY is set.\n", .{});
             return err;

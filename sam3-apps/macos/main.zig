@@ -30,11 +30,11 @@ const Platform = struct {
     pub const name = "macOS";
     pub const launch_message = "Launching native macOS interface…";
 
-    pub fn launch(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model, example_path: []const u8) !void {
+    pub fn launch(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model) !void {
         zimo.open(allocator, io, ".sam3-zimo") catch {};
         defer zimo.close();
 
-        var app = app_mod.App.init(allocator, io, model, example_path);
+        var app = app_mod.App.init(allocator, io, model);
         defer app.deinit();
 
         try app.start();

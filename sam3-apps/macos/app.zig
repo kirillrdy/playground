@@ -166,7 +166,6 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     model: *sam3.Model,
-    example_path: []const u8,
 
     mutex: std.Io.Mutex = .init,
     model_mutex: std.Io.Mutex = .init,
@@ -199,12 +198,11 @@ pub const App = struct {
     video_step_requested: bool = false,
     session: core.Session(MacosVideoReader),
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model, example_path: []const u8) App {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *sam3.Model) App {
         return .{
             .allocator = allocator,
             .io = io,
             .model = model,
-            .example_path = example_path,
             .session = core.Session(MacosVideoReader).init(allocator, io),
         };
     }
@@ -232,7 +230,7 @@ pub const App = struct {
             .on_video_play_pause = &cVideoPlayPause,
             .on_video_seek = &cVideoSeek,
             .on_video_step = &cVideoStep,
-            .on_sample_click = &cSampleClick,
+            .on_sample_click = null,
             .on_mode_change = &cModeChange,
             .on_clear_points = &cClearPoints,
             .on_find_text = &cFindText,
@@ -1189,12 +1187,6 @@ fn cVideoSeek(seconds: f64) callconv(.c) void {
 
 fn cVideoStep() callconv(.c) void {
     if (g_app) |app| app.handleVideoStep();
-}
-
-fn cSampleClick() callconv(.c) void {
-    if (g_app) |app| {
-        app.openImageFromPath(app.example_path);
-    }
 }
 
 fn cModeChange(mode: c_int) callconv(.c) void {

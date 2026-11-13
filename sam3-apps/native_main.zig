@@ -11,11 +11,8 @@ pub fn run(init: std.process.Init, comptime Platform: type) !void {
     var model = try sam3.Model.open(allocator, init.io);
     defer model.deinit();
 
-    const example_path = try sam3.assets.cat.get(allocator, init.io);
-    defer allocator.free(example_path);
-
     log.info(init.io, "Loaded segmentation and text lookup graphs", .{});
     log.info(init.io, "{s}", .{Platform.launch_message});
 
-    try Platform.launch(allocator, init.io, &model, example_path);
+    try Platform.launch(allocator, init.io, &model);
 }
