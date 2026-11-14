@@ -11,10 +11,6 @@ pub fn setActiveModel(model: ?*sam3.Model) void {
     active_model = model;
 }
 
-pub fn getActiveModel() ?*sam3.Model {
-    return active_model;
-}
-
 pub fn unpackMasks(allocator: std.mem.Allocator, values: []const f32) !sam3.Masks {
     if (values.len < 4) return error.InvalidCachedQuery;
     const count: usize = @as(u32, @bitCast(values[0]));

@@ -59,12 +59,6 @@ pub const SelectStmt = struct {
     source: TableSource,
     where_clause: ?*Expr = null,
     limit: ?usize = null,
-
-    pub fn overlayPrompts(self: *const SelectStmt) !Prompts {
-        var result: Prompts = .{};
-        for (self.projections) |projection| try result.collect(projection.expr);
-        return result;
-    }
 };
 
 pub const CreateIndexStmt = struct {

@@ -241,20 +241,6 @@ pub const Runtime = struct {
         return yolo.nms(allocator, decoded, iou_threshold);
     }
 
-    pub fn freeDetections(_: *@This(), allocator: Allocator, detections: []Detection) void {
-        allocator.free(detections);
-    }
-
-    pub fn detectFromRgb(
-        self: *@This(),
-        allocator: Allocator,
-        rgb: []const u8,
-        image_size: image_preprocess.ImageSize,
-    ) ![]Detection {
-        var profile: DetectProfile = .{};
-        return self.detectFromRgbWithProfile(allocator, rgb, image_size, &profile);
-    }
-
     pub fn detectFromRgbWithProfile(
         self: *@This(),
         allocator: Allocator,

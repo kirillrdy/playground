@@ -14,7 +14,6 @@ typedef struct {
     void (*on_video_play_pause)(void);
     void (*on_video_seek)(double seconds);
     void (*on_video_step)(void);
-    void (*on_sample_click)(void);
     void (*on_mode_change)(int mode); // 1 = add, 0 = cut
     void (*on_clear_points)(void);
     void (*on_find_text)(const char *text);

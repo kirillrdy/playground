@@ -484,12 +484,6 @@ pub const App = struct {
         @memcpy(self.browser_path[0..self.browser_path_len], path[0..self.browser_path_len]);
     }
 
-    fn openBrowser(self: *App) void {
-        self.browser_open = true;
-        const home = if (std.c.getenv("HOME")) |value| std.mem.span(value) else "/";
-        self.browseDir(if (self.browser_dir.len > 0) self.browser_dir else home);
-    }
-
     fn browserOpenPath(self: *App, path: []const u8) void {
         if (self.is_busy) return;
         const dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch null;

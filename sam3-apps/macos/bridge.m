@@ -8,16 +8,6 @@
 extern size_t sam_query_completions(const char *text, size_t caret, size_t *start,
                                     size_t *end, const char **output, size_t capacity);
 
-static void openMediaURL(NSURL *url, const SamCallbacks *callbacks) {
-    if (!url || !callbacks) return;
-    UTType *type = [UTType typeWithFilenameExtension:url.pathExtension];
-    if ([type conformsToType:UTTypeMovie] || [type conformsToType:UTTypeVideo]) {
-        if (callbacks->on_open_video) callbacks->on_open_video([url.path UTF8String]);
-    } else if (callbacks->on_open_file) {
-        callbacks->on_open_file([url.path UTF8String]);
-    }
-}
-
 @interface SamVideoReader : NSObject
 @property (nonatomic, strong) AVAssetReader *reader;
 @property (nonatomic, strong) AVAssetReaderOutput *output;

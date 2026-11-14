@@ -773,26 +773,6 @@ const Files = struct {
     }
 };
 
-fn writeDetectionsJsonl(path: []const u8, detections: []const onnxruntime.Detection) !void {
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.c_allocator);
-    const writer = buf.writer(std.heap.c_allocator);
-
-    try writer.print("{{\"frame\":0,\"detections\":[", .{});
-    for (detections, 0..) |d, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.print(
-            "{{\"class_id\":{d},\"score\":{d:.4},\"x1\":{d:.6},\"y1\":{d:.6},\"x2\":{d:.6},\"y2\":{d:.6}}}",
-            .{ d.class_id, d.score, d.x1, d.y1, d.x2, d.y2 },
-        );
-    }
-    try writer.writeAll("]}\n");
-    try file.writeAll(buf.items);
-}
-
 fn readDetectionsJsonl(allocator: Allocator, path: []const u8) ![]DetectionRecord {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
